@@ -114,6 +114,39 @@ body {
   flex-wrap: wrap;
 }
 
+/* 置顶（pin）按钮：与「刷新」并排的图标按钮 */
+.pin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 40px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.pin-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.pin-icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* 激活态：强调色高亮 */
+.pin-btn.is-pinned {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.pin-btn.is-pinned:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: var(--accent-strong);
+}
+
 /* ------------------------------------------------------- 通用控件样式 ---- */
 
 input,
@@ -405,11 +438,14 @@ button:focus-visible {
   cursor: pointer;
 }
 
-/* 标题即「查看详情」按钮：点击选中任务，不触发勾选 */
+/* 中区 description：仅此处点击才选中 / 打开详情 */
 .task-open {
   flex: 1;
   min-width: 0;
-  display: block;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   padding: 0;
   background: transparent;
   border: none;
@@ -440,9 +476,7 @@ button:focus-visible {
 .task-meta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 14px;
-  margin-top: 7px;
-  padding-left: 26px;
+  gap: 2px 12px;
 }
 
 .meta {
@@ -603,10 +637,12 @@ button:focus-visible {
 }
 
 .list-nav-select {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   width: 100%;
-  /* 右侧留出计数 / 动作按钮的位置，避免名称与它们重叠 */
-  padding: 7px 136px 7px 10px;
+  padding: 7px 10px;
   background: transparent;
   border: none;
   border-radius: var(--radius-control);
@@ -626,66 +662,41 @@ button:focus-visible {
 }
 
 .list-nav-name {
-  display: block;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.list-nav-mark {
+  margin-right: 6px;
+  color: var(--accent);
+}
+
 .list-nav-count {
-  position: absolute;
-  right: 12px;
-  top: 50%;
-  transform: translateY(-50%);
+  flex: none;
   font-size: 0.75rem;
   color: var(--text-muted);
-  transition: opacity var(--ease);
 }
 
 .list-nav-item.is-active .list-nav-count {
   color: var(--accent-strong);
 }
 
-/* 清单动作：悬浮 / 聚焦时在右侧替换计数显现 */
-.list-nav-actions {
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--ease);
+/* 「已完成」固定项：与普通清单视觉区隔、不可拖拽 / 右键 */
+.list-nav-item.is-fixed {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
 }
 
-.list-nav-actions .row-action {
-  padding: 3px 6px;
-  font-size: 0.72rem;
+.list-nav-item.is-fixed .list-nav-select {
+  color: var(--text-muted);
+  font-weight: 600;
 }
 
-.list-nav-item:hover .list-nav-actions,
-.list-nav-item:focus-within .list-nav-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.list-nav-item:hover .list-nav-count,
-.list-nav-item:focus-within .list-nav-count {
-  opacity: 0;
-}
-
-/* 触屏无 hover：动作常驻可点，计数隐藏避免重叠 */
-@media (hover: none) {
-  .list-nav-actions {
-    opacity: 1;
-    pointer-events: auto;
-  }
-
-  .list-nav-count {
-    opacity: 0;
-  }
+.list-nav-item.is-fixed.is-active .list-nav-select {
+  color: var(--accent-strong);
 }
 
 /* 清单重命名（内联） */
@@ -821,6 +832,110 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
+/* -------------------------------------------------------------- 拖拽 ---- */
+
+/* 拖拽中的源行：半透明（浮层由 DragOverlay 抬升显示） */
+.task-card.is-dragging,
+.list-nav-item.is-dragging {
+  opacity: 0.45;
+}
+
+.drag-overlay {
+  cursor: grabbing;
+  filter: drop-shadow(0 10px 24px rgba(16, 24, 40, 0.18));
+}
+
+.drag-card {
+  background: var(--surface);
+  border: 1px solid var(--border-hover);
+  border-radius: var(--radius-card);
+  padding: 12px 14px;
+}
+
+.drag-card.task-drag {
+  opacity: 0.95;
+}
+
+.drag-card.list-drag {
+  border-radius: var(--radius-control);
+  padding: 8px 12px;
+  font-weight: 600;
+}
+
+/* 勾选完成 / 取消后的移除动画：高度塌缩 + 淡出（≤200ms） */
+@keyframes card-leave {
+  from {
+    opacity: 1;
+    max-height: 240px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+  to {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-width: 0;
+  }
+}
+
+.task-card.is-leaving {
+  animation: card-leave 200ms ease forwards;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------- 右键菜单 ---- */
+
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 128px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(16, 24, 40, 0.16);
+  animation: menu-in 120ms ease backwards;
+}
+
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  text-align: left;
+  font-size: 0.875rem;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: var(--surface-muted);
+  border-color: transparent;
+}
+
+.context-menu-item.danger {
+  color: var(--danger);
+}
+
+.context-menu-item.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger-strong);
+}
+
 /* -------------------------------------------------------- 窄屏（≤760） ---- */
 
 @media (max-width: 760px) {
@@ -862,6 +977,18 @@ button:focus-visible {
     overflow-y: hidden;
     gap: 6px;
     padding-bottom: 2px;
+  }
+
+  .list-nav-item {
+    flex: none;
+    max-width: 200px;
+  }
+
+  .list-nav-item.is-fixed {
+    margin-top: 0;
+    border-top: none;
+    border-left: 1px solid var(--border);
+    padding-left: 6px;
   }
 
   .lists-block > .add-row {

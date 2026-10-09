@@ -70,6 +70,24 @@ fn move_list(list_file: String, direction: String) -> Result<(), String> {
     storage::move_list_in(&base, &list_file, &direction)
 }
 
+/// 同清单内把任务移到指定任务之前（`before_task_id` 为空 → 末尾）。
+#[tauri::command]
+fn reorder_task(
+    list_file: String,
+    task_id: String,
+    before_task_id: Option<String>,
+) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::reorder_task_in(&base, &list_file, &task_id, before_task_id.as_deref())
+}
+
+/// 把清单移到指定清单之前（`before_list_file` 为空 → 末尾），整体重编号。
+#[tauri::command]
+fn reorder_list(list_file: String, before_list_file: Option<String>) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::reorder_list_in(&base, &list_file, before_list_file.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -82,7 +100,9 @@ pub fn run() {
             delete_task,
             rename_list,
             delete_list,
-            move_list
+            move_list,
+            reorder_task,
+            reorder_list
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

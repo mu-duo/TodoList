@@ -285,6 +285,51 @@ pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(),
     write_list(&path, &value)
 }
 
+/// 在同清单内把任务移到 `before_task_id` 之前（`None` → 末尾），仅调整数组顺序。
+///
+/// 目标为自身或已在目标位置时视为成功且不改动文件；任务或清单不存在 → 错误。
+pub fn reorder_task_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    before_task_id: Option<&str>,
+) -> Result<(), String> {
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let tasks = value
+        .get_mut("tasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("清单「{list_file}」缺少 tasks 数组"))?;
+
+    let current = tasks
+        .iter()
+        .position(|t| t.get("id").and_then(Value::as_str) == Some(task_id))
+        .ok_or_else(|| format!("清单「{list_file}」中未找到任务 {task_id}"))?;
+
+    let target = match before_task_id {
+        Some(before) => {
+            if before == task_id {
+                return Ok(());
+            }
+            tasks
+                .iter()
+                .position(|t| t.get("id").and_then(Value::as_str) == Some(before))
+                .ok_or_else(|| format!("清单「{list_file}」中未找到任务 {before}"))?
+        }
+        None => tasks.len(),
+    };
+
+    // 已在目标位置（或移到自己之前）→ 视为成功且不改动文件
+    if target == current || target == current + 1 {
+        return Ok(());
+    }
+
+    let task = tasks.remove(current);
+    let insert_at = if current < target { target - 1 } else { target };
+    tasks.insert(insert_at, task);
+    write_list(&path, &value)
+}
+
 /// 新建清单文件，返回新清单的文件标识（`lists/` 下的文件名）。
 ///
 /// 文件名由清单名规整化（见 [`sanitize_file_stem`]）并对重名追加 `-2`/`-3`…；
@@ -379,6 +424,57 @@ pub fn move_list_in(base: &Path, list_file: &str, direction: &str) -> Result<(),
         return Ok(());
     }
     ordered.swap(position, target as usize);
+
+    for (index, (file, _, _)) in ordered.iter().enumerate() {
+        let path = lists_dir.join(file);
+        let mut value = match read_list_value(&path, file) {
+            Ok(value) => value,
+            Err(_) => continue, // 跳过无法解析的文件
+        };
+        if let Some(map) = value.as_mapping_mut() {
+            map.insert(key("order"), Value::Number(((index as i64 + 1) * 10).into()));
+        }
+        write_list(&path, &value)?;
+    }
+    Ok(())
+}
+
+/// 把清单移到 `before_list_file` 之前（`None` → 末尾），沿用整体重编号写回。
+///
+/// 目标为自身或已在目标位置时视为成功且不改动文件；清单不存在 → 错误。
+pub fn reorder_list_in(
+    base: &Path,
+    list_file: &str,
+    before_list_file: Option<&str>,
+) -> Result<(), String> {
+    let lists_dir = base.join(LISTS_DIR);
+    let mut ordered = read_ordered_lists(&lists_dir)?;
+    let current = ordered
+        .iter()
+        .position(|(file, _, _)| file == list_file)
+        .ok_or_else(|| format!("清单文件不存在：{list_file}"))?;
+
+    let target = match before_list_file {
+        Some(before) => {
+            if before == list_file {
+                return Ok(());
+            }
+            ordered
+                .iter()
+                .position(|(file, _, _)| file == before)
+                .ok_or_else(|| format!("清单文件不存在：{before}"))?
+        }
+        None => ordered.len(),
+    };
+
+    // 已在目标位置（或移到自己之前）→ 视为成功且不改动文件
+    if target == current || target == current + 1 {
+        return Ok(());
+    }
+
+    let item = ordered.remove(current);
+    let insert_at = if current < target { target - 1 } else { target };
+    ordered.insert(insert_at, item);
 
     for (index, (file, _, _)) in ordered.iter().enumerate() {
         let path = lists_dir.join(file);
@@ -1087,5 +1183,126 @@ tasks:
         assert!(set_task_status_in(base, "a.yaml", "NOPE", true).is_err());
         assert!(create_task_in(base, "../evil.yaml", "x").is_err());
         assert!(create_task_in(base, "a.yaml", "   ").is_err());
+    }
+
+    #[test]
+    fn reorder_task_moves_within_list_and_preserves_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep1\n  - id: T2\n    title: 二\n    status: open\n  - id: T3\n    title: 三\n    status: open\n",
+        );
+
+        let ids = |path: &Path| -> Vec<String> {
+            read_value(path)
+                .get("tasks")
+                .and_then(Value::as_sequence)
+                .unwrap()
+                .iter()
+                .map(|t| t.get("id").and_then(Value::as_str).unwrap().to_string())
+                .collect()
+        };
+
+        // 中间插入：T1 移到 T3 之前
+        reorder_task_in(base, "L.yaml", "T1", Some("T3")).unwrap();
+        assert_eq!(ids(&path), vec!["T2", "T1", "T3"]);
+        // 未知字段与既有语义字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let t1 = value
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T1"))
+            .unwrap();
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep1"));
+        assert_eq!(t1.get("status").and_then(Value::as_str), Some("open"));
+        assert_eq!(t1.get("title").and_then(Value::as_str), Some("一"));
+
+        // 重复调用幂等
+        reorder_task_in(base, "L.yaml", "T1", Some("T3")).unwrap();
+        assert_eq!(ids(&path), vec!["T2", "T1", "T3"]);
+
+        // 移到末尾（None）
+        reorder_task_in(base, "L.yaml", "T2", None).unwrap();
+        assert_eq!(ids(&path), vec!["T1", "T3", "T2"]);
+        // 已在末尾再移到末尾 → 无操作
+        reorder_task_in(base, "L.yaml", "T2", None).unwrap();
+        assert_eq!(ids(&path), vec!["T1", "T3", "T2"]);
+
+        // 目标为自身 / 已在目标位置 → 无操作
+        reorder_task_in(base, "L.yaml", "T3", Some("T3")).unwrap();
+        reorder_task_in(base, "L.yaml", "T3", Some("T2")).unwrap();
+        assert_eq!(ids(&path), vec!["T1", "T3", "T2"]);
+
+        // 任务不存在 / 目标不存在 / 清单不存在 → 错误
+        assert!(reorder_task_in(base, "L.yaml", "NOPE", Some("T3")).is_err());
+        assert!(reorder_task_in(base, "L.yaml", "T1", Some("NOPE")).is_err());
+        assert!(reorder_task_in(base, "nope.yaml", "T1", None).is_err());
+    }
+
+    #[test]
+    fn reorder_list_moves_and_renumbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(base, "a.yaml", "schema: 1\nname: a\norder: 10\nx-keep: 1\ntasks: []\n");
+        write_list(base, "b.yaml", "schema: 1\nname: b\norder: 20\ntasks: []\n");
+        write_list(base, "c.yaml", "schema: 1\nname: c\norder: 30\ntasks: []\n");
+
+        let names = |base: &Path| -> Vec<String> {
+            load_lists_from(base)
+                .unwrap()
+                .lists
+                .into_iter()
+                .map(|l| l.name)
+                .collect()
+        };
+
+        // 中间插入：c 移到 a 之前
+        reorder_list_in(base, "c.yaml", Some("a.yaml")).unwrap();
+        assert_eq!(names(base), vec!["c", "a", "b"]);
+        assert_eq!(order_of(base, "c.yaml"), 10);
+        assert_eq!(order_of(base, "a.yaml"), 20);
+        assert_eq!(order_of(base, "b.yaml"), 30);
+        // 未知字段保留
+        assert_eq!(
+            read_value(&base.join(LISTS_DIR).join("a.yaml"))
+                .get("x-keep")
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+
+        // 重复调用幂等
+        reorder_list_in(base, "c.yaml", Some("a.yaml")).unwrap();
+        assert_eq!(names(base), vec!["c", "a", "b"]);
+
+        // 移到末尾（None）
+        reorder_list_in(base, "c.yaml", None).unwrap();
+        assert_eq!(names(base), vec!["a", "b", "c"]);
+        assert_eq!(order_of(base, "c.yaml"), 30);
+
+        // 目标为自身 / 已在目标位置 → 无操作
+        reorder_list_in(base, "a.yaml", Some("a.yaml")).unwrap();
+        reorder_list_in(base, "a.yaml", Some("b.yaml")).unwrap();
+        assert_eq!(names(base), vec!["a", "b", "c"]);
+
+        // 清单 / 目标不存在 → 错误
+        assert!(reorder_list_in(base, "nope.yaml", Some("a.yaml")).is_err());
+        assert!(reorder_list_in(base, "a.yaml", Some("nope.yaml")).is_err());
+    }
+
+    #[test]
+    fn reorder_list_single_list_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(base, "only.yaml", "schema: 1\nname: only\norder: 10\ntasks: []\n");
+
+        reorder_list_in(base, "only.yaml", None).unwrap();
+        reorder_list_in(base, "only.yaml", Some("only.yaml")).unwrap();
+        assert_eq!(load_lists_from(base).unwrap().lists[0].name, "only");
+        assert_eq!(order_of(base, "only.yaml"), 10);
     }
 }
