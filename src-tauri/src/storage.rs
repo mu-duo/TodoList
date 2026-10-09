@@ -7,11 +7,24 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
 pub const LISTS_DIR: &str = "lists";
 pub const EXAMPLE_LIST_FILE: &str = "收集箱.yaml";
+
+/// 设置文件名（位于应用配置目录 `%APPDATA%\com.lftan.todolist`）。
+pub const SETTINGS_FILE: &str = "settings.yaml";
+/// 应用标识（同时用作配置目录名）。
+pub const APP_IDENTIFIER: &str = "com.lftan.todolist";
+/// 默认主题。
+pub const DEFAULT_THEME: &str = "system";
+
+/// 应用设置（当前仅主题）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    pub theme: String,
+}
 
 /// 加载结果：成功解析的清单 + 被跳过的文件告警。
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +73,14 @@ pub fn data_dir() -> Result<PathBuf, String> {
     Ok(docs.join("TodoList"))
 }
 
+/// 系统配置目录下的应用设置目录：`%APPDATA%\com.lftan.todolist`。
+///
+/// 仅解析路径，不创建目录（由 [`save_settings_in`] 按需创建）。
+pub fn settings_dir() -> Result<PathBuf, String> {
+    let config = dirs::config_dir().ok_or_else(|| "无法定位系统配置目录".to_string())?;
+    Ok(config.join(APP_IDENTIFIER))
+}
+
 /// 确保数据目录与 `lists/` 存在；`lists/` 无 YAML 时生成示例清单。
 pub fn ensure_data_dir(base: &Path) -> Result<(), String> {
     let lists = base.join(LISTS_DIR);
@@ -83,6 +104,72 @@ pub fn ensure_data_dir(base: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 归一化主题值：仅接受 `system` / `light` / `dark`，其余回退 `system`。
+fn normalize_theme(theme: &str) -> String {
+    match theme {
+        "light" | "dark" => theme.to_string(),
+        _ => DEFAULT_THEME.to_string(),
+    }
+}
+
+/// 读取设置目录（`%APPDATA%\com.lftan.todolist`）下的 `settings.yaml`。
+///
+/// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
+/// 且**不会**创建文件、不会 panic。
+pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
+    let path = base.join(SETTINGS_FILE);
+    if !path.is_file() {
+        return Ok(Settings {
+            theme: DEFAULT_THEME.to_string(),
+        });
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(Settings {
+                theme: DEFAULT_THEME.to_string(),
+            })
+        }
+    };
+    let value: Value = match yaml_serde::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(Settings {
+                theme: DEFAULT_THEME.to_string(),
+            })
+        }
+    };
+    let theme = value
+        .get("theme")
+        .and_then(Value::as_str)
+        .map(normalize_theme)
+        .unwrap_or_else(|| DEFAULT_THEME.to_string());
+    Ok(Settings { theme })
+}
+
+/// 写入 `theme` 到设置目录（`%APPDATA%\com.lftan.todolist`）下的 `settings.yaml`。
+///
+/// 沿用现有做法：Value 级补丁（保留未知字段）+ 原子写 + 中文错误消息；
+/// 文件不存在则创建，已存在则仅改 `theme`。非法主题值归一化为 `system`。
+pub fn save_settings_in(base: &Path, theme: &str) -> Result<(), String> {
+    let theme = normalize_theme(theme);
+    fs::create_dir_all(base).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let path = base.join(SETTINGS_FILE);
+
+    let mut value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("读取设置文件失败：{e}"))?;
+        yaml_serde::from_str(&text).map_err(|e| format!("解析设置文件失败：{e}"))?
+    } else {
+        Value::Mapping(Mapping::new())
+    };
+
+    let map = value
+        .as_mapping_mut()
+        .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+    map.insert(key("theme"), Value::String(theme));
+    write_list(&path, &value)
 }
 
 /// 读取 `lists/*.yaml` 全部清单；排序：文件内 order 升序，其次按名称。
@@ -1304,5 +1391,89 @@ tasks:
         reorder_list_in(base, "only.yaml", Some("only.yaml")).unwrap();
         assert_eq!(load_lists_from(base).unwrap().lists[0].name, "only");
         assert_eq!(order_of(base, "only.yaml"), 10);
+    }
+
+    #[test]
+    fn load_settings_default_when_missing_without_creating_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert!(
+            !base.join(SETTINGS_FILE).exists(),
+            "文件不存在时不应顺手创建 settings.yaml"
+        );
+    }
+
+    #[test]
+    fn save_settings_then_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        save_settings_in(base, "dark").unwrap();
+        assert!(base.join(SETTINGS_FILE).is_file(), "应创建 settings.yaml");
+        assert_eq!(load_settings_from(base).unwrap().theme, "dark");
+
+        save_settings_in(base, "light").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "light");
+
+        save_settings_in(base, "system").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "system");
+    }
+
+    #[test]
+    fn save_settings_preserves_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::write(
+            base.join(SETTINGS_FILE),
+            "theme: light\nx-custom: 保留我\n",
+        )
+        .unwrap();
+
+        save_settings_in(base, "dark").unwrap();
+
+        let value = read_value(&base.join(SETTINGS_FILE));
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(
+            value.get("x-custom").and_then(Value::as_str),
+            Some("保留我"),
+            "未知键应保留"
+        );
+    }
+
+    #[test]
+    fn save_settings_normalizes_invalid_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        save_settings_in(base, "purple").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "system");
+        assert_eq!(
+            read_value(&base.join(SETTINGS_FILE))
+                .get("theme")
+                .and_then(Value::as_str),
+            Some("system"),
+            "非法 theme 应归一化为 system"
+        );
+    }
+
+    #[test]
+    fn load_settings_falls_back_on_corrupt_or_invalid_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // 损坏文件 → 默认
+        fs::write(base.join(SETTINGS_FILE), "theme: [未闭合\n").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "system");
+
+        // 合法 YAML 但 theme 值非法 → 默认
+        fs::write(base.join(SETTINGS_FILE), "theme: blue\n").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "system");
+
+        // 缺 theme 键 → 默认
+        fs::write(base.join(SETTINGS_FILE), "x: 1\n").unwrap();
+        assert_eq!(load_settings_from(base).unwrap().theme, "system");
     }
 }

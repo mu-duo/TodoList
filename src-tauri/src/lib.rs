@@ -90,6 +90,20 @@ fn reorder_list(list_file: String, before_list_file: Option<String>) -> Result<(
     storage::reorder_list_in(&base, &list_file, before_list_file.as_deref())
 }
 
+/// 读取设置（文件不存在 / 解析失败 / 值非法 → 默认 `system`）。
+#[tauri::command]
+fn load_settings() -> Result<storage::Settings, String> {
+    let base = storage::settings_dir()?;
+    storage::load_settings_from(&base)
+}
+
+/// 保存主题设置（仅 `system` | `light` | `dark`，其余归一化为 `system`）。
+#[tauri::command]
+fn save_settings(theme: String) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_settings_in(&base, &theme)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -111,7 +125,9 @@ pub fn run() {
             delete_list,
             move_list,
             reorder_task,
-            reorder_list
+            reorder_list,
+            load_settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

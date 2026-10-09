@@ -14,7 +14,7 @@ TodoList/
 ```
 
 - 文件名 = 清单名（规整化）；清单显示名以文件内 `name` 为准。
-- 非任务数据（窗口位置、主题等）放应用配置目录，不进数据目录。
+- 非任务数据（设置等）放**应用配置目录**，不进数据目录；当前为 `settings.yaml`（Windows：`%APPDATA%\com.lftan.todolist\settings.yaml`；文件名、字段与回退语义见 ADR-0006）。
 
 ## 2. 清单文件（schema v1）
 

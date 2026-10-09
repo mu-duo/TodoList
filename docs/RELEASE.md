@@ -55,6 +55,16 @@ Get-FileHash .\TodoList_1.0.0_x64-setup.exe -Algorithm SHA256
 # 与同名 .sha256 文件内容比对
 ```
 
+## 升级（机器上已装旧版本时）
+
+**直接双击新版安装包即可**，不要先手动卸载。
+
+- 安装器会进"维护页"：**默认选中「Uninstall before installing」**（先跑旧卸载器再装新版）；也可选「**Do not uninstall**」＝**原地覆盖**。两者都能升级成功，推荐后者（更快、少一次卸载）。
+- ⚠️ **旧卸载器那页有个「Delete the application data」勾选框**：勾了会 `RmDir /r` 掉 `%APPDATA%\com.lftan.todolist`，而**主题偏好**就存在那里 → 会丢（重设一次即可）。**任务数据在 `文档\TodoList`，不受影响。**
+- 安装时若应用**正在运行**，安装器会**自动检测并提示关闭**（Restart Manager），取消则中止安装——内置行为，无需配置。
+- **不支持降级**（`bundle.windows.allowDowngrades: false`）：用旧版包覆盖已装的新版会被拦。
+- 跨版本务必保持 `identifier` / `productName` / `installMode` 不变，否则安装器检测不到旧安装，可能在机器上留下两份。
+
 ## 坑与说明
 
 - **SmartScreen**：exe 未签名，首次运行可能提示「未知发布者」→ 点「更多信息」→「仍要运行」。要彻底消除需代码签名证书（本项目不做）。

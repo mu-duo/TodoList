@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { arrayMove } from "@dnd-kit/sortable";
 import { SortableList } from "./components/SortableList";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
+import { SettingsModal } from "./components/SettingsModal";
+import { applyThemePref, loadThemePref, type ThemePref } from "./theme";
 import { useMediaQuery, usePrefersReducedMotion } from "./hooks";
 import "./App.css";
 
@@ -60,6 +62,10 @@ function App() {
   const [pinned, setPinned] = useState(false);
   const [pinBusy, setPinBusy] = useState(false);
 
+  // 设置面板（模态）与主题偏好
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemePref>("system");
+
   const [newListName, setNewListName] = useState("");
   const [newTaskTitles, setNewTaskTitles] = useState<Record<string, string>>({});
 
@@ -78,6 +84,13 @@ function App() {
   // 任务详情面板的编辑草稿
   const [editTitle, setEditTitle] = useState("");
   const [editNotes, setEditNotes] = useState("");
+
+  // 详情即时保存：输入值镜像到 ref，供防抖与 flush 读取最新值
+  const editTitleRef = useRef("");
+  const editNotesRef = useRef("");
+  const saveTimerRef = useRef<number | null>(null);
+  // 同一错误去重/节流：记住上一次已提示的保存错误
+  const lastSaveErrorRef = useRef<string | null>(null);
 
   const [editingListFile, setEditingListFile] = useState<string | null>(null);
   const [editListName, setEditListName] = useState("");
@@ -151,8 +164,58 @@ function App() {
     }
   }
 
+  // 启动：先确定主题（首帧前 setTheme），再加载清单；主题未定前不画亮色内容
   useEffect(() => {
-    refresh();
+    let cancelled = false;
+    (async () => {
+      const pref = await loadThemePref();
+      if (cancelled) return;
+      setTheme(pref);
+      try {
+        await applyThemePref(pref);
+      } catch {
+        // 权限 / runtime 未就绪：静默降级，界面仍可用
+      }
+      if (cancelled) return;
+      await refresh();
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 「跟随系统」：订阅系统主题变化并同步 color-scheme（带 guard 防回环）
+  const lastSystemThemeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (theme !== "system") return;
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        unlisten = await win.onThemeChanged((event) => {
+          if (cancelled) return;
+          const next = event.payload;
+          if (next === lastSystemThemeRef.current) return;
+          lastSystemThemeRef.current = next;
+          document.documentElement.style.colorScheme = next;
+        });
+      } catch {
+        // 订阅失败忽略：CSS 的 prefers-color-scheme 仍会跟随
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [theme]);
+
+  // 卸载时清掉待写的防抖
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    };
   }, []);
 
   // 挂载时用真实状态校正置顶（默认应为未置顶），并记下未置顶时的默认快照
@@ -191,12 +254,16 @@ function App() {
     });
   }, [lists]);
 
-  // 选中任务：在当前视图内仍存在则保持，否则清空
+  // 选中任务：在当前视图内仍存在则保持，否则清空（清空前 flush 待写改动）
   useEffect(() => {
     const ids = isCompletedView
       ? completedTasks.map((e) => e.task.id)
       : selectedList?.tasks.map((t) => t.id) ?? [];
-    setSelectedTaskId((prev) => (prev && ids.includes(prev) ? prev : null));
+    setSelectedTaskId((prev) => {
+      if (prev && ids.includes(prev)) return prev;
+      if (prev) flushPendingSave();
+      return null;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lists, selectedListFile]);
 
@@ -207,8 +274,12 @@ function App() {
 
   // 选中项切换时，把详情草稿同步为任务当前值（刷新时不覆盖正在编辑的草稿）
   useEffect(() => {
-    setEditTitle(selectedEntry?.task.title ?? "");
-    setEditNotes(selectedEntry?.task.notes ?? "");
+    const title = selectedEntry?.task.title ?? "";
+    const notes = selectedEntry?.task.notes ?? "";
+    editTitleRef.current = title;
+    editNotesRef.current = notes;
+    setEditTitle(title);
+    setEditNotes(notes);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTaskId, selectedListFile]);
 
@@ -343,9 +414,28 @@ function App() {
     else void pinWindow();
   }
 
+  // 切换主题：立即生效；失败记入 actionError（不弹窗）
+  function changeTheme(next: ThemePref) {
+    setTheme(next);
+    void (async () => {
+      setActionError(null);
+      try {
+        await applyThemePref(next);
+      } catch (e) {
+        setActionError(String(e));
+      }
+      try {
+        await invoke("save_settings", { theme: next });
+      } catch (e) {
+        setActionError(String(e));
+      }
+    })();
+  }
+
   function selectList(file: string) {
     if (suppressClickRef.current) return;
     if (file === selectedListFile) return;
+    flushPendingSave();
     setSelectedListFile(file);
     setSelectedTaskId(null);
     setDrawerOpen(false);
@@ -354,12 +444,9 @@ function App() {
   function openTask(taskId: string) {
     if (suppressClickRef.current) return;
     if (!taskId) return;
+    if (taskId !== selectedTaskId) flushPendingSave();
     setSelectedTaskId(taskId);
     setDrawerOpen(true);
-  }
-
-  function closeDrawer() {
-    setDrawerOpen(false);
   }
 
   function submitNewList() {
@@ -380,22 +467,91 @@ function App() {
     });
   }
 
-  function cancelEditTask() {
-    if (!selectedTask) return;
-    setEditTitle(selectedTask.title);
-    setEditNotes(selectedTask.notes ?? "");
+  // ---- 详情即时保存 ----
+
+  // 输入停止 ~400ms 后落盘
+  function scheduleSave() {
+    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      void persistEdit();
+    }, 400);
   }
 
-  function saveTask(listFile: string, taskId: string) {
-    const title = editTitle.trim();
-    if (!title) {
-      setActionError("任务标题不能为空");
-      return;
-    }
-    void run(async () => {
-      await invoke("update_task", { listFile, taskId, title, notes: editNotes });
-    });
+  // 立即落盘待写的防抖改动（失焦 / Esc / Enter / 切换任务前调用）
+  function flushPendingSave() {
+    if (saveTimerRef.current === null) return;
+    window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = null;
+    void persistEdit();
   }
+
+  async function persistEdit() {
+    const task = selectedTask;
+    const listFile = selectedTaskListFile;
+    if (!task || !listFile) return;
+    const title = editTitleRef.current.trim();
+    if (!title) return; // 空标题不落盘，保留磁盘原值
+    const notes = editNotesRef.current;
+    if (title === (task.title ?? "").trim() && notes === (task.notes ?? "")) return;
+    try {
+      await invoke("update_task", { listFile, taskId: task.id, title, notes });
+      lastSaveErrorRef.current = null;
+      await refresh();
+    } catch (e) {
+      reportSaveError(String(e));
+    }
+  }
+
+  // 同一错误只提示一次，避免连续输入时刷屏
+  function reportSaveError(message: string) {
+    if (lastSaveErrorRef.current === message) return;
+    lastSaveErrorRef.current = message;
+    setActionError(message);
+  }
+
+  // 关闭详情：先 flush；空标题未落盘则回填磁盘原值
+  function closeDetail() {
+    flushPendingSave();
+    if (editTitleRef.current.trim() === "") backfillFromDisk();
+    setDrawerOpen(false);
+    if (!isNarrow) setSelectedTaskId(null);
+  }
+
+  function backfillFromDisk() {
+    const title = selectedEntry?.task.title ?? "";
+    const notes = selectedEntry?.task.notes ?? "";
+    editTitleRef.current = title;
+    editNotesRef.current = notes;
+    setEditTitle(title);
+    setEditNotes(notes);
+  }
+
+  function onEditTitleChange(value: string) {
+    editTitleRef.current = value;
+    setEditTitle(value);
+    scheduleSave();
+  }
+
+  function onEditNotesChange(value: string) {
+    editNotesRef.current = value;
+    setEditNotes(value);
+    scheduleSave();
+  }
+
+  // 详情激活时的 Esc：关闭详情（只在有选中任务时绑定，不劫持全局）
+  const closeDetailRef = useRef<() => void>(() => {});
+  closeDetailRef.current = closeDetail;
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.isComposing) return;
+      event.preventDefault();
+      closeDetailRef.current();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedTaskId]);
 
   function removeTask(listFile: string, task: Task) {
     if (!window.confirm(`删除任务「${task.title || "(无标题)"}」？`)) return;
@@ -698,7 +854,19 @@ function App() {
             className="edit-title"
             value={editTitle}
             placeholder="标题"
-            onChange={(e) => setEditTitle(e.currentTarget.value)}
+            onChange={(e) => onEditTitleChange(e.currentTarget.value)}
+            onBlur={flushPendingSave}
+            onKeyDown={(e) => {
+              // Enter = 保存并关闭（IME 组合态不触发）
+              if (
+                e.key === "Enter" &&
+                !e.nativeEvent.isComposing &&
+                e.nativeEvent.keyCode !== 229
+              ) {
+                e.preventDefault();
+                closeDetailRef.current();
+              }
+            }}
           />
         </label>
         <label className="field">
@@ -708,22 +876,22 @@ function App() {
             value={editNotes}
             placeholder="备注"
             rows={3}
-            onChange={(e) => setEditNotes(e.currentTarget.value)}
+            onChange={(e) => onEditNotesChange(e.currentTarget.value)}
+            onBlur={flushPendingSave}
+            onKeyDown={(e) => {
+              // Ctrl/Cmd+Enter = 保存并关闭；普通 Enter 保留换行
+              if (
+                e.key === "Enter" &&
+                (e.ctrlKey || e.metaKey) &&
+                !e.nativeEvent.isComposing &&
+                e.nativeEvent.keyCode !== 229
+              ) {
+                e.preventDefault();
+                closeDetailRef.current();
+              }
+            }}
           />
         </label>
-        <div className="edit-actions">
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={() => saveTask(selectedTaskListFile, selectedTask.id)}
-            disabled={busy}
-          >
-            保存
-          </button>
-          <button type="button" onClick={cancelEditTask} disabled={busy}>
-            取消
-          </button>
-        </div>
 
         <dl className="detail-meta">
           <div className="detail-row">
@@ -825,6 +993,18 @@ function App() {
     </li>
   );
 
+  if (loading) {
+    // 主题确定前不画亮色内容，避免深色用户闪白
+    return (
+      <main className="app">
+        <div className="app-boot" role="status" aria-live="polite">
+          <span className="boot-spinner" aria-hidden="true" />
+          <p className="hint">加载中…</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="app">
       <div className="app-main">
@@ -857,6 +1037,27 @@ function App() {
                 <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
               </svg>
             </button>
+            <button
+              type="button"
+              className="settings-btn"
+              onClick={() => setSettingsOpen(true)}
+              aria-label="设置"
+              title="设置"
+            >
+              <svg
+                className="settings-icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
           </div>
         </header>
 
@@ -866,7 +1067,6 @@ function App() {
 
         {actionError && <p className="error">操作失败：{actionError}</p>}
 
-        {loading && <p className="hint">加载中…</p>}
         {error && (
           <p className="error">
             出错了：{error}
@@ -1026,7 +1226,7 @@ function App() {
             <div className={`detail-shell${drawerOpen ? " is-open" : ""}`}>
               <div
                 className="drawer-backdrop"
-                onClick={closeDrawer}
+                onClick={closeDetail}
                 aria-hidden="true"
               />
               <aside className="detail-panel" aria-label="任务详情">
@@ -1035,7 +1235,7 @@ function App() {
                   <button
                     type="button"
                     className="drawer-close"
-                    onClick={closeDrawer}
+                    onClick={closeDetail}
                     aria-label="关闭"
                     title="关闭"
                   >
@@ -1055,6 +1255,14 @@ function App() {
           y={menu.y}
           items={menuItems}
           onClose={() => setMenu(null)}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsModal
+          theme={theme}
+          onThemeChange={changeTheme}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
     </main>

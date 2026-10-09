@@ -31,6 +31,13 @@ pnpm tauri dev      # 首次编译较慢
 
 发布步骤见 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
+## 升级
+
+- **直接双击新版安装包即可升级**（`TodoList_<版本>_x64-setup.exe`），无需先手动卸载旧版。
+- 维护页默认选「**先卸载再安装**」（Uninstall before installing）：先运行旧版卸载器再安装新版；也可改选「**Do not uninstall**」，即原地覆盖安装。两种方式都能成功升级。
+- 旧版卸载器页面若勾选「**删除应用数据**」（Delete the application data），会删除 `%APPDATA%\com.lftan.todolist`（含主题偏好 `settings.yaml`）；**任务数据在 `文档\TodoList`，不受影响**。
+- **不支持降级**：安装程序已禁止用旧版本安装包覆盖版本更高的已安装版本。
+
 ## 当前功能
 
 - 清单：新建 / 重命名 / 删除 / 上移 / 下移
@@ -66,6 +73,8 @@ tasks:
 
 完整字段契约见 [`docs/pdr/10-app/02-interfaces.md`](docs/pdr/10-app/02-interfaces.md)。
 
+**设置** —— `%APPDATA%\com.lftan.todolist\settings.yaml`（当前只有主题偏好；与任务数据分家，见 [ADR-0006](docs/adr/0006-设置存储-应用配置目录.md)）。
+
 **构建产物** —— 前端 `dist/`；Rust `src-tauri/target/`；发布打包用 `pnpm tauri build`。
 
 提示：v1 无内置备份；建议将数据目录纳入 git / 网盘。
@@ -85,7 +94,7 @@ pnpm install
 pnpm tauri dev            # 开发运行
 pnpm build                # 前端构建（tsc + vite）
 cd src-tauri
-cargo test                # 存储层测试（13 个）
+cargo test                # 存储层测试（21 个）
 cargo clippy --all-targets
 cargo check
 ```
