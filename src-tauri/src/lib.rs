@@ -1,5 +1,7 @@
 mod storage;
 
+use tauri::Manager;
+
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
 /// 单个文件失败不影响其余清单，失败信息通过 `warnings` 返回。
 #[tauri::command]
@@ -91,6 +93,13 @@ fn reorder_list(list_file: String, before_list_file: Option<String>) -> Result<(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            // 把主窗口标题设为「TodoList <版本>」；找不到窗口时静默忽略。
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(&format!("TodoList {}", app.package_info().version));
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_lists,
             set_task_status,

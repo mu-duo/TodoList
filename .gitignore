@@ -15,6 +15,9 @@ dist-ssr
 # Tauri / Rust build output
 src-tauri/target/
 
+# 发布产物
+release/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

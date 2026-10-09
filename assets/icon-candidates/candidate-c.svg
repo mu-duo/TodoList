@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img">
+  <title>TodoList 候选 C · 几何字母 T（品牌字标）</title>
+  <defs>
+    <linearGradient id="c-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b6ce8"/>
+      <stop offset="1" stop-color="#434ec4"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#c-bg)"/>
+  <!-- 几何 T：一根横梁 + 一根竖笔，圆头等宽 -->
+  <g fill="#ffffff">
+    <rect x="258" y="314" width="508" height="120" rx="60"/>
+    <rect x="452" y="314" width="120" height="396" rx="60"/>
+  </g>
+</svg>

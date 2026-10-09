@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img">
+  <title>TodoList 候选 B · 清单卡片折角 + 对勾</title>
+  <defs>
+    <linearGradient id="b-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b6ce8"/>
+      <stop offset="1" stop-color="#434ec4"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#b-bg)"/>
+  <!-- 白色页面，右上角折角 -->
+  <path d="M308 196 H624 L792 364 V752 A76 76 0 0 1 716 828 H308 A76 76 0 0 1 232 752 V272 A76 76 0 0 1 308 196 Z" fill="#ffffff"/>
+  <!-- 折角翻片（浅靛蓝） -->
+  <path d="M624 196 L792 364 H624 Z" fill="#cdd4f7"/>
+  <!-- 页面上的对勾 -->
+  <path d="M360 512 L478 630 L668 428" fill="none" stroke="#4f5bd5" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
