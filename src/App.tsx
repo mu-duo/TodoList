@@ -5,6 +5,7 @@ import { arrayMove } from "@dnd-kit/sortable";
 import { SortableList } from "./components/SortableList";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { SettingsModal } from "./components/SettingsModal";
+import { ConfirmModal } from "./components/ConfirmModal";
 import { applyThemePref, loadThemePref, type ThemePref } from "./theme";
 import { useMediaQuery, usePrefersReducedMotion } from "./hooks";
 import "./App.css";
@@ -65,6 +66,11 @@ function App() {
   // 设置面板（模态）与主题偏好
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>("system");
+
+  // 待确认删除的清单（非空即显示确认模态）
+  const [pendingDeleteList, setPendingDeleteList] = useState<TaskList | null>(
+    null,
+  );
 
   const [newListName, setNewListName] = useState("");
   const [newTaskTitles, setNewTaskTitles] = useState<Record<string, string>>({});
@@ -828,7 +834,7 @@ function App() {
   }, [selectedTaskId]);
 
   function removeTask(listFile: string, task: Task) {
-    if (!window.confirm(`删除任务「${task.title || "(无标题)"}」？`)) return;
+    // 直接删除（行内图标 + 悬停显形 + 位置固定防误删，不做 web 确认框）
     void run(() => invoke("delete_task", { listFile, taskId: task.id }));
   }
 
@@ -860,7 +866,14 @@ function App() {
   }
 
   function removeList(list: TaskList) {
-    if (!window.confirm(`删除清单「${list.name}」？该操作会删除对应文件。`)) return;
+    // 打开自定义确认模态（不再用 window.confirm）；用户确认后才真正删除
+    setPendingDeleteList(list);
+  }
+
+  function confirmRemoveList() {
+    const list = pendingDeleteList;
+    setPendingDeleteList(null);
+    if (!list) return;
     void run(() => invoke("delete_list", { listFile: list.file }));
   }
 
@@ -1050,8 +1063,25 @@ function App() {
             }}
             onPointerDown={(e) => e.stopPropagation()}
             disabled={busy || !task.id}
+            aria-label="删除任务"
+            title="删除任务"
           >
-            删除
+            <svg
+              className="trash-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M3 6h18" />
+              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+            </svg>
           </button>
         </div>
       </div>
@@ -1664,6 +1694,16 @@ function App() {
           theme={theme}
           onThemeChange={changeTheme}
           onClose={() => setSettingsOpen(false)}
+        />
+      )}
+
+      {pendingDeleteList && (
+        <ConfirmModal
+          title="删除清单"
+          message={`「${pendingDeleteList.name}」及其中的任务将一并删除，且无法撤销。对应文件也会一并删除。`}
+          confirmLabel="删除"
+          onConfirm={confirmRemoveList}
+          onCancel={() => setPendingDeleteList(null)}
         />
       )}
     </main>

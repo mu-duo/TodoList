@@ -146,6 +146,13 @@ body {
   height: 16px;
 }
 
+/* 行内删除图标（垃圾桶）：与图钉 / 齿轮同风格，16px */
+.trash-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
 /* 激活态：强调色高亮 */
 .pin-btn.is-pinned {
   color: var(--accent);
@@ -1222,6 +1229,27 @@ button:focus-visible {
 .modal-close:hover:not(:disabled) {
   color: var(--text);
   background: var(--surface-muted);
+}
+
+/* 通用确认模态（ConfirmModal）：正文 + 右下角操作区 */
+.confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.confirm-message {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .settings-body {
