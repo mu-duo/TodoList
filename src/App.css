@@ -40,6 +40,13 @@
 
   --ease: 150ms ease;
 
+  /* 层叠层级（从小到大）：内容 < 右键菜单 < 拖拽浮层 < 窄屏抽屉 < 设置模态。
+     数值与 src/layers.ts 保持一致（拖拽浮层在 JS 侧通过 DragOverlay 的 zIndex 使用）。 */
+  --z-menu: 100;
+  --z-drag: 300;
+  --z-drawer: 400;
+  --z-modal: 500;
+
   color-scheme: light;
 }
 
@@ -465,6 +472,12 @@ button:focus-visible {
   border-color: transparent;
 }
 
+/* 选中行不画焦点环：该行已有 accent 选中边框（.task-card.is-selected），焦点环冗余。
+   仅限选中行——未选中行仍保留全局 button:focus-visible 的键盘焦点环（不做全局 outline:none）。 */
+.task-card.is-selected .task-open:focus-visible {
+  outline: none;
+}
+
 .task-title {
   display: block;
   line-height: 1.5;
@@ -489,16 +502,33 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
-/* 操作区 = 卡片右侧热区。删除按钮默认隐藏，悬浮热区 / 聚焦时淡入 */
+/* 操作区 = 卡片右侧热区。计数与删除按钮叠放同一格：
+   未悬停显示计数，悬停 / 聚焦时换成删除按钮；叠放保证切换不引起布局跳动。 */
 .task-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
   flex: none;
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: center;
   /* 加宽命中区域：向外撑开 padding，再用等量负 margin 还原视觉位置与占位 */
   padding: 10px 14px 10px 22px;
   margin: -10px -14px -10px -22px;
   border-radius: 10px;
+}
+
+/* 计数与删除叠在同一格、靠右；容器宽度取两者较宽者 */
+.task-actions > * {
+  grid-area: 1 / 1;
+  justify-self: end;
+}
+
+/* 子任务计数：次级文字、不可点击（有子任务时才渲染） */
+.task-subtask-count {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: opacity var(--ease);
 }
 
 /* 隐藏态：保留占位（不引起布局跳动），但不响应指针 */
@@ -510,7 +540,7 @@ button:focus-visible {
     background-color var(--ease), color var(--ease);
 }
 
-/* 悬浮右侧热区，或键盘 Tab 聚焦到其中按钮时显现 */
+/* 悬浮右侧热区，或键盘 Tab 聚焦到其中按钮时：计数隐去、删除显现 */
 .task-actions:hover .row-action,
 .task-actions:focus-within .row-action {
   opacity: 1;
@@ -518,12 +548,32 @@ button:focus-visible {
   pointer-events: auto;
 }
 
-/* 触屏无 hover：按钮常驻可点 */
+.task-actions:hover .task-subtask-count,
+.task-actions:focus-within .task-subtask-count {
+  opacity: 0;
+}
+
+/* 触屏无 hover：计数与删除并排常显（计数在删除左侧） */
 @media (hover: none) {
+  .task-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .task-actions > * {
+    grid-area: auto;
+    justify-self: auto;
+  }
+
   .task-actions .row-action {
     opacity: 1;
     transform: none;
     pointer-events: auto;
+  }
+
+  .task-actions .task-subtask-count {
+    opacity: 1;
   }
 }
 
@@ -810,30 +860,155 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
+/* ---------------------------------------- 子任务（标题 ↔ 备注之间的独立板块） ---- */
+
+.subtask-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.subtask-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* 板块内的「+」录入入口 */
+.subtask-add {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--accent);
+  background: transparent;
+  border-color: transparent;
+}
+
+.subtask-add:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+
 .subtask-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
 .subtask {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
+  padding: 2px 0;
 }
 
-.subtask.done {
+/* 等待落盘：降透明度，抑制连点 */
+.subtask.is-pending {
+  opacity: 0.5;
+}
+
+/* 勾选标记：本身就是可点按钮（不整行点击） */
+.subtask-mark {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+.subtask-mark:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+
+.subtask-title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  cursor: text;
+}
+
+/* 双击改名的可发现性：悬停淡下划线（text-decoration 不影响布局，不跳动） */
+.subtask:not(.done) .subtask-title:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--text-faint);
+  text-underline-offset: 2px;
+}
+
+.subtask.done .subtask-title {
   color: var(--text-faint);
   text-decoration: line-through;
   text-decoration-color: var(--text-faint);
 }
 
-.subtask-mark {
+/* 就地改名输入框（双击文字进入；编辑态下该条只留输入框） */
+.subtask-edit {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  font-size: 0.9rem;
+}
+
+/* 条尾删除：默认悬停显示，键盘聚焦亦可及 */
+.subtask-remove {
   flex: none;
-  color: var(--text-muted);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--text-faint);
+  background: transparent;
+  border-color: transparent;
+  opacity: 0;
+  transition: opacity var(--ease), color var(--ease),
+    background-color var(--ease);
+}
+
+.subtask:hover .subtask-remove,
+.subtask:focus-within .subtask-remove {
+  opacity: 1;
+}
+
+.subtask-remove:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: transparent;
+}
+
+/* 触屏无 hover：删除按钮常显 */
+@media (hover: none) {
+  .subtask-remove {
+    opacity: 1;
+  }
+}
+
+/* 就地录入框 */
+.subtask-input {
+  padding: 5px 9px;
+  font-size: 0.9rem;
 }
 
 /* -------------------------------------------------------------- 拖拽 ---- */
@@ -893,7 +1068,7 @@ button:focus-visible {
 
 .context-menu {
   position: fixed;
-  z-index: 100;
+  z-index: var(--z-menu);
   min-width: 128px;
   padding: 4px;
   background: var(--surface);
@@ -972,7 +1147,7 @@ button:focus-visible {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 200;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1166,12 +1341,12 @@ button:focus-visible {
     margin-top: 0;
   }
 
-  /* 任务详情改为右侧抽屉 */
+  /* 任务详情改为右侧抽屉（层叠见 :root 的 --z-* 层级） */
   .detail-shell {
     display: block;
     position: fixed;
     inset: 0;
-    z-index: 50;
+    z-index: var(--z-drawer);
     pointer-events: none;
   }
 

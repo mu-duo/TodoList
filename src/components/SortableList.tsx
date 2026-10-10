@@ -19,6 +19,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { usePrefersReducedMotion } from "../hooks";
+import { Z_LAYER } from "../layers";
 
 type Axis = "vertical" | "horizontal";
 
@@ -32,8 +33,15 @@ type SortableListProps = {
   sortable?: boolean;
   /** 每个 <li> 的类名（含选中 / 完成等状态）。 */
   rowClassName: (id: string) => string;
-  /** <li> 内部内容。 */
-  renderItem: (id: string) => ReactNode;
+  /**
+   * <li> 内部内容。第二个参数是可选的「拖拽激活节点」ref：
+   * 绑定到实际的拖拽把手/按钮上，键盘拖拽结束会把焦点还给该节点
+   * （否则 dnd-kit 会聚焦行内第一个可聚焦元素，任务行会落到勾选框）。
+   */
+  renderItem: (
+    id: string,
+    activatorRef?: (element: HTMLElement | null) => void,
+  ) => ReactNode;
   /** 拖拽浮层内容（不提供则不显示浮层）。 */
   renderOverlay?: (id: string) => ReactNode;
   /** 固定尾项（如「已完成」），不可拖拽。 */
@@ -70,7 +78,16 @@ export function SortableList({
   const [activeId, setActiveId] = useState<string | null>(null);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+      // 键盘拖拽只由 Space 激活/落定，Esc 取消。
+      // dnd-kit 默认还含 Enter，会抢走行内按钮的原生回车（任务行＝打开详情），故在此收敛。
+      keyboardCodes: {
+        start: ["Space"],
+        cancel: ["Escape"],
+        end: ["Space"],
+      },
+    }),
   );
 
   const strategy =
@@ -127,13 +144,16 @@ export function SortableList({
               disabled={itemDisabled?.(id) ?? false}
               onContextMenu={onItemContextMenu}
             >
-              {renderItem(id)}
+              {(activatorRef) => renderItem(id, activatorRef)}
             </SortableRow>
           ))}
           {footer}
         </ul>
       </SortableContext>
-      <DragOverlay dropAnimation={reduced ? null : undefined}>
+      <DragOverlay
+        zIndex={Z_LAYER.drag}
+        dropAnimation={reduced ? null : undefined}
+      >
         {activeId && renderOverlay ? (
           <div className="drag-overlay">{renderOverlay(activeId)}</div>
         ) : null}
@@ -148,7 +168,8 @@ type SortableRowProps = {
   className: string;
   disabled: boolean;
   onContextMenu?: (id: string, event: MouseEvent) => void;
-  children: ReactNode;
+  /** 渲染行内容；入参为「拖拽激活节点」ref，供键盘拖拽结束后归还焦点。 */
+  children: (activatorRef: (element: HTMLElement | null) => void) => ReactNode;
 };
 
 function SortableRow({
@@ -159,7 +180,14 @@ function SortableRow({
   onContextMenu,
   children,
 }: SortableRowProps) {
-  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+  const {
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
     id,
     disabled,
   });
@@ -177,7 +205,7 @@ function SortableRow({
       onContextMenu={(event) => onContextMenu?.(id, event)}
       {...listeners}
     >
-      {children}
+      {children(setActivatorNodeRef)}
     </li>
   );
 }

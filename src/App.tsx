@@ -92,11 +92,37 @@ function App() {
   // 同一错误去重/节流：记住上一次已提示的保存错误
   const lastSaveErrorRef = useRef<string | null>(null);
 
+  // ---- 子任务编辑（独立即时写盘通道，无防抖）----
+  // 本地镜像：增 / 删 / 勾选成功后按命令返回值就地更新，不做整表刷新
+  const [subtasks, setSubtasks] = useState<Subtask[]>([]);
+  // 就地录入框的开启态与草稿（失焦保留、关详情丢弃）
+  const [subtaskDraftOpen, setSubtaskDraftOpen] = useState(false);
+  const [subtaskDraft, setSubtaskDraft] = useState("");
+  // 正在等待落盘的子任务 id（禁用重复触发 + 视觉降透明度）
+  const [subtaskBusyIds, setSubtaskBusyIds] = useState<Set<string>>(new Set());
+  const subtaskBusyRef = useRef<Set<string>>(new Set());
+  const addSubtaskPendingRef = useRef(false);
+  const subtaskInputRef = useRef<HTMLInputElement>(null);
+  // 子任务错误单独去重，避免与标题/备注保存通道互相干扰
+  const lastSubtaskErrorRef = useRef<string | null>(null);
+
+  // 子任务改名（双击进入编辑态）：正在编辑的 id、草稿、输入框、防重复触发
+  const [editingSubtaskId, setEditingSubtaskId] = useState<string | null>(null);
+  const [subtaskEditDraft, setSubtaskEditDraft] = useState("");
+  const subtaskEditRef = useRef<HTMLInputElement>(null);
+  // 本轮编辑是否已被处理（Enter/Esc/失焦只认一次，避免错误二次提交）
+  const subtaskEditHandledRef = useRef(false);
+  // 最新编辑 id 的镜像：异步收尾时判断是否已切走，避免关掉后一个编辑态
+  const editingSubtaskIdRef = useRef<string | null>(null);
+  editingSubtaskIdRef.current = editingSubtaskId;
+
   const [editingListFile, setEditingListFile] = useState<string | null>(null);
   const [editListName, setEditListName] = useState("");
 
   // 拖拽结束后的「点击抑制」：避免松手时误触发选中
   const suppressClickRef = useRef(false);
+  // 详情由键盘打开（click.detail===0）→ 关闭时保留焦点；指针打开 → 清焦点环
+  const openedByKeyboardRef = useRef(true);
   // 置顶前的最小化 / 缩放 / 最大化快照（用于逐条还原）
   const pinSnapshotRef = useRef<{
     minimizable: boolean;
@@ -140,6 +166,39 @@ function App() {
   }, [isCompletedView, completedTasks, selectedList, selectedTaskId]);
   const selectedTask = selectedEntry?.task ?? null;
   const selectedTaskListFile = selectedEntry?.listFile ?? null;
+
+  // 磁盘侧子任务的「指纹」：选中任务切换、或外部/刷新/本地改动子任务时重新同步本地镜像
+  const selectedSubtasksKey = JSON.stringify(selectedTask?.subtasks ?? null);
+  // 切换任务：重置录入草稿与改名编辑态（仅在换任务时，避免本地改动子任务时误清空）
+  useEffect(() => {
+    setSubtaskDraftOpen(false);
+    setSubtaskDraft("");
+    setEditingSubtaskId(null);
+    setSubtaskEditDraft("");
+    subtaskEditHandledRef.current = true;
+  }, [selectedTaskId]);
+
+  // 子任务数据变化（详情内增 / 删 / 勾 / 改名，或外部刷新）→ 同步本地镜像
+  useEffect(() => {
+    setSubtasks(selectedTask?.subtasks ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskId, selectedSubtasksKey]);
+
+  // 录入框出现即聚焦（含连续录入时保持聚焦）
+  useEffect(() => {
+    if (subtaskDraftOpen) subtaskInputRef.current?.focus();
+  }, [subtaskDraftOpen]);
+
+  // 改名框出现即聚焦并全选（双击进入编辑态）
+  useEffect(() => {
+    if (editingSubtaskId) {
+      const el = subtaskEditRef.current;
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    }
+  }, [editingSubtaskId]);
 
   const listIds = useMemo(() => lists.map((l) => l.file), [lists]);
   const taskIds = useMemo(() => viewTasks.map((e) => e.task.id), [viewTasks]);
@@ -441,10 +500,16 @@ function App() {
     setDrawerOpen(false);
   }
 
-  function openTask(taskId: string) {
+  function openTask(taskId: string, viaKeyboard = false) {
     if (suppressClickRef.current) return;
     if (!taskId) return;
-    if (taskId !== selectedTaskId) flushPendingSave();
+    if (taskId !== selectedTaskId) {
+      // 仅在「首次打开该任务」时记录打开方式：指针 → 关闭时清焦点环；键盘 → 保留。
+      // 重复激活（如指针点击后再按 Enter，click.detail===0）不改写最初来源，
+      // 否则「指针 → 回车 → Esc」会漏掉 closeDetail 的清焦点分支。
+      openedByKeyboardRef.current = viaKeyboard;
+      flushPendingSave();
+    }
     setSelectedTaskId(taskId);
     setDrawerOpen(true);
   }
@@ -510,10 +575,23 @@ function App() {
     setActionError(message);
   }
 
-  // 关闭详情：先 flush；空标题未落盘则回填磁盘原值
+  // 关闭详情：先 flush；空标题未落盘则回填磁盘原值；丢弃未提交的子任务草稿
   function closeDetail() {
     flushPendingSave();
     if (editTitleRef.current.trim() === "") backfillFromDisk();
+    setSubtaskDraftOpen(false);
+    setSubtaskDraft("");
+    subtaskEditHandledRef.current = true;
+    setEditingSubtaskId(null);
+    setSubtaskEditDraft("");
+    // 焦点归还：指针打开的详情，关闭时清掉行按钮焦点（避免 Esc 触发 :focus-visible 焦点环）；
+    // 键盘打开的保留焦点与焦点环。禁止全局 outline:none。
+    if (!openedByKeyboardRef.current) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active.classList.contains("task-open")) {
+        active.blur();
+      }
+    }
     setDrawerOpen(false);
     if (!isNarrow) setSelectedTaskId(null);
   }
@@ -537,6 +615,202 @@ function App() {
     editNotesRef.current = value;
     setEditNotes(value);
     scheduleSave();
+  }
+
+  // ---- 子任务：增 / 删 / 勾选（即时写盘，无防抖）----
+
+  // 子任务改动同时落到列表里的对应 task（行尾计数的数据源），保持单一 state 源
+  function applyTaskSubtasks(
+    listFile: string,
+    taskId: string,
+    update: (subs: Subtask[]) => Subtask[],
+  ) {
+    setLists((prev) =>
+      prev.map((list) =>
+        list.file === listFile
+          ? {
+              ...list,
+              tasks: list.tasks.map((t) =>
+                t.id === taskId
+                  ? { ...t, subtasks: update(t.subtasks ?? []) }
+                  : t,
+              ),
+            }
+          : list,
+      ),
+    );
+  }
+
+  // 子任务错误同样去重/节流，避免连点刷屏；与标题/备注通道互不干扰
+  function reportSubtaskError(message: string) {
+    if (lastSubtaskErrorRef.current === message) return;
+    lastSubtaskErrorRef.current = message;
+    setActionError(message);
+  }
+
+  function markSubtaskBusy(id: string, busy: boolean) {
+    const set = subtaskBusyRef.current;
+    if (busy) set.add(id);
+    else set.delete(id);
+    setSubtaskBusyIds(new Set(set));
+  }
+
+  function openSubtaskDraft() {
+    setSubtaskDraftOpen(true);
+  }
+
+  // 关闭录入框并丢弃未提交草稿（空回车 / Esc / 关详情）
+  function discardSubtaskDraft() {
+    setSubtaskDraftOpen(false);
+    setSubtaskDraft("");
+  }
+
+  async function addSubtask() {
+    const title = subtaskDraft.trim();
+    if (!title) {
+      discardSubtaskDraft();
+      return;
+    }
+    if (!selectedTask || !selectedTaskListFile) return;
+    if (addSubtaskPendingRef.current) return;
+    addSubtaskPendingRef.current = true;
+    const listFile = selectedTaskListFile;
+    const taskId = selectedTask.id;
+    try {
+      const created = await invoke<Subtask>("add_subtask", {
+        listFile,
+        taskId,
+        title,
+      });
+      // 成功后追加到本地镜像，保持输入框打开并聚焦（连续录入）
+      setSubtasks((prev) => [...prev, created]);
+      applyTaskSubtasks(listFile, taskId, (prev) => [...prev, created]);
+      setSubtaskDraft("");
+      lastSubtaskErrorRef.current = null;
+      subtaskInputRef.current?.focus();
+    } catch (e) {
+      reportSubtaskError(String(e));
+    } finally {
+      addSubtaskPendingRef.current = false;
+    }
+  }
+
+  async function toggleSubtask(sub: Subtask) {
+    if (!selectedTask || !selectedTaskListFile) return;
+    if (subtaskBusyRef.current.has(sub.id)) return;
+    const status = sub.status === "done" ? "open" : "done";
+    const listFile = selectedTaskListFile;
+    const taskId = selectedTask.id;
+    markSubtaskBusy(sub.id, true);
+    try {
+      await invoke("set_subtask_status", {
+        listFile,
+        taskId,
+        subtaskId: sub.id,
+        status,
+      });
+      // 不做乐观更新：成功后再改本地状态
+      setSubtasks((prev) =>
+        prev.map((s) => (s.id === sub.id ? { ...s, status } : s)),
+      );
+      applyTaskSubtasks(listFile, taskId, (prev) =>
+        prev.map((s) => (s.id === sub.id ? { ...s, status } : s)),
+      );
+      lastSubtaskErrorRef.current = null;
+    } catch (e) {
+      reportSubtaskError(String(e));
+    } finally {
+      markSubtaskBusy(sub.id, false);
+    }
+  }
+
+  async function removeSubtask(sub: Subtask) {
+    if (!selectedTask || !selectedTaskListFile) return;
+    if (subtaskBusyRef.current.has(sub.id)) return;
+    const listFile = selectedTaskListFile;
+    const taskId = selectedTask.id;
+    markSubtaskBusy(sub.id, true);
+    try {
+      await invoke("remove_subtask", { listFile, taskId, subtaskId: sub.id });
+      setSubtasks((prev) => prev.filter((s) => s.id !== sub.id));
+      applyTaskSubtasks(listFile, taskId, (prev) =>
+        prev.filter((s) => s.id !== sub.id),
+      );
+      lastSubtaskErrorRef.current = null;
+    } catch (e) {
+      reportSubtaskError(String(e));
+    } finally {
+      markSubtaskBusy(sub.id, false);
+    }
+  }
+
+  // ---- 子任务改名（双击文字进入编辑态；即时写盘，无防抖）----
+
+  // 进入编辑态：预填原值，聚焦 + 全选由 effect 完成
+  function startEditSubtask(sub: Subtask) {
+    if (subtaskBusyRef.current.has(sub.id)) return; // 在途请求：忽略双击
+    subtaskEditHandledRef.current = false;
+    setEditingSubtaskId(sub.id);
+    setSubtaskEditDraft(sub.title ?? "");
+  }
+
+  // 退出编辑态（不改本地值）
+  function finishSubtaskEdit() {
+    subtaskEditHandledRef.current = true;
+    setEditingSubtaskId(null);
+    setSubtaskEditDraft("");
+  }
+
+  // 提交改名：空 / 未改动 → 视为取消；否则落盘后更新本地
+  async function commitSubtaskEdit() {
+    if (subtaskEditHandledRef.current) return;
+    const id = editingSubtaskId;
+    if (!id) return;
+    const title = subtaskEditDraft.trim();
+    const current = subtasks.find((s) => s.id === id);
+    // 空标题或与磁盘值一致：取消 / 无操作，不调命令、不删除
+    if (!title || !current || current.title === title) {
+      finishSubtaskEdit();
+      return;
+    }
+    if (subtaskBusyRef.current.has(id)) return; // 在途：不重复提交
+    if (!selectedTask || !selectedTaskListFile) {
+      finishSubtaskEdit();
+      return;
+    }
+    const listFile = selectedTaskListFile;
+    const taskId = selectedTask.id;
+    subtaskEditHandledRef.current = true; // 先占位，避免失焦再次提交
+    markSubtaskBusy(id, true);
+    try {
+      await invoke("set_subtask_title", {
+        listFile,
+        taskId,
+        subtaskId: id,
+        title,
+      });
+      setSubtasks((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, title } : s)),
+      );
+      applyTaskSubtasks(listFile, taskId, (prev) =>
+        prev.map((s) => (s.id === id ? { ...s, title } : s)),
+      );
+      lastSubtaskErrorRef.current = null;
+    } catch (e) {
+      reportSubtaskError(String(e)); // 失败：退出编辑态、保留原值
+    } finally {
+      markSubtaskBusy(id, false);
+      // 若期间已切到别的子任务编辑，别把对方的编辑态关掉
+      if (editingSubtaskIdRef.current === id) {
+        setEditingSubtaskId(null);
+        setSubtaskEditDraft("");
+      }
+    }
+  }
+
+  // 取消改名（Esc）：还原、不调命令
+  function cancelSubtaskEdit() {
+    finishSubtaskEdit();
   }
 
   // 详情激活时的 Esc：关闭详情（只在有选中任务时绑定，不劫持全局）
@@ -714,9 +988,15 @@ function App() {
 
   // ---- 行渲染 ----
 
-  function renderTaskCard(entry: ViewTask) {
+  function renderTaskCard(
+    entry: ViewTask,
+    activatorRef?: (element: HTMLElement | null) => void,
+  ) {
     const { task } = entry;
     const isDone = leaving.get(task.id) ?? task.status === "done";
+    const subs = task.subtasks ?? [];
+    const total = subs.length;
+    const doneCount = subs.filter((s) => s.status === "done").length;
     return (
       <div className="task-row">
         <input
@@ -732,7 +1012,8 @@ function App() {
         <button
           type="button"
           className="task-open"
-          onClick={() => openTask(task.id)}
+          ref={activatorRef}
+          onClick={(e) => openTask(task.id, e.detail === 0)}
           disabled={!task.id}
           title="查看详情"
         >
@@ -752,6 +1033,14 @@ function App() {
           )}
         </button>
         <div className="task-actions">
+          {total > 0 && (
+            <span
+              className="task-subtask-count"
+              title={`已完成 ${doneCount} / 共 ${total} 子任务`}
+            >
+              {doneCount}/{total}
+            </span>
+          )}
           <button
             type="button"
             className="row-action danger"
@@ -869,6 +1158,132 @@ function App() {
             }}
           />
         </label>
+
+        <div className="subtask-block">
+          <div className="subtask-head">
+            <span className="field-label">子任务 · {subtasks.length}</span>
+            <button
+              type="button"
+              className="subtask-add"
+              onClick={openSubtaskDraft}
+              aria-label="添加子任务"
+              title="添加子任务"
+            >
+              +
+            </button>
+          </div>
+
+          {subtasks.length > 0 && (
+            <ul className="subtask-list">
+              {subtasks.map((sub) => {
+                const done = sub.status === "done";
+                const pending = subtaskBusyIds.has(sub.id);
+                const editing = editingSubtaskId === sub.id;
+                return (
+                  <li
+                    key={sub.id}
+                    className={`subtask${done ? " done" : ""}${
+                      pending ? " is-pending" : ""
+                    }${editing ? " editing" : ""}`}
+                  >
+                    {editing ? (
+                      <input
+                        ref={subtaskEditRef}
+                        className="subtask-edit"
+                        value={subtaskEditDraft}
+                        placeholder="子任务…"
+                        onChange={(e) =>
+                          setSubtaskEditDraft(e.currentTarget.value)
+                        }
+                        onKeyDown={(e) => {
+                          // IME 组合态一律不触发
+                          if (
+                            e.nativeEvent.isComposing ||
+                            e.nativeEvent.keyCode === 229
+                          )
+                            return;
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void commitSubtaskEdit();
+                          } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            cancelSubtaskEdit();
+                          }
+                        }}
+                        onBlur={() => void commitSubtaskEdit()}
+                      />
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className="subtask-mark"
+                          onClick={() => void toggleSubtask(sub)}
+                          disabled={pending}
+                          aria-pressed={done}
+                          aria-label={done ? "标记为未完成" : "标记为已完成"}
+                          title={done ? "标记为未完成" : "标记为已完成"}
+                        >
+                          {done ? "✓" : "○"}
+                        </button>
+                        <span
+                          className="subtask-title"
+                          onDoubleClick={() => startEditSubtask(sub)}
+                          title="双击改名"
+                        >
+                          {sub.title || "(无标题)"}
+                        </span>
+                        <button
+                          type="button"
+                          className="subtask-remove"
+                          onClick={() => void removeSubtask(sub)}
+                          disabled={pending}
+                          aria-label="删除子任务"
+                          title="删除子任务"
+                        >
+                          ×
+                        </button>
+                      </>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {subtaskDraftOpen && (
+            <input
+              ref={subtaskInputRef}
+              className="subtask-input"
+              value={subtaskDraft}
+              placeholder="子任务…"
+              onChange={(e) => setSubtaskDraft(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                // IME 组合态一律不触发
+                if (
+                  e.nativeEvent.isComposing ||
+                  e.nativeEvent.keyCode === 229
+                )
+                  return;
+                if (e.key === "Enter") {
+                  // 隔离：不得冒泡触发详情面板的全局行为
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void addSubtask();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  discardSubtaskDraft();
+                }
+              }}
+              onBlur={() => {
+                /* 失焦不落盘、保留草稿 */
+              }}
+            />
+          )}
+        </div>
+
         <label className="field">
           <span className="field-label">备注</span>
           <textarea
@@ -916,28 +1331,6 @@ function App() {
               {selectedTask.tags && selectedTask.tags.length > 0
                 ? selectedTask.tags.join("、")
                 : "—"}
-            </dd>
-          </div>
-          <div className="detail-row">
-            <dt>子任务</dt>
-            <dd>
-              {selectedTask.subtasks && selectedTask.subtasks.length > 0 ? (
-                <ul className="subtask-list">
-                  {selectedTask.subtasks.map((sub) => (
-                    <li
-                      key={sub.id}
-                      className={sub.status === "done" ? "subtask done" : "subtask"}
-                    >
-                      <span className="subtask-mark" aria-hidden="true">
-                        {sub.status === "done" ? "✓" : "○"}
-                      </span>
-                      <span>{sub.title || "(无标题)"}</span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                "—"
-              )}
             </dd>
           </div>
           <div className="detail-row">
@@ -1118,7 +1511,9 @@ function App() {
                       ids={taskIds}
                       axis="vertical"
                       rowClassName={(id) => taskRowClass(entryById.get(id)!)}
-                      renderItem={(id) => renderTaskCard(entryById.get(id)!)}
+                      renderItem={(id, activatorRef) =>
+                        renderTaskCard(entryById.get(id)!, activatorRef)
+                      }
                       renderOverlay={renderOverlayTask}
                       onReorder={handleTaskReorder}
                       onDragStart={markDragStart}
@@ -1147,7 +1542,13 @@ function App() {
                     }));
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && selectedList)
+                    // IME 组合态期间回车不提交（与详情标题框一致）
+                    if (
+                      e.key === "Enter" &&
+                      selectedList &&
+                      !e.nativeEvent.isComposing &&
+                      e.nativeEvent.keyCode !== 229
+                    )
                       submitNewTask(selectedList.file);
                   }}
                 />

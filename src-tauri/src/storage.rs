@@ -372,6 +372,146 @@ pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(),
     write_list(&path, &value)
 }
 
+/// 向指定任务的 `subtasks` 末尾追加一条子任务，返回其视图。
+///
+/// 标题 `trim` 后为空 → 错误；任务缺失 → 错误；`subtasks` 缺失则新建数组，
+/// 存在但非数组 → 错误（不静默覆盖）。Value 级补丁 + 原子写，保留未知字段。
+pub fn add_subtask_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    title: &str,
+) -> Result<SubtaskView, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("子任务标题不能为空".to_string());
+    }
+
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let map = find_task_mut(&mut value, list_file, task_id)?;
+
+    let subtasks = match map.get_mut("subtasks") {
+        Some(existing) => existing
+            .as_sequence_mut()
+            .ok_or_else(|| format!("任务 {task_id} 的 subtasks 不是数组"))?,
+        None => {
+            map.insert(key("subtasks"), Value::Sequence(Vec::new()));
+            map.get_mut("subtasks")
+                .and_then(Value::as_sequence_mut)
+                .expect("刚插入的 subtasks 应为数组")
+        }
+    };
+
+    let subtask = SubtaskView {
+        id: ulid::Ulid::generate().to_string(),
+        title: title.to_string(),
+        status: "open".to_string(),
+    };
+    let mut item = Mapping::new();
+    item.insert(key("id"), Value::String(subtask.id.clone()));
+    item.insert(key("title"), Value::String(subtask.title.clone()));
+    item.insert(key("status"), Value::String(subtask.status.clone()));
+    subtasks.push(Value::Mapping(item));
+
+    write_list(&path, &value)?;
+    Ok(subtask)
+}
+
+/// 从指定任务移除一条子任务；未知 task / subtask id → 错误。
+pub fn remove_subtask_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    subtask_id: &str,
+) -> Result<(), String> {
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let map = find_task_mut(&mut value, list_file, task_id)?;
+
+    let subtasks = map
+        .get_mut("subtasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("任务 {task_id} 没有子任务"))?;
+    let index = subtasks
+        .iter()
+        .position(|s| s.get("id").and_then(Value::as_str) == Some(subtask_id))
+        .ok_or_else(|| format!("任务 {task_id} 中未找到子任务 {subtask_id}"))?;
+    subtasks.remove(index);
+
+    write_list(&path, &value)
+}
+
+/// 切换指定子任务的 `status`（仅 `open` | `done`，其余 → 错误）。
+///
+/// 未知 task / subtask id → 错误；Value 级补丁 + 原子写，保留未知字段。
+pub fn set_subtask_status_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    subtask_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    let status = match status {
+        "open" | "done" => status,
+        other => return Err(format!("非法的子任务状态：{other}")),
+    };
+
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let map = find_task_mut(&mut value, list_file, task_id)?;
+
+    let subtasks = map
+        .get_mut("subtasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("任务 {task_id} 没有子任务"))?;
+    let subtask = subtasks
+        .iter_mut()
+        .find(|s| s.get("id").and_then(Value::as_str) == Some(subtask_id))
+        .ok_or_else(|| format!("任务 {task_id} 中未找到子任务 {subtask_id}"))?;
+    let sm = subtask
+        .as_mapping_mut()
+        .ok_or_else(|| format!("子任务 {subtask_id} 不是对象"))?;
+    sm.insert(key("status"), Value::String(status.to_string()));
+
+    write_list(&path, &value)
+}
+
+/// 仅修改指定子任务的 `title`；`trim` 后为空 → 错误。
+///
+/// 未知 task / subtask id → 错误；Value 级补丁 + 原子写，保留未知字段。
+pub fn set_subtask_title_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    subtask_id: &str,
+    title: &str,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("子任务标题不能为空".to_string());
+    }
+
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let map = find_task_mut(&mut value, list_file, task_id)?;
+
+    let subtasks = map
+        .get_mut("subtasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("任务 {task_id} 没有子任务"))?;
+    let subtask = subtasks
+        .iter_mut()
+        .find(|s| s.get("id").and_then(Value::as_str) == Some(subtask_id))
+        .ok_or_else(|| format!("任务 {task_id} 中未找到子任务 {subtask_id}"))?;
+    let sm = subtask
+        .as_mapping_mut()
+        .ok_or_else(|| format!("子任务 {subtask_id} 不是对象"))?;
+    sm.insert(key("title"), Value::String(title.to_string()));
+
+    write_list(&path, &value)
+}
+
 /// 在同清单内把任务移到 `before_task_id` 之前（`None` → 末尾），仅调整数组顺序。
 ///
 /// 目标为自身或已在目标位置时视为成功且不改动文件；任务或清单不存在 → 错误。
@@ -1475,5 +1615,274 @@ tasks:
         // 缺 theme 键 → 默认
         fs::write(base.join(SETTINGS_FILE), "x: 1\n").unwrap();
         assert_eq!(load_settings_from(base).unwrap().theme, "system");
+    }
+
+    /// 取某任务下子任务的 `(id, title, status)` 列表。
+    fn subtasks_of(base: &Path, task_id: &str) -> Vec<(String, String, String)> {
+        let loaded = load_lists_from(base).unwrap();
+        loaded.lists[0]
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .unwrap()
+            .subtasks
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id, s.title, s.status))
+            .collect()
+    }
+
+    #[test]
+    fn add_subtask_appends_reads_back_and_preserves_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep2\n  - id: T2\n    title: 二\n    status: open\n",
+        );
+
+        // 加一条并读回；title 已 trim，初始 status=open，id 为 ULID
+        let first = add_subtask_in(base, "L.yaml", "T1", "  买菜  ").unwrap();
+        assert_eq!(first.title, "买菜");
+        assert_eq!(first.status, "open");
+        assert_eq!(first.id.len(), 26, "子任务 id 应为 ULID");
+
+        // 连加两条 → append 保序
+        let second = add_subtask_in(base, "L.yaml", "T1", "做饭").unwrap();
+        let subs = subtasks_of(base, "T1");
+        assert_eq!(
+            subs,
+            vec![
+                (first.id.clone(), "买菜".to_string(), "open".to_string()),
+                (second.id.clone(), "做饭".to_string(), "open".to_string()),
+            ]
+        );
+
+        // 未知字段与其它字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let tasks = value.get("tasks").and_then(Value::as_sequence).unwrap();
+        let t1 = tasks
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T1"))
+            .unwrap();
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep2"));
+        assert_eq!(t1.get("title").and_then(Value::as_str), Some("一"));
+        // 其它任务不被触碰（未新建 subtasks 字段）
+        let t2 = tasks
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T2"))
+            .unwrap();
+        assert!(t2.get("subtasks").is_none(), "其它任务不应被写入 subtasks");
+    }
+
+    #[test]
+    fn add_subtask_rejects_blank_title_and_unknown_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        assert!(add_subtask_in(base, "L.yaml", "T1", "").is_err(), "空标题应报错");
+        assert!(add_subtask_in(base, "L.yaml", "T1", "   ").is_err(), "纯空白应报错");
+        assert!(add_subtask_in(base, "L.yaml", "NOPE", "x").is_err(), "未知 task 应报错");
+        // 失败均不写盘
+        assert!(
+            read_value(&path)
+                .get("tasks")
+                .and_then(Value::as_sequence)
+                .unwrap()[0]
+                .get("subtasks")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn add_subtask_rejects_non_array_subtasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    subtasks: 不是数组\n",
+        );
+
+        assert!(
+            add_subtask_in(base, "L.yaml", "T1", "x").is_err(),
+            "subtasks 存在但非数组应报错，不静默覆盖"
+        );
+        // 原值保留
+        let value = read_value(&path);
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("subtasks").and_then(Value::as_str), Some("不是数组"));
+    }
+
+    #[test]
+    fn remove_subtask_removes_only_target_and_errors_on_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep2\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n      - id: S2\n        title: 乙\n        status: open\n",
+        );
+
+        remove_subtask_in(base, "L.yaml", "T1", "S1").unwrap();
+        assert_eq!(
+            subtasks_of(base, "T1")
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["S2".to_string()],
+            "仅移除目标子任务"
+        );
+
+        // 未知 task / subtask → 错误
+        assert!(remove_subtask_in(base, "L.yaml", "NOPE", "S2").is_err());
+        assert!(remove_subtask_in(base, "L.yaml", "T1", "NOPE").is_err());
+
+        // 未知字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep2"));
+    }
+
+    #[test]
+    fn set_subtask_status_validates_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n",
+        );
+
+        // open → done → open 往返
+        set_subtask_status_in(base, "L.yaml", "T1", "S1", "done").unwrap();
+        assert_eq!(subtasks_of(base, "T1")[0].2, "done");
+        set_subtask_status_in(base, "L.yaml", "T1", "S1", "open").unwrap();
+        assert_eq!(subtasks_of(base, "T1")[0].2, "open");
+
+        // 非法 status → 报错且不写盘
+        assert!(set_subtask_status_in(base, "L.yaml", "T1", "S1", "doing").is_err());
+        assert_eq!(subtasks_of(base, "T1")[0].2, "open");
+        // 未知 task / subtask → 错误
+        assert!(set_subtask_status_in(base, "L.yaml", "NOPE", "S1", "done").is_err());
+        assert!(set_subtask_status_in(base, "L.yaml", "T1", "NOPE", "done").is_err());
+
+        // 未知字段保留
+        let value = read_value(&path);
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("title").and_then(Value::as_str), Some("一"));
+    }
+
+    #[test]
+    fn subtask_commands_work_on_done_task_and_preserve_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: done\n    completed: 2026-10-01T09:00\n    x-task: keep2\n",
+        );
+
+        // 对已完成任务增 / 勾 / 删
+        let added = add_subtask_in(base, "L.yaml", "T1", "步骤").unwrap();
+        set_subtask_status_in(base, "L.yaml", "T1", &added.id, "done").unwrap();
+        assert_eq!(subtasks_of(base, "T1")[0].2, "done");
+        remove_subtask_in(base, "L.yaml", "T1", &added.id).unwrap();
+        assert!(subtasks_of(base, "T1").is_empty());
+
+        // 任务级 / 文件级未知字段与既有字段均保留；任务 status 未被联动
+        let value = read_value(&path);
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(
+            t1.get("completed").and_then(Value::as_str),
+            Some("2026-10-01T09:00")
+        );
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep2"));
+    }
+
+    #[test]
+    fn set_subtask_title_renames_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep2\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n        x-sub: keepS\n      - id: S2\n        title: 乙\n        status: done\n",
+        );
+
+        // 改名生效且 trim
+        set_subtask_title_in(base, "L.yaml", "T1", "S1", "  新甲  ").unwrap();
+        let subs = subtasks_of(base, "T1");
+        assert_eq!(subs[0], ("S1".to_string(), "新甲".to_string(), "open".to_string()));
+        // 同任务其它子任务不受影响（title / status 不变）
+        assert_eq!(subs[1], ("S2".to_string(), "乙".to_string(), "done".to_string()));
+
+        // 未知字段与其它字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep2"));
+        let s1 = &t1.get("subtasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(s1.get("x-sub").and_then(Value::as_str), Some("keepS"));
+        assert_eq!(s1.get("status").and_then(Value::as_str), Some("open"));
+    }
+
+    #[test]
+    fn set_subtask_title_rejects_blank_and_unknown_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n",
+        );
+        let before = fs::read_to_string(&path).unwrap();
+
+        // 空 / 纯空白标题报错且不写盘
+        assert!(set_subtask_title_in(base, "L.yaml", "T1", "S1", "").is_err());
+        assert!(set_subtask_title_in(base, "L.yaml", "T1", "S1", "   ").is_err());
+        // 未知 task / subtask 报错
+        assert!(set_subtask_title_in(base, "L.yaml", "NOPE", "S1", "x").is_err());
+        assert!(set_subtask_title_in(base, "L.yaml", "T1", "NOPE", "x").is_err());
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "失败均不应改动文件"
+        );
+    }
+
+    #[test]
+    fn set_subtask_title_works_on_done_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: done\n    completed: 2026-10-01T09:00\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n",
+        );
+
+        set_subtask_title_in(base, "L.yaml", "T1", "S1", "改后").unwrap();
+        assert_eq!(subtasks_of(base, "T1")[0].1, "改后");
+
+        // 任务 status / completed 未被联动
+        let value = read_value(&path);
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(t1.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(
+            t1.get("completed").and_then(Value::as_str),
+            Some("2026-10-01T09:00")
+        );
     }
 }

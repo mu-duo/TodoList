@@ -60,7 +60,7 @@ tasks:
 | `due` | `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM` |  | 截止（本地时间） |
 | `tags` | string[] |  | 标签 |
 | `notes` | string（多行） |  | 备注 |
-| `subtasks` | array（一层） |  | 子任务；元素含 `id` / `title` / `status`，可扩展 |
+| `subtasks` | array（一层，**元素不可嵌套**） |  | 子任务；元素为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；数组顺序 = 显示顺序；增 / 删 / 勾选 / 改名经**按 id 的命令**原子写入（不做整数组覆盖）；可扩展 |
 
 ## 3. 语义与写入约定
 
@@ -82,3 +82,7 @@ tasks:
 
 - 权威定义：本文件（落地后以 `src-tauri` 解析实现为准，语义不得偏离本文件）。
 - 待决：提醒 / 重复字段（对应切片定稿）；清单文件名规整化细则。
+
+## Log
+
+- 2026-10-10 子任务**定形**（FR-APP-03）：`subtasks` 元素固定为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；**一层、元素不可嵌套**（深度恒为 1）；数组顺序 = 显示顺序；增 / 删 / 勾选 / **改名**经**按 id 的原子命令**写入（避免整数组覆盖冲掉外部并发改动）。schema 形状本身未变（与 §2 示例一致）。

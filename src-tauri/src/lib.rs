@@ -51,6 +51,48 @@ fn delete_task(list_file: String, task_id: String) -> Result<(), String> {
     storage::delete_task_in(&base, &list_file, &task_id)
 }
 
+/// 向指定任务末尾追加一条子任务，返回新子任务视图。
+#[tauri::command]
+fn add_subtask(
+    list_file: String,
+    task_id: String,
+    title: String,
+) -> Result<storage::SubtaskView, String> {
+    let base = storage::data_dir()?;
+    storage::add_subtask_in(&base, &list_file, &task_id, &title)
+}
+
+/// 从指定任务移除一条子任务。
+#[tauri::command]
+fn remove_subtask(list_file: String, task_id: String, subtask_id: String) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::remove_subtask_in(&base, &list_file, &task_id, &subtask_id)
+}
+
+/// 切换指定子任务的状态（仅 `open` | `done`）。
+#[tauri::command]
+fn set_subtask_status(
+    list_file: String,
+    task_id: String,
+    subtask_id: String,
+    status: String,
+) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::set_subtask_status_in(&base, &list_file, &task_id, &subtask_id, &status)
+}
+
+/// 修改指定子任务的标题（trim 后为空报错）。
+#[tauri::command]
+fn set_subtask_title(
+    list_file: String,
+    task_id: String,
+    subtask_id: String,
+    title: String,
+) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::set_subtask_title_in(&base, &list_file, &task_id, &subtask_id, &title)
+}
+
 /// 重命名清单（更新 name 并按规整化名移动文件），返回新文件名。
 #[tauri::command]
 fn rename_list(list_file: String, new_name: String) -> Result<String, String> {
@@ -121,6 +163,10 @@ pub fn run() {
             create_list,
             update_task,
             delete_task,
+            add_subtask,
+            remove_subtask,
+            set_subtask_status,
+            set_subtask_title,
             rename_list,
             delete_list,
             move_list,
