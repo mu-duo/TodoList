@@ -1,6 +1,6 @@
 [package]
 name = "todolist"
-version = "1.2.0"
+version = "1.3.0"
 description = "TodoList - 文件驱动的本地待办"
 authors = ["you"]
 edition = "2021"
