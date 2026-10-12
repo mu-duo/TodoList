@@ -113,8 +113,71 @@ app_bar:
 - **写入时机**：排序放下即原子写；写失败**回滚到最后一次成功顺序**并向用户报错。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
+## 6. Agent 协助（Phase 1 接口冻结，**实现中待核，未实测**）
+
+> **状态（2026-10-12）：Phase 1 契约冻结，实现中待核**——命令与字段已按 architecture.md（含父会话修正）冻结，**尚在实现、未经核验**；**不得据此声称已实现或可用**。运行时（run）记录与结果 schema 属 **Phase 2，待实现**。**真实联网未验证**（见 §6.6）。
+
+### 6.1 任务 YAML `agent` 形状（冻结）
+
+```yaml
+tasks:
+  - id: <ULID>
+    title: ...
+    agent:
+      enabled: true                       # 是否启用 Agent（缺省 = false）
+      paths: ["D:\\a.txt", "D:\\proj"]    # 只存原始绝对路径，运行时解析
+```
+
+- 支持文件与目录、存**原路径**；**任意文件 / 目录均可关联**、由 Agent 自主选择读取；**关联 ≠ 授权**（授权为本机行为）。
+- 未知字段宽容：沿用 §3，app 写回保留未知字段（`agent` 之外不动）。
+
+### 6.2 本机全局配置（`settings.yaml`，非密钥）
+
+```yaml
+agent:
+  model: deepseek-flash      # 默认；可改，**不自动回退**
+  result_root: null          # 或绝对路径（结果根目录）
+  execution_enabled: false   # 本机执行 opt-in，**默认 false**
+  max_uses: 5                # 单请求内服务端搜索上限，**非运行总帽**
+```
+
+- 仅补丁 `agent` 下**已知字段**，保留 `agent` 其它 / 未知字段与 `theme`、`app_bar` 等。
+- `execution_enabled` 由 false → true 必须经**显式云端同意**（见 §6.4）；默认 false。
+
+### 6.3 凭据（**独立本机，绝不回 JS**）
+
+- 密钥经 **Windows DPAPI**（`CryptProtectData` / `CryptUnprotectData`）加密，落 `%APPDATA%\com.lftan.todolist\agent.credentials`（**独立本机文件**）；仅内存解密、HTTP 全在 Rust；**绝不回传 JS / 写日志 / 错误串**。
+- presence = 可解密且非空（仅返回布尔）。
+
+### 6.4 Phase 1 命令契约（冻结；**不编造未列命令**）
+
+- `agent_load_config() -> { model: string, result_root: string|null, execution_enabled: bool, max_uses: number, key_present: bool }`
+- `agent_save_config({ config: { model?, result_root?, execution_enabled?, max_uses? }, consentCloud: bool }) -> void`：Value 级补丁仅改 `agent` 已知字段、保留未知；**`execution_enabled` false→true 当且仅当 `consentCloud === true`**，否则报错不写。
+- `agent_set_key({ key: string }) -> void` ／ `agent_clear_key() -> void` ／ `agent_key_present() -> bool`：**密钥值永不回 JS**。
+- `agent_validate_result_root({ path: string }) -> { ok: bool, message: string }`
+- `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。**不提供自动 / 保存流 / 测试流**，**不做任何真实付费调用**。
+- `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`
+- `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
+- 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
+
+### 6.5 运行记录与结果（**Phase 2，待实现，schema 待定**）
+
+- 本机记录计划为 `%APPDATA%\com.lftan.todolist\agent\runs\{run_id}.json`（一次运行一文件＝事实源，temp+rename 原子写；列表＝扫描目录；损坏→跳过+告警）；**schema 待 Phase 2 落地**。
+- 结果计划输出到 `{result_root}\{task_id}\{时间}_{run_id}\`（`report.md` + `sources.json`）；**字段待定**。
+- 运行状态 / 重试 / 历史索引**仅存本机**，**不写入任务 YAML**。
+
+### 6.6 联网与运行约束（规范；**未实测**）
+
+- 端点 `POST https://api.deepseek.com/anthropic/v1/messages`；默认 `model=deepseek-flash`（可改，**不自动回退到其它模型**，不支持的模型明确报错）；HTTP **禁跟随重定向**（3xx＝失败）。
+- 主循环仅用**客户端只读 fs 工具**；联网仅走**独立辅助 native search 请求**（`tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]`），**不与客户端文件工具混在同一请求**；`max_uses` 是**单请求内**上限、**非运行总帽**。
+- 2xx 但**无 `web_search_tool_result` 块＝失败**，**不得判为联网成功**；检索结果 / 引用为**不可信外部内容**，仅作数据、绝不执行。
+- 运行**无全局模型 / 搜索调用次数帽**；保留 **30 分钟 deadline / 取消 / 读取限制**（ADR-0007：单次文本 ≤256KiB、运行累计 ≤5MiB、分页不可绕）。
+- **联网未经真实调用验证**（仅 DeepSeek 原生 Anthropic 兼容端点有官方一方源码，字段存在未决项），**不声称可用或已验收**。
+
 ## Log
 
 - 2026-10-10 子任务**定形**（FR-APP-03）：`subtasks` 元素固定为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；**一层、元素不可嵌套**（深度恒为 1）；数组顺序 = 显示顺序；增 / 删 / 勾选 / **改名**经**按 id 的原子命令**写入（避免整数组覆盖冲掉外部并发改动）。schema 形状本身未变（与 §2 示例一致）。
 - 2026-10-12 新增 §5「应用功能栏入口顺序」（FR-APP-24）：**设计待实现**契约——`app_bar.order` 存 `settings.yaml`、宽窄共用、默认 `[refresh, pin, settings]`、未知 id 隐藏保留槽位、恢复默认清历史、放下即原子写且失败回滚。未实现字段 / 命令，未改数据目录契约。
 - 2026-10-12 **落地 §5**：`load_settings` 增 `app_bar_order: string[] | null`（取自 `app_bar.order`）；新增 `save_app_bar_order({ order })`——Value 级补丁**仅改 `app_bar.order`**，`null` / 空数组删除该字段恢复默认，保留 `theme` 与全部未知字段，空白 id / `app_bar` 非对象报中文错误。契约与 01-spec §8 一致，**未改数据目录 schema**。
+- 2026-10-12 新增 §6「Agent 协助：任务意图与本机运行记录」（**概念契约，待架构冻结**）：任务 YAML 记启用状态 / 关联路径（字段名待定），本机运行记录不进数据目录；成果输出主目录 / 任务 ULID / 时间（+ 运行 ID）、`report.md` 来源摘要、独立稳定 id 历史。**未改 schema、未新增命令**。
+- 2026-10-12 **冻结 §6 Phase 1 接口（实现中待核）**：任务 YAML `agent.enabled/paths`；本机配置 `agent{model/result_root/execution_enabled/max_uses}`（execution 默认 false、false→true 需显式 `consentCloud`）；DPAPI 凭据独立本机、密钥不回 JS；命令 `agent_load_config` / `agent_save_config` / `agent_set_key`·`clear`·`present` / `agent_validate_result_root` / `agent_probe`(仅 `confirmPaid=true` 且本阶段无真实调用) / `agent_set_task_intent` / `TaskView.agent` / dialog 桥 `agent_pick_result_root`·`agent_pick_paths`；运行 / 结果 schema 属 **P2 待实现**。**未实现、未实测**。

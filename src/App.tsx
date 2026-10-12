@@ -7,6 +7,7 @@ import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { SettingsModal } from "./components/SettingsModal";
 import { ConfirmModal } from "./components/ConfirmModal";
 import { AppBar } from "./components/AppBar";
+import { AgentConfigModal } from "./components/AgentConfigModal";
 import { applyThemePref, type ThemePref } from "./theme";
 import { loadSettings } from "./settings";
 import {
@@ -37,6 +38,8 @@ type Task = {
   tags: string[] | null;
   notes: string | null;
   subtasks: Subtask[] | null;
+  /** Phase 2 起由后端返回的任务级 Agent 意图（本 Phase 仅预定义字段，不接线 UI）。 */
+  agent?: { enabled: boolean; paths: string[] } | null;
 };
 
 type TaskList = {
@@ -77,6 +80,8 @@ function App() {
   // 设置面板（模态）与主题偏好
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>("system");
+  // Agent 配置模态（Phase 1）
+  const [agentConfigOpen, setAgentConfigOpen] = useState(false);
 
   // 待确认删除的清单（非空即显示确认模态）
   const [pendingDeleteList, setPendingDeleteList] = useState<TaskList | null>(
@@ -528,6 +533,7 @@ function App() {
     if (id === "refresh") void manualRefresh();
     else if (id === "pin") togglePin();
     else if (id === "settings") setSettingsOpen(true);
+    else if (id === "agent") setAgentConfigOpen(true);
   }
 
   function isAppBarDisabled(id: string) {
@@ -1784,6 +1790,10 @@ function App() {
           appBarError={appBarError}
           canResetAppBar={hasSavedAppBarOrder(appBarSaved)}
         />
+      )}
+
+      {agentConfigOpen && (
+        <AgentConfigModal onClose={() => setAgentConfigOpen(false)} />
       )}
 
       {pendingDeleteList && (

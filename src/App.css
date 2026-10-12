@@ -1320,6 +1320,155 @@ button:focus-visible {
   gap: 8px;
 }
 
+/* ---------------------------------------------- Agent 配置模态（Phase 1） ---- */
+
+/* 内容较长：卡片限高 + 内部滚动（仅本模态） */
+.modal-card--agent {
+  max-height: min(86vh, 720px);
+  overflow-y: auto;
+}
+
+.agent-note {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.agent-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.agent-input--num {
+  width: 120px;
+}
+
+.agent-key-row,
+.agent-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-key-row .agent-input,
+.agent-path-row .agent-path {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 结果目录：只读展示，长路径省略 */
+.agent-path {
+  display: block;
+  padding: 8px 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.agent-status,
+.agent-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.agent-warn {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
+
+.agent-ok {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--accent-strong);
+}
+
+.agent-err {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--danger);
+}
+
+/* 执行权限勾选：与任务行复选框一致的观感 */
+.agent-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.agent-check input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* 云端同意 / 就地面板 */
+.agent-consent {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+  padding: 10px 12px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.agent-consent p {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.agent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.agent-actions--footer .agent-warn {
+  flex: 1 1 auto;
+  text-align: right;
+}
+
+/* 高级：默认折叠，避免干扰主流程 */
+.agent-advanced {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.agent-advanced > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.agent-advanced[open] > summary {
+  margin-bottom: 10px;
+}
+
 .settings-body {
   display: flex;
   flex-direction: column;

@@ -24,9 +24,22 @@ yaml_serde = "0.10"
 ulid = "3"
 dirs = "7"
 chrono = "0.4"
+serde_json = "1.0.154"
+base64 = "0.23.1"
+zeroize = "1.9.1"
+async-trait = "0.1.92"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "time", "macros"] }
+tauri-plugin-dialog = "2.8.2"
+tauri-plugin-single-instance = "2.5.3"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+reqwest = { version = "0.13.5", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# 测试用假 provider / 密钥存储；release 不含。仅替换网络，不绕过任何安全规则。
+agent-test-provider = []
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

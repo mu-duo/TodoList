@@ -61,6 +61,8 @@ pub struct TaskView {
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub subtasks: Option<Vec<SubtaskView>>,
+    /// Agent 任务意图（`agent: { enabled, paths }`）；缺失 / 非法 → `None`。
+    pub agent: Option<crate::agent::TaskAgent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,7 +301,7 @@ pub fn load_lists_from(base: &Path) -> Result<LoadResult, String> {
 /// 校验清单文件名并返回其在 `lists/` 下的完整路径。
 ///
 /// 拒绝空名、路径分隔符与 `..`；`create_*` 与 `set_*` 共用同一套规则。
-fn list_path(base: &Path, list_file: &str) -> Result<PathBuf, String> {
+pub(crate) fn list_path(base: &Path, list_file: &str) -> Result<PathBuf, String> {
     if list_file.is_empty()
         || list_file.contains('/')
         || list_file.contains('\\')
@@ -311,24 +313,24 @@ fn list_path(base: &Path, list_file: &str) -> Result<PathBuf, String> {
 }
 
 /// 构造 YAML 字符串键。
-fn key(name: &str) -> Value {
+pub(crate) fn key(name: &str) -> Value {
     Value::String(name.to_string())
 }
 
 /// 读取并解析清单文件为 Value。
-fn read_list_value(path: &Path, list_file: &str) -> Result<Value, String> {
+pub(crate) fn read_list_value(path: &Path, list_file: &str) -> Result<Value, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("读取清单「{list_file}」失败：{e}"))?;
     yaml_serde::from_str(&text).map_err(|e| format!("解析清单「{list_file}」失败：{e}"))
 }
 
 /// 将 Value 序列化后原子写回。
-fn write_list(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_list(path: &Path, value: &Value) -> Result<(), String> {
     let out = yaml_serde::to_string(value).map_err(|e| format!("序列化失败：{e}"))?;
     atomic_write(path, out.as_bytes())
 }
 
 /// 按 id 定位任务对象，未找到 / 非对象时报错。
-fn find_task_mut<'a>(
+pub(crate) fn find_task_mut<'a>(
     value: &'a mut Value,
     list_file: &str,
     task_id: &str,
@@ -877,15 +879,22 @@ fn sanitize_file_stem(name: &str) -> String {
     stem
 }
 
-/// Windows 保留设备名判断（忽略大小写）。
-fn is_reserved_name(stem: &str) -> bool {
-    let upper = stem.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+/// Windows 保留设备名判断（忽略大小写；容忍带扩展名 / 结尾空格的输入）。
+///
+/// 供 `sanitize_file_stem` 与 `agent::sandbox::guard_path_string` 共用，消除双份实现。
+pub(crate) fn is_reserved_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
         return true;
     }
-    let bytes = upper.as_bytes();
+    let bytes = stem.as_bytes();
     bytes.len() == 4
-        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
         && matches!(bytes[3], b'1'..=b'9')
 }
 
@@ -945,6 +954,7 @@ fn mapping_to_task(value: &Value) -> Option<TaskView> {
         tags,
         notes: get_str(m, "notes"),
         subtasks,
+        agent: crate::agent::intent::parse_task_agent(m),
     })
 }
 
@@ -966,7 +976,7 @@ fn file_name(path: &Path) -> String {
 }
 
 /// 同目录临时文件 + rename 覆盖，尽量避免半写状态。
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or_else(|| "无效的写入路径".to_string())?;
     let name = file_name(path);
     let nanos = std::time::SystemTime::now()

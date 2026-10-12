@@ -1,0 +1,262 @@
+//! 任务 Agent 意图：任务 YAML 内 `agent: { enabled, paths }`（按 id 原子补丁，保留未知字段）。
+//!
+//! 关联 ≠ 授权：此处只存原始绝对路径；实际读取在运行时经沙箱校验（Phase 2）。
+//! `enabled: true` 的前置（本机执行授权 / 密钥 / 结果根）由命令层校验。
+
+use std::path::Path;
+
+use serde::Serialize;
+use yaml_serde::{Mapping, Value};
+
+use super::sandbox;
+use crate::storage;
+
+/// 任务上的 Agent 意图视图（随 `TaskView` 返回）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TaskAgent {
+    pub enabled: bool,
+    pub paths: Vec<String>,
+}
+
+/// 从任务映射解析 `agent` 字段；缺失 / 非法不 panic，宽返回 `None` 或默认值。
+pub fn parse_task_agent(m: &Mapping) -> Option<TaskAgent> {
+    let agent = m.get("agent")?.as_mapping()?;
+    let enabled = agent
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let paths = agent
+        .get("paths")
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TaskAgent { enabled, paths })
+}
+
+/// 按 `task_id` 补丁任务的 `agent.enabled` / `agent.paths`，保留其它 / 未知字段并原子写。
+///
+/// 空白路径报错；`enabled == true` 时要求每个路径为绝对路径（关联≠授权，此处只做形状校验）。
+pub fn set_task_intent_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    enabled: bool,
+    paths: &[String],
+) -> Result<(), String> {
+    for p in paths {
+        if p.trim().is_empty() {
+            return Err("关联路径不能为空".to_string());
+        }
+        // 存前对每个路径套源根语义护栏（与结果根同等强度）；P2 runner 启动处理已存根时
+        // 应对每个 `agent.paths` 再调用同一 `sandbox::guard_source_root`（外部 YAML 可绕过命令）。
+        sandbox::guard_source_root(p)?;
+    }
+
+    let path = storage::list_path(base, list_file)?;
+    let mut value = storage::read_list_value(&path, list_file)?;
+    let map = storage::find_task_mut(&mut value, list_file, task_id)?;
+
+    let agent = match map.get_mut("agent") {
+        Some(existing) => existing
+            .as_mapping_mut()
+            .ok_or_else(|| format!("任务 {task_id} 的 agent 不是对象"))?,
+        None => {
+            map.insert(storage::key("agent"), Value::Mapping(Mapping::new()));
+            map.get_mut("agent")
+                .and_then(Value::as_mapping_mut)
+                .expect("刚插入的 agent 应为对象")
+        }
+    };
+    agent.insert(storage::key("enabled"), Value::Bool(enabled));
+    agent.insert(
+        storage::key("paths"),
+        Value::Sequence(paths.iter().map(|p| Value::String(p.clone())).collect()),
+    );
+
+    storage::write_list(&path, &value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::LISTS_DIR;
+    use std::fs;
+
+    fn write_list(base: &Path, file: &str, text: &str) {
+        let lists = base.join(LISTS_DIR);
+        fs::create_dir_all(&lists).unwrap();
+        fs::write(lists.join(file), text).unwrap();
+    }
+
+    fn read(base: &Path, file: &str) -> Value {
+        yaml_serde::from_str(&fs::read_to_string(base.join(LISTS_DIR).join(file)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn sets_enabled_and_paths_preserving_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep2\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n  - id: T2\n    title: 二\n    status: open\n",
+        );
+
+        set_task_intent_in(
+            base,
+            "L.yaml",
+            "T1",
+            true,
+            &["D:\\docs\\a.txt".to_string(), "D:\\proj".to_string()],
+        )
+        .unwrap();
+
+        let value = read(base, "L.yaml");
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let tasks = value.get("tasks").and_then(Value::as_sequence).unwrap();
+        let t1 = tasks
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T1"))
+            .unwrap();
+        let agent = t1.get("agent").and_then(Value::as_mapping).unwrap();
+        assert_eq!(agent.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            agent
+                .get("paths")
+                .and_then(Value::as_sequence)
+                .map(|s| s.len()),
+            Some(2)
+        );
+        // 子任务与其它字段保留
+        assert_eq!(t1.get("x-task").and_then(Value::as_str), Some("keep2"));
+        assert_eq!(
+            t1.get("subtasks").and_then(Value::as_sequence).map(|s| s.len()),
+            Some(1)
+        );
+        // 其它任务不被动
+        let t2 = tasks
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T2"))
+            .unwrap();
+        assert!(t2.get("agent").is_none());
+    }
+
+    #[test]
+    fn preserves_unknown_fields_inside_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    agent:\n      enabled: false\n      x-extra: keep\n",
+        );
+
+        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()]).unwrap();
+
+        let value = read(base, "L.yaml");
+        let agent = value.get("tasks").and_then(Value::as_sequence).unwrap()[0]
+            .get("agent")
+            .and_then(Value::as_mapping)
+            .unwrap()
+            .clone();
+        assert_eq!(agent.get("x-extra").and_then(Value::as_str), Some("keep"));
+        assert_eq!(agent.get("enabled").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn unsafe_or_relative_paths_rejected_regardless_of_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        // 相对路径一律拒绝（架构 §5：只存原始绝对路径）
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["rel\\a.txt".to_string()]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "T1", true, &["rel\\a.txt".to_string()]).is_err());
+        // 空白路径报错
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["   ".to_string()]).is_err());
+        // 未知任务报错
+        assert!(set_task_intent_in(base, "L.yaml", "NOPE", false, &[]).is_err());
+        // 合法绝对路径可存（停用态）
+        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn dangerous_authorization_roots_rejected_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        // P1-4：盘符根 / 设备路径 / UNC / 含 .. 的形状一律拒绝
+        for p in ["C:\\", "\\\\?\\C:\\a", "\\\\server\\share", "C:\\a\\..\\b"] {
+            assert!(
+                set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()]).is_err(),
+                "危险授权根应被拒：{p}"
+            );
+            assert!(
+                set_task_intent_in(base, "L.yaml", "T1", false, &[p.to_string()]).is_err(),
+                "停用态也不应存危险根：{p}"
+            );
+        }
+        // 全部被拒 → 未写盘
+        let value = read(base, "L.yaml");
+        let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        assert!(t1.get("agent").is_none(), "拒绝后不应写入 agent");
+    }
+
+    #[test]
+    fn rejects_non_mapping_agent_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    agent: scalar\n",
+        );
+        let before = fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap();
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &[]).is_err());
+        assert_eq!(
+            fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn parse_task_agent_is_tolerant() {
+        let load = |text: &str| -> Option<TaskAgent> {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path();
+            write_list(base, "L.yaml", text);
+            let value = read(base, "L.yaml");
+            let task = value
+                .get("tasks")
+                .and_then(Value::as_sequence)
+                .and_then(|s| s.first())?;
+            parse_task_agent(task.as_mapping()?)
+        };
+
+        assert!(load("schema: 1\ntasks:\n  - id: T1\n    title: x\n").is_none());
+        let a = load("schema: 1\ntasks:\n  - id: T1\n    agent:\n      enabled: true\n").unwrap();
+        assert!(a.enabled);
+        assert!(a.paths.is_empty());
+        // enabled 非布尔 / paths 非数组 → 宽容
+        let b = load("schema: 1\ntasks:\n  - id: T1\n    agent:\n      enabled: nope\n      paths: 5\n")
+            .unwrap();
+        assert!(!b.enabled);
+        assert!(b.paths.is_empty());
+        // agent 非对象 → None
+        assert!(load("schema: 1\ntasks:\n  - id: T1\n    agent: scalar\n").is_none());
+    }
+}

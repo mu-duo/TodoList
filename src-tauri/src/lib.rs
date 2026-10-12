@@ -1,3 +1,4 @@
+mod agent;
 mod storage;
 
 use tauri::Manager;
@@ -156,6 +157,13 @@ fn save_app_bar_order(order: Option<Vec<String>>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例须最先注册：第二实例聚焦既有窗口，不唤醒 / 不托盘。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 把主窗口标题设为「TodoList <版本>」；找不到窗口时静默忽略。
             if let Some(window) = app.get_webview_window("main") {
@@ -181,7 +189,17 @@ pub fn run() {
             reorder_list,
             load_settings,
             save_settings,
-            save_app_bar_order
+            save_app_bar_order,
+            agent::commands::agent_load_config,
+            agent::commands::agent_save_config,
+            agent::commands::agent_set_key,
+            agent::commands::agent_clear_key,
+            agent::commands::agent_key_present,
+            agent::commands::agent_validate_result_root,
+            agent::commands::agent_probe,
+            agent::commands::agent_set_task_intent,
+            agent::commands::agent_pick_result_root,
+            agent::commands::agent_pick_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

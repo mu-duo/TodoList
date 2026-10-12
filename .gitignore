@@ -18,6 +18,9 @@ src-tauri/target/
 # 发布产物
 release/
 
+# Agent workflow state (not application data)
+.slim/deepwork/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
