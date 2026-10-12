@@ -89,6 +89,7 @@ body {
 .app-main {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   width: 100%;
   max-width: 1080px;
   margin: 0 auto;
@@ -111,39 +112,10 @@ body {
 
 .header h1 {
   margin: 0;
+  flex: none;
   font-size: 1.4rem;
   font-weight: 650;
   letter-spacing: -0.015em;
-}
-
-.header-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-/* 置顶（pin）/ 设置按钮：与「刷新」并排的图标按钮 */
-.pin-btn,
-.settings-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 38px;
-  height: 40px;
-  padding: 0;
-  color: var(--text-muted);
-}
-
-.pin-btn:hover:not(:disabled),
-.settings-btn:hover:not(:disabled) {
-  color: var(--text);
-}
-
-.pin-icon,
-.settings-icon {
-  width: 16px;
-  height: 16px;
 }
 
 /* 行内删除图标（垃圾桶）：与图钉 / 齿轮同风格，16px */
@@ -153,17 +125,103 @@ body {
   display: block;
 }
 
-/* 激活态：强调色高亮 */
-.pin-btn.is-pinned {
+/* ---------------------------------------------------- 应用功能栏（App Bar） ---- */
+
+/* 宽屏：独立最左竖栏 → 整个 .app 变为横向；窄屏保持纵向（栏在顶部 header 内）。 */
+.app--wide {
+  flex-direction: row;
+}
+
+.app-bar {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 宽屏竖栏：约 40–48px 宽 = 按钮点击区 + 留白 */
+.app-bar--vertical {
+  width: 48px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 14px 0;
+  border-right: 1px solid var(--border);
+}
+
+/* 窄屏横排：占据标题右侧剩余空间（min-width:0 保证不挤压标题、不整页横滚） */
+.app-bar--horizontal {
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  overflow: hidden;
+}
+
+.app-bar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+}
+
+.app-bar--vertical .app-bar-list {
+  flex-direction: column;
+}
+
+.app-bar--horizontal .app-bar-list {
+  flex-direction: row;
+  justify-content: flex-end;
+}
+
+.app-bar-item {
+  flex: none;
+  display: flex;
+}
+
+.app-bar-item.is-dragging {
+  opacity: 0.45;
+}
+
+/* 入口按钮：图标无文字，悬浮显示中文名（title），保留 aria 名称 */
+.app-bar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.app-bar-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+/* 按下态（置顶）：强调色高亮 */
+.app-bar-btn.is-pressed {
   color: var(--accent);
   background: var(--accent-soft);
   border-color: var(--accent);
 }
 
-.pin-btn.is-pinned:hover:not(:disabled) {
+.app-bar-btn.is-pressed:hover:not(:disabled) {
   color: var(--accent-strong);
   background: var(--accent-soft);
   border-color: var(--accent-strong);
+}
+
+.app-bar-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
 }
 
 /* ------------------------------------------------------- 通用控件样式 ---- */
@@ -1122,6 +1180,16 @@ button:focus-visible {
   color: var(--danger-strong);
 }
 
+/* 勾选态（切换类菜单项，如置顶）：前缀对勾 */
+.context-menu-check {
+  margin-right: 6px;
+  color: var(--accent);
+}
+
+.context-menu-item.is-checked {
+  color: var(--accent-strong);
+}
+
 /* ---------------------------------------------------------- 启动门控 ---- */
 
 .app-boot {
@@ -1308,6 +1376,84 @@ button:focus-visible {
   margin: 0;
   font-size: 0.78rem;
   color: var(--text-faint);
+}
+
+/* ------------------------------------------- 设置内：功能栏顺序排序 ---- */
+
+.settings-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.settings-inline-error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--danger);
+}
+
+.app-bar-order-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.app-bar-order-item {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.app-bar-order-item.is-dragging {
+  opacity: 0.5;
+}
+
+.app-bar-order-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px 3px 3px;
+}
+
+/* 拖拽把手 */
+.app-bar-order-handle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-faint);
+  background: transparent;
+  border-color: transparent;
+  cursor: grab;
+}
+
+.app-bar-order-handle:hover:not(:disabled) {
+  color: var(--text-muted);
+  background: var(--surface);
+  border-color: transparent;
+}
+
+.app-bar-order-grip {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.app-bar-order-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.9rem;
+}
+
+.app-bar-order-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 /* -------------------------------------------------------- 窄屏（≤760） ---- */

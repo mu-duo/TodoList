@@ -146,6 +146,13 @@ fn save_settings(theme: String) -> Result<(), String> {
     storage::save_settings_in(&base, &theme)
 }
 
+/// 保存应用功能栏入口顺序（`None` / 空数组 → 恢复默认，删除 `order`）。
+#[tauri::command]
+fn save_app_bar_order(order: Option<Vec<String>>) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_app_bar_order_in(&base, order.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -173,7 +180,8 @@ pub fn run() {
             reorder_task,
             reorder_list,
             load_settings,
-            save_settings
+            save_settings,
+            save_app_bar_order
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

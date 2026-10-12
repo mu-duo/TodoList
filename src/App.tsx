@@ -6,7 +6,18 @@ import { SortableList } from "./components/SortableList";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { SettingsModal } from "./components/SettingsModal";
 import { ConfirmModal } from "./components/ConfirmModal";
-import { applyThemePref, loadThemePref, type ThemePref } from "./theme";
+import { AppBar } from "./components/AppBar";
+import { applyThemePref, type ThemePref } from "./theme";
+import { loadSettings } from "./settings";
+import {
+  APP_BAR_ENTRIES,
+  DEFAULT_APP_BAR_ORDER,
+  hasSavedAppBarOrder,
+  mergeAppBarOrder,
+  resolveAppBarOrder,
+  visibleAppBarIds,
+  type AppBarEntryMeta,
+} from "./appBar";
 import { useMediaQuery, usePrefersReducedMotion } from "./hooks";
 import "./App.css";
 
@@ -71,6 +82,18 @@ function App() {
   const [pendingDeleteList, setPendingDeleteList] = useState<TaskList | null>(
     null,
   );
+
+  // 应用功能栏（App Bar）：顺序（含未知槽位）、最后成功顺序、保存态与错误
+  const [appBarOrder, setAppBarOrder] = useState<string[]>(() => [
+    ...DEFAULT_APP_BAR_ORDER,
+  ]);
+  const [appBarSaved, setAppBarSaved] = useState<string[] | null>(null);
+  const [appBarSaving, setAppBarSaving] = useState(false);
+  const [appBarError, setAppBarError] = useState<string | null>(null);
+  // 同步互斥：同一渲染内快速连调用时，仅靠 state 守卫会漏；ref 在 finally 释放
+  const appBarSavingRef = useRef(false);
+  // 手动刷新按钮的忙碌态（入口忙碌时禁用并可反馈）
+  const [refreshing, setRefreshing] = useState(false);
 
   const [newListName, setNewListName] = useState("");
   const [newTaskTitles, setNewTaskTitles] = useState<Record<string, string>>({});
@@ -214,6 +237,13 @@ function App() {
   );
   const listById = useMemo(() => new Map(lists.map((l) => [l.file, l])), [lists]);
 
+  // 应用功能栏可见入口（仅已知 id，按当前顺序）
+  const appBarEntries = useMemo<AppBarEntryMeta[]>(() => {
+    return visibleAppBarIds(appBarOrder)
+      .map((id) => APP_BAR_ENTRIES.find((e) => e.id === id))
+      .filter((e): e is AppBarEntryMeta => !!e);
+  }, [appBarOrder]);
+
   async function refresh() {
     try {
       const data = await invoke<LoadResult>("load_lists");
@@ -229,13 +259,15 @@ function App() {
     }
   }
 
-  // 启动：先确定主题（首帧前 setTheme），再加载清单；主题未定前不画亮色内容
+  // 启动：先确定主题（首帧前 setTheme）并读取功能栏顺序，再加载清单；主题未定前不画亮色内容
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const pref = await loadThemePref();
+      const { theme: pref, appBarOrder: order } = await loadSettings();
       if (cancelled) return;
       setTheme(pref);
+      setAppBarSaved(order);
+      setAppBarOrder(resolveAppBarOrder(order));
       try {
         await applyThemePref(pref);
       } catch {
@@ -477,6 +509,80 @@ function App() {
     if (pinBusy) return;
     if (pinned) void unpinWindow();
     else void pinWindow();
+  }
+
+  // ---- 应用功能栏（App Bar）接线 ----
+
+  // 刷新入口：只重扫重读清单（不保存草稿、不重读设置、不新增监听）
+  async function manualRefresh() {
+    if (refreshing || busy) return;
+    setRefreshing(true);
+    try {
+      await refresh();
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  function activateAppBar(id: string) {
+    if (id === "refresh") void manualRefresh();
+    else if (id === "pin") togglePin();
+    else if (id === "settings") setSettingsOpen(true);
+  }
+
+  function isAppBarDisabled(id: string) {
+    if (id === "refresh") return busy || refreshing;
+    if (id === "pin") return pinBusy;
+    return false;
+  }
+
+  function isAppBarPressed(id: string): boolean | undefined {
+    return id === "pin" ? pinned : undefined;
+  }
+
+  // 重排可见入口：合并未知槽位 → 立即落盘；失败回滚到最后成功顺序并报错
+  function reorderAppBar(nextVisible: string[]) {
+    if (appBarSavingRef.current) return;
+    appBarSavingRef.current = true;
+    const prev = appBarOrder;
+    const merged = mergeAppBarOrder(appBarOrder, nextVisible);
+    setAppBarError(null);
+    setAppBarOrder(merged);
+    setAppBarSaving(true);
+    void (async () => {
+      try {
+        await invoke("save_app_bar_order", { order: merged });
+        setAppBarSaved(merged);
+      } catch (e) {
+        setAppBarOrder(prev);
+        setAppBarError(String(e));
+      } finally {
+        appBarSavingRef.current = false;
+        setAppBarSaving(false);
+      }
+    })();
+  }
+
+  // 恢复默认：清空历史顺序（含未知入口），落盘 null
+  function resetAppBar() {
+    if (appBarSavingRef.current) return;
+    appBarSavingRef.current = true;
+    const prev = appBarOrder;
+    setAppBarError(null);
+    setAppBarOrder([...DEFAULT_APP_BAR_ORDER]);
+    setAppBarSaving(true);
+    void (async () => {
+      try {
+        await invoke("save_app_bar_order", { order: null });
+        setAppBarSaved(null);
+      } catch (e) {
+        setAppBarOrder(prev);
+        setAppBarError(String(e));
+      } finally {
+        appBarSavingRef.current = false;
+        setAppBarSaving(false);
+      }
+    })();
   }
 
   // 切换主题：立即生效；失败记入 actionError（不弹窗）
@@ -1429,59 +1535,32 @@ function App() {
   }
 
   return (
-    <main className="app">
+    <main className={`app${isNarrow ? "" : " app--wide"}`}>
+      {!isNarrow && (
+        <AppBar
+          orientation="vertical"
+          entries={appBarEntries}
+          onActivate={activateAppBar}
+          isDisabled={isAppBarDisabled}
+          isPressed={isAppBarPressed}
+          reorderDisabled={appBarSaving}
+          onReorder={reorderAppBar}
+        />
+      )}
       <div className="app-main">
         <header className="header">
           <h1>TodoList</h1>
-          <div className="header-actions">
-            <button type="button" className="refresh" onClick={refresh}>
-              刷新
-            </button>
-            <button
-              type="button"
-              className={`pin-btn${pinned ? " is-pinned" : ""}`}
-              onClick={togglePin}
-              disabled={pinBusy}
-              aria-pressed={pinned}
-              aria-label={pinned ? "取消置顶" : "置顶"}
-              title={pinned ? "取消置顶" : "置顶"}
-            >
-              <svg
-                className="pin-icon"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <path d="M12 17v5" />
-                <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="settings-btn"
-              onClick={() => setSettingsOpen(true)}
-              aria-label="设置"
-              title="设置"
-            >
-              <svg
-                className="settings-icon"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="3" />
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-              </svg>
-            </button>
-          </div>
+          {isNarrow && (
+            <AppBar
+              orientation="horizontal"
+              entries={appBarEntries}
+              onActivate={activateAppBar}
+              isDisabled={isAppBarDisabled}
+              isPressed={isAppBarPressed}
+              reorderDisabled={appBarSaving}
+              onReorder={reorderAppBar}
+            />
+          )}
         </header>
 
         {warnings.length > 0 && (
@@ -1489,6 +1568,10 @@ function App() {
         )}
 
         {actionError && <p className="error">操作失败：{actionError}</p>}
+
+        {appBarError && !settingsOpen && (
+          <p className="error">功能栏排序保存失败：{appBarError}</p>
+        )}
 
         {error && (
           <p className="error">
@@ -1694,6 +1777,12 @@ function App() {
           theme={theme}
           onThemeChange={changeTheme}
           onClose={() => setSettingsOpen(false)}
+          appBarEntries={appBarEntries}
+          onAppBarReorder={reorderAppBar}
+          onAppBarReset={resetAppBar}
+          appBarBusy={appBarSaving}
+          appBarError={appBarError}
+          canResetAppBar={hasSavedAppBarOrder(appBarSaved)}
         />
       )}
 

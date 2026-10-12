@@ -83,6 +83,38 @@ tasks:
 - 权威定义：本文件（落地后以 `src-tauri` 解析实现为准，语义不得偏离本文件）。
 - 待决：提醒 / 重复字段（对应切片定稿）；清单文件名规整化细则。
 
+## 5. 应用功能栏入口顺序（不进数据目录）
+
+> **状态（2026-10-12）：已实现**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+> 应用功能栏本身的命名、位置与入口行为见 [01-spec.md](01-spec.md) §8；验证见 [04-current.md](04-current.md)。
+
+应用功能栏（App Bar）入口的顺序是**本机偏好**，存现有应用配置 `settings.yaml`（**不写清单、不进数据目录**）。实际字段：
+
+```yaml
+theme: system                 # 现有
+app_bar:
+  order: [refresh, pin, settings]
+```
+
+**接口（Tauri 命令）**：
+
+- `load_settings() -> { theme, app_bar_order }`：`app_bar_order` 为 `string[] | null`，取自 `app_bar.order`；缺失 / 空 / 非法 → `null`（= 默认）。
+- `save_app_bar_order({ order: string[] | null })`：Value 级补丁**仅改 `app_bar.order`**（保留 `theme`、`app_bar` 其它字段与全部未知字段，不做整份覆盖）；`order` 为 `null` 或空数组 → **删除 `order`**（恢复默认）；空白 id、或已有 `app_bar` 非对象 → 中文错误、不写盘。
+
+**顺序语义**：
+
+- `app_bar.order`（string[]，可选）：入口稳定 id 的**有序**列表；宽屏竖栏与窄屏顶部**共用**同一顺序。
+- **已知 id**：`refresh`、`pin`、`settings`（本轮）；`agent` 预留（本轮不实现、不占位）。
+- **默认顺序**（字段缺失 / 为空）：`[refresh, pin, settings]`；未来新增入口在默认顺序末尾追加。
+- **重复 id**：取第一次出现，忽略后续。
+- **未知 id**：不渲染（隐藏），但**保留其在数组中的原始槽位**；仅允许重排可见入口。
+- **新增未配置入口**：默认追加到用户顺序末尾；用户重排后写回。
+- **恢复默认**：删除 `app_bar.order`（连同其中记录的未知 id 历史顺序一并清除）。
+- **写入时机**：排序放下即原子写；写失败**回滚到最后一次成功顺序**并向用户报错。
+- **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
+
 ## Log
 
 - 2026-10-10 子任务**定形**（FR-APP-03）：`subtasks` 元素固定为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；**一层、元素不可嵌套**（深度恒为 1）；数组顺序 = 显示顺序；增 / 删 / 勾选 / **改名**经**按 id 的原子命令**写入（避免整数组覆盖冲掉外部并发改动）。schema 形状本身未变（与 §2 示例一致）。
+- 2026-10-12 新增 §5「应用功能栏入口顺序」（FR-APP-24）：**设计待实现**契约——`app_bar.order` 存 `settings.yaml`、宽窄共用、默认 `[refresh, pin, settings]`、未知 id 隐藏保留槽位、恢复默认清历史、放下即原子写且失败回滚。未实现字段 / 命令，未改数据目录契约。
+- 2026-10-12 **落地 §5**：`load_settings` 增 `app_bar_order: string[] | null`（取自 `app_bar.order`）；新增 `save_app_bar_order({ order })`——Value 级补丁**仅改 `app_bar.order`**，`null` / 空数组删除该字段恢复默认，保留 `theme` 与全部未知字段，空白 id / `app_bar` 非对象报中文错误。契约与 01-spec §8 一致，**未改数据目录 schema**。

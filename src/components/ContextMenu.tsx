@@ -4,6 +4,10 @@ export type MenuItem = {
   key: string;
   label: string;
   danger?: boolean;
+  /** 禁用（不可选）。默认 false，保持既有行为。 */
+  disabled?: boolean;
+  /** 勾选态（切换类菜单项）。未提供则不渲染勾选语义。默认 undefined。 */
+  checked?: boolean;
   onSelect: () => void;
 };
 
@@ -63,20 +67,32 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
       style={{ left: pos.left, top: pos.top }}
       role="menu"
     >
-      {items.map((item) => (
-        <button
-          key={item.key}
-          type="button"
-          role="menuitem"
-          className={`context-menu-item${item.danger ? " danger" : ""}`}
-          onClick={() => {
-            onClose();
-            item.onSelect();
-          }}
-        >
-          {item.label}
-        </button>
-      ))}
+      {items.map((item) => {
+        const hasCheck = item.checked !== undefined;
+        return (
+          <button
+            key={item.key}
+            type="button"
+            role={hasCheck ? "menuitemcheckbox" : "menuitem"}
+            aria-checked={hasCheck ? item.checked : undefined}
+            className={`context-menu-item${item.danger ? " danger" : ""}${
+              item.checked ? " is-checked" : ""
+            }`}
+            disabled={item.disabled}
+            onClick={() => {
+              onClose();
+              item.onSelect();
+            }}
+          >
+            {item.checked && (
+              <span className="context-menu-check" aria-hidden="true">
+                ✓
+              </span>
+            )}
+            {item.label}
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -2,7 +2,9 @@ import {
   DndContext,
   DragOverlay,
   KeyboardSensor,
+  MouseSensor,
   PointerSensor,
+  TouchSensor,
   closestCenter,
   useSensor,
   useSensors,
@@ -53,6 +55,17 @@ type SortableListProps = {
   onItemContextMenu?: (id: string, event: MouseEvent) => void;
   /** 单项禁用拖拽。 */
   itemDisabled?: (id: string) => boolean;
+  /**
+   * 拖拽激活方式：
+   * - `pointer`（默认，保持既有行为）：鼠标 / 触屏均为「移动超过阈值」触发。
+   * - `mouseTouch`：鼠标移动超过阈值触发；触屏改为**长按**触发（避免与滚动竞争）。
+   */
+  interaction?: "pointer" | "mouseTouch";
+  /**
+   * 是否注册键盘拖拽（Space 拾起 / 放下）。默认 true。
+   * 入口本身即按钮的场景（应用功能栏）设为 false，令 Space / Enter 都作原生点击。
+   */
+  keyboardDrag?: boolean;
 };
 
 /**
@@ -73,21 +86,39 @@ export function SortableList({
   onDragEnd,
   onItemContextMenu,
   itemDisabled,
+  interaction = "pointer",
+  keyboardDrag = true,
 }: SortableListProps) {
   const reduced = usePrefersReducedMotion();
   const [activeId, setActiveId] = useState<string | null>(null);
+  // 无条件建立各传感器描述符，按 interaction 选择注册，保持 hooks 调用顺序稳定。
+  const pointerSensor = useSensor(PointerSensor, {
+    activationConstraint: { distance: 6 },
+  });
+  const mouseSensor = useSensor(MouseSensor, {
+    activationConstraint: { distance: 6 },
+  });
+  const touchSensor = useSensor(TouchSensor, {
+    activationConstraint: { delay: 220, tolerance: 6 },
+  });
+  const keyboardSensor = useSensor(KeyboardSensor, {
+    coordinateGetter: sortableKeyboardCoordinates,
+    // 键盘拖拽只由 Space 激活/落定，Esc 取消。
+    // dnd-kit 默认还含 Enter，会抢走行内按钮的原生回车（任务行＝打开详情），故在此收敛。
+    keyboardCodes: {
+      start: ["Space"],
+      cancel: ["Escape"],
+      end: ["Space"],
+    },
+  });
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      // 键盘拖拽只由 Space 激活/落定，Esc 取消。
-      // dnd-kit 默认还含 Enter，会抢走行内按钮的原生回车（任务行＝打开详情），故在此收敛。
-      keyboardCodes: {
-        start: ["Space"],
-        cancel: ["Escape"],
-        end: ["Space"],
-      },
-    }),
+    ...(interaction === "mouseTouch"
+      ? keyboardDrag
+        ? [mouseSensor, touchSensor, keyboardSensor]
+        : [mouseSensor, touchSensor]
+      : keyboardDrag
+        ? [pointerSensor, keyboardSensor]
+        : [pointerSensor]),
   );
 
   const strategy =

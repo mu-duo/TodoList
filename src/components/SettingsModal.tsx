@@ -1,11 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { arrayMove } from "@dnd-kit/sortable";
+import { SortableList } from "./SortableList";
+import { moveAppBarVisible, type AppBarEntryMeta } from "../appBar";
 import type { ThemePref } from "../theme";
 
 type SettingsModalProps = {
   theme: ThemePref;
   onThemeChange: (theme: ThemePref) => void;
   onClose: () => void;
+  /** 应用功能栏入口（可见、按当前顺序）。 */
+  appBarEntries: AppBarEntryMeta[];
+  /** 重排可见入口（拖拽 / 上移 / 下移共用；由上层合并未知槽位并落盘）。 */
+  onAppBarReorder: (nextVisibleIds: string[]) => void;
+  /** 恢复默认顺序。 */
+  onAppBarReset: () => void;
+  /** 顺序保存中：禁用重排 / 恢复默认。 */
+  appBarBusy: boolean;
+  /** 顺序保存失败信息（就地展示）。 */
+  appBarError: string | null;
+  /** 是否存在非默认顺序（决定「恢复默认」是否可点）。 */
+  canResetAppBar: boolean;
 };
 
 const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
@@ -20,8 +35,19 @@ const FOCUSABLE =
 /**
  * 设置模态卡片：带遮罩、居中；点遮罩 / Esc / 关闭按钮关闭；Enter 不做任何处理。
  * 打开时焦点进入面板并做焦点陷阱（Tab 不外泄），关闭后把焦点还给触发元素。
+ * 含「应用功能栏顺序」：拖拽 + 上移 / 下移 + 恢复默认（键盘可用）。
  */
-export function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalProps) {
+export function SettingsModal({
+  theme,
+  onThemeChange,
+  onClose,
+  appBarEntries,
+  onAppBarReorder,
+  onAppBarReset,
+  appBarBusy,
+  appBarError,
+  canResetAppBar,
+}: SettingsModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
   const [version, setVersion] = useState<string | null>(null);
@@ -93,6 +119,14 @@ export function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalPr
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [onClose]);
 
+  const orderIds = appBarEntries.map((e) => e.id);
+
+  function moveEntry(id: string, dir: -1 | 1) {
+    if (appBarBusy) return;
+    const next = moveAppBarVisible(orderIds, id, dir);
+    if (next !== orderIds) onAppBarReorder(next);
+  }
+
   return (
     <div className="modal-backdrop" onPointerDown={onClose}>
       <div
@@ -140,9 +174,104 @@ export function SettingsModal({ theme, onThemeChange, onClose }: SettingsModalPr
             </div>
           </div>
 
+          <div className="settings-field">
+            <span className="field-label">功能栏顺序</span>
+            <p className="settings-hint">
+              拖拽，或用「上移 / 下移」调整入口顺序（宽屏竖栏与窄屏顶部共用）。
+            </p>
+            {appBarError && (
+              <p className="settings-inline-error">排序保存失败：{appBarError}</p>
+            )}
+            <SortableList
+              className="app-bar-order-list"
+              ids={orderIds}
+              axis="vertical"
+              interaction="mouseTouch"
+              rowClassName={() => "app-bar-order-item"}
+              itemDisabled={() => appBarBusy}
+              onReorder={(activeId, overId) => {
+                const from = orderIds.indexOf(activeId);
+                const to = orderIds.indexOf(overId);
+                if (from < 0 || to < 0 || from === to) return;
+                onAppBarReorder(arrayMove(orderIds, from, to));
+              }}
+              renderItem={(id, activatorRef) => {
+                const meta = appBarEntries.find((e) => e.id === id);
+                if (!meta) return null;
+                const index = orderIds.indexOf(id);
+                const isFirst = index === 0;
+                const isLast = index === orderIds.length - 1;
+                return (
+                  <div className="app-bar-order-row">
+                    <button
+                      type="button"
+                      ref={activatorRef}
+                      className="app-bar-order-handle"
+                      aria-label={`拖拽排序：${meta.label}`}
+                      title="拖拽排序"
+                    >
+                      <GripIcon />
+                    </button>
+                    <span className="app-bar-order-label">{meta.label}</span>
+                    <button
+                      type="button"
+                      className="row-action"
+                      onClick={() => moveEntry(id, -1)}
+                      disabled={appBarBusy || isFirst}
+                      aria-label={`上移 ${meta.label}`}
+                      title="上移"
+                    >
+                      上移
+                    </button>
+                    <button
+                      type="button"
+                      className="row-action"
+                      onClick={() => moveEntry(id, 1)}
+                      disabled={appBarBusy || isLast}
+                      aria-label={`下移 ${meta.label}`}
+                      title="下移"
+                    >
+                      下移
+                    </button>
+                  </div>
+                );
+              }}
+            />
+            <div className="app-bar-order-actions">
+              <button
+                type="button"
+                className="row-action"
+                onClick={onAppBarReset}
+                disabled={appBarBusy || !canResetAppBar}
+                title="恢复默认顺序"
+              >
+                恢复默认
+              </button>
+            </div>
+          </div>
+
           {version && <p className="settings-version">版本 {version}</p>}
         </div>
       </div>
     </div>
+  );
+}
+
+/** 拖拽把手图标（六点）。 */
+function GripIcon() {
+  return (
+    <svg
+      className="app-bar-order-grip"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <circle cx="9" cy="6" r="1.5" />
+      <circle cx="15" cy="6" r="1.5" />
+      <circle cx="9" cy="12" r="1.5" />
+      <circle cx="15" cy="12" r="1.5" />
+      <circle cx="9" cy="18" r="1.5" />
+      <circle cx="15" cy="18" r="1.5" />
+    </svg>
   );
 }

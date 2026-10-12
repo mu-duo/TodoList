@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /** 主题偏好：跟随系统 / 亮色 / 暗色。 */
@@ -7,19 +6,6 @@ export type ThemePref = "system" | "light" | "dark";
 /** 校验后端返回的主题值是否合法。 */
 export function isThemePref(value: unknown): value is ThemePref {
   return value === "system" || value === "light" || value === "dark";
-}
-
-/**
- * 读取持久化的主题偏好。
- * 后端未就绪 / 读取失败 / 值非法时一律回退为「跟随系统」，不报错。
- */
-export async function loadThemePref(): Promise<ThemePref> {
-  try {
-    const settings = await invoke<{ theme?: unknown }>("load_settings");
-    return isThemePref(settings?.theme) ? settings.theme : "system";
-  } catch {
-    return "system";
-  }
 }
 
 /**
