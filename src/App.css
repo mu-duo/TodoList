@@ -32,6 +32,10 @@
   --danger-strong: #b91c1c;
   --danger-soft: #fef2f2;
 
+  /* Agent 状态「成功」语义色（Phase 2 新增；不改动既有令牌值） */
+  --success: #16a34a;
+  --success-soft: #e9f7ef;
+
   --radius-card: 12px;
   --radius-control: 8px;
 
@@ -567,23 +571,72 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
-/* 操作区 = 卡片右侧热区。计数与删除按钮叠放同一格：
-   未悬停显示计数，悬停 / 聚焦时换成删除按钮；叠放保证切换不引起布局跳动。 */
+/* 操作区 = 卡片右侧热区。计数与删除叠放同一格：
+   未悬停显示计数，悬停 / 聚焦时换成删除按钮；叠放保证切换不引起布局跳动。
+   Agent 徽标恒显于计数左侧（悬停不消失）。 */
 .task-actions {
   flex: none;
-  display: grid;
-  grid-template-columns: 1fr;
+  display: flex;
   align-items: center;
+  gap: 6px;
   /* 加宽命中区域：向外撑开 padding，再用等量负 margin 还原视觉位置与占位 */
   padding: 10px 14px 10px 22px;
   margin: -10px -14px -10px -22px;
   border-radius: 10px;
 }
 
+.task-actions-swap {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: center;
+}
+
 /* 计数与删除叠在同一格、靠右；容器宽度取两者较宽者 */
-.task-actions > * {
+.task-actions-swap > * {
   grid-area: 1 / 1;
   justify-self: end;
+}
+
+/* 行尾 Agent 徽标：恒显（不随悬停消失），置于计数 / 删除左侧 */
+.task-agent-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.task-agent-icon {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.task-agent-badge:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.task-agent-badge.agent-tone-running {
+  color: var(--accent);
+  animation: agent-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes agent-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
 }
 
 /* 子任务计数：次级文字、不可点击（有子任务时才渲染） */
@@ -620,13 +673,13 @@ button:focus-visible {
 
 /* 触屏无 hover：计数与删除并排常显（计数在删除左侧） */
 @media (hover: none) {
-  .task-actions {
+  .task-actions-swap {
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
-  .task-actions > * {
+  .task-actions-swap > * {
     grid-area: auto;
     justify-self: auto;
   }
@@ -1469,6 +1522,246 @@ button:focus-visible {
   margin-bottom: 10px;
 }
 
+/* ---------------------------------------------- Agent 任务 UI（Phase 2） ---- */
+
+/* 从别处跳转进 Agent 配置模态时的引导横幅 */
+.agent-notice {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-control);
+}
+
+/* 状态色调（行尾徽标 / 详情徽标 / 历史行共用） */
+.agent-tone-neutral {
+  color: var(--text-muted);
+}
+.agent-tone-running {
+  color: var(--accent);
+}
+.agent-tone-success {
+  color: var(--success);
+}
+.agent-tone-danger {
+  color: var(--danger);
+}
+
+/* 状态文字徽标（必须有文字，不能只靠颜色） */
+.agent-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+}
+
+.agent-status-badge.agent-tone-running {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.agent-status-badge.agent-tone-success {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: var(--success);
+}
+
+.agent-status-badge.agent-tone-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+/* 详情内的 Agent 区 */
+.agent-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agent-path-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-path-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 8px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.agent-path-text {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-path-remove {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--text-faint);
+  background: transparent;
+  border-color: transparent;
+}
+
+.agent-path-remove:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: transparent;
+}
+
+.agent-run-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-run-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.agent-run-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.agent-run-line .row-action {
+  flex: none;
+  margin-left: auto;
+}
+
+.agent-run-time {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.agent-run-attempt {
+  font-size: 0.78rem;
+  color: var(--text-faint);
+}
+
+.agent-run-error {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--danger);
+  /* 错误信息完整展示：换行、不截断 */
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.agent-run-steps {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-run-note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.agent-run-dir {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右键菜单子菜单（清单 / 任务菜单共用；AppBar「更多」菜单不含 children，行为不变） */
+.context-menu-sub-host {
+  position: relative;
+}
+
+.context-menu--sub {
+  position: absolute;
+  left: calc(100% - 2px);
+  top: -5px;
+  z-index: 1;
+}
+
+.context-menu--sub.is-flip {
+  left: auto;
+  right: calc(100% - 2px);
+}
+
+.context-menu-item--parent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.context-menu-caret {
+  color: var(--text-faint);
+  font-size: 0.7rem;
+}
+
 .settings-body {
   display: flex;
   flex-direction: column;
@@ -1778,6 +2071,9 @@ button:focus-visible {
     --danger: #f26a6a;
     --danger-strong: #ff9b93;
     --danger-soft: #341d1f;
+
+    --success: #5fd39a;
+    --success-soft: #17301f;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.5);

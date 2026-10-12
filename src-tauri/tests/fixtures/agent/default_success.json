@@ -1,0 +1,22 @@
+{
+  "chat": [
+    {
+      "tool_calls": [
+        { "id": "s1", "name": "native_search", "input": { "query": "offline fixture query" } }
+      ]
+    },
+    { "text": "完成：已获取离线来源（仅供集成验证，未触网）。" }
+  ],
+  "search": [
+    {
+      "sources": [
+        {
+          "url": "https://example.test/a",
+          "title": "离线来源 A",
+          "page_age": "2026-10-12",
+          "snippet": "offline snippet A"
+        }
+      ]
+    }
+  ]
+}

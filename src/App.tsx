@@ -8,8 +8,34 @@ import { SettingsModal } from "./components/SettingsModal";
 import { ConfirmModal } from "./components/ConfirmModal";
 import { AppBar } from "./components/AppBar";
 import { AgentConfigModal } from "./components/AgentConfigModal";
+import { AgentTaskPanel } from "./components/AgentTaskPanel";
 import { applyThemePref, type ThemePref } from "./theme";
 import { loadSettings } from "./settings";
+import {
+  getAgentStatus,
+  listAgentRuns,
+  loadAgentConfig,
+  openAgentResultDir,
+  pickAgentPaths,
+  setAgentTaskIntent,
+  startAgentTask,
+  stopAgentTask,
+  subscribeAgentState,
+  type AgentStateEvent,
+  type RunSummary,
+} from "./agent";
+import {
+  agentMenuModel,
+  agentStateMeta,
+  agentStateTitle,
+  hasMoreRuns,
+  isAgentActive,
+  latestRun,
+  mergeRuns,
+  rowBadgeState,
+  sortRunsDesc,
+  taskKey,
+} from "./agentTask";
 import {
   APP_BAR_ENTRIES,
   DEFAULT_APP_BAR_ORDER,
@@ -38,7 +64,7 @@ type Task = {
   tags: string[] | null;
   notes: string | null;
   subtasks: Subtask[] | null;
-  /** Phase 2 起由后端返回的任务级 Agent 意图（本 Phase 仅预定义字段，不接线 UI）。 */
+  /** 任务级 Agent 意图（启用状态 + 关联原路径）；由后端 `load_lists` 返回，P2 已接线。 */
   agent?: { enabled: boolean; paths: string[] } | null;
 };
 
@@ -64,6 +90,28 @@ const PRIORITY_LABEL: Record<string, string> = {
 
 /** 「已完成」虚拟清单的哨兵 id（非真实文件）。 */
 const COMPLETED_ID = "__completed__";
+
+/** 详情 / 行尾共用的运行态快照（来自事件 / 状态 / 历史）。 */
+type AgentLiveState = {
+  runId: string;
+  state: string;
+  attempt: number;
+  errorClass?: string | null;
+  /** 停止原因（`state == stopped`）：manual|disabled|completed|deleted。 */
+  stopReason?: string | null;
+  resultDir?: string | null;
+};
+
+/** 任务右键菜单的位置与目标。 */
+type TaskMenuState = {
+  listFile: string;
+  taskId: string;
+  x: number;
+  y: number;
+};
+
+/** 运行历史每页条数。 */
+const AGENT_RUNS_PAGE = 50;
 
 function App() {
   const [lists, setLists] = useState<TaskList[]>([]);
@@ -99,6 +147,33 @@ function App() {
   const appBarSavingRef = useRef(false);
   // 手动刷新按钮的忙碌态（入口忙碌时禁用并可反馈）
   const [refreshing, setRefreshing] = useState(false);
+
+  // ---- Agent 任务 UI（Phase 2）----
+  // 任务键 → 已知运行态（事件 / 状态轮询 / 历史最新）
+  const [agentStates, setAgentStates] = useState<Map<string, AgentLiveState>>(
+    new Map(),
+  );
+  // 任务右键菜单（位置 + 目标）
+  const [taskMenu, setTaskMenu] = useState<TaskMenuState | null>(null);
+  // 选中任务的运行历史
+  const [agentRuns, setAgentRuns] = useState<RunSummary[]>([]);
+  const [agentRunsLoading, setAgentRunsLoading] = useState(false);
+  const [agentRunsHasMore, setAgentRunsHasMore] = useState(false);
+  // 启动 / 停止在途的任务键
+  const [agentBusyKeys, setAgentBusyKeys] = useState<Set<string>>(new Set());
+  // 启用前置不足时的引导提示（随 Agent 配置模态展示）
+  const [agentGateNotice, setAgentGateNotice] = useState<string | null>(null);
+  // 点击行尾图标后定位到详情 Agent 区
+  const [agentFocusTick, setAgentFocusTick] = useState(0);
+
+  const agentStatesRef = useRef(agentStates);
+  agentStatesRef.current = agentStates;
+  const agentBusyRef = useRef<Set<string>>(new Set());
+  // 已尝试拉取过最新状态的任务键（避免每次视图变化重复拉取）
+  const seededAgentKeysRef = useRef<Set<string>>(new Set());
+  const agentSectionRef = useRef<HTMLElement>(null);
+  const agentEventRef = useRef<((event: AgentStateEvent) => void) | null>(null);
+  const agentRunsRefetchRef = useRef<number | null>(null);
 
   const [newListName, setNewListName] = useState("");
   const [newTaskTitles, setNewTaskTitles] = useState<Record<string, string>>({});
@@ -201,6 +276,17 @@ function App() {
   const selectedTask = selectedEntry?.task ?? null;
   const selectedTaskListFile = selectedEntry?.listFile ?? null;
 
+  // 选中任务在 Agent 状态表中的键与快照
+  const selectedAgentKey =
+    selectedTask && selectedTaskListFile
+      ? taskKey(selectedTaskListFile, selectedTask.id)
+      : null;
+  const selectedAgentLive = selectedAgentKey
+    ? agentStates.get(selectedAgentKey)
+    : undefined;
+  const selectedAgentKeyRef = useRef<string | null>(null);
+  selectedAgentKeyRef.current = selectedAgentKey;
+
   // 磁盘侧子任务的「指纹」：选中任务切换、或外部/刷新/本地改动子任务时重新同步本地镜像
   const selectedSubtasksKey = JSON.stringify(selectedTask?.subtasks ?? null);
   // 切换任务：重置录入草稿与改名编辑态（仅在换任务时，避免本地改动子任务时误清空）
@@ -262,6 +348,470 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  // ---- Agent 任务 UI（Phase 2）：状态同步 / 历史 / 意图 / 启动停止 ----
+
+  function markAgentBusy(key: string, busy: boolean) {
+    const set = agentBusyRef.current;
+    if (busy) set.add(key);
+    else set.delete(key);
+    setAgentBusyKeys(new Set(set));
+  }
+
+  // 用一条运行记录播种最新状态；不覆盖「进行中」的活状态
+  function seedLatestFromRun(key: string, run: RunSummary) {
+    setAgentStates((prev) => {
+      const cur = prev.get(key);
+      if (cur && isAgentActive(cur.state)) return prev;
+      const next = new Map(prev);
+      next.set(key, {
+        runId: run.run_id,
+        state: run.state,
+        attempt: run.attempt,
+        errorClass: run.error_class ?? null,
+        stopReason: run.stop_reason ?? null,
+        resultDir: run.result_dir || null,
+      });
+      return next;
+    });
+  }
+
+  // 兜底：全局状态（active + queue）
+  async function refreshAgentStatus() {
+    try {
+      const status = await getAgentStatus();
+      setAgentStates((prev) => {
+        const next = new Map(prev);
+        if (status.active) {
+          const a = status.active;
+          const k = taskKey(a.list_file, a.task_id);
+          next.set(k, {
+            runId: a.run_id,
+            state: a.state,
+            attempt: a.attempt,
+            errorClass: a.error_class ?? null,
+            stopReason: a.stop_reason ?? null,
+            resultDir: a.result_dir || next.get(k)?.resultDir || null,
+          });
+        }
+        // 队列项＝待执行（后端 RunRef 不含 state 字段）
+        for (const q of status.queue) {
+          const k = taskKey(q.list_file, q.task_id);
+          next.set(k, {
+            runId: q.run_id,
+            state: "pending",
+            attempt: q.attempt,
+            errorClass: null,
+            stopReason: next.get(k)?.stopReason ?? null,
+            resultDir: next.get(k)?.resultDir ?? null,
+          });
+        }
+        return next;
+      });
+    } catch {
+      // 状态不可用时保持现状（不刷屏）
+    }
+  }
+
+  async function reloadSelectedRuns() {
+    const task = selectedTask;
+    const listFile = selectedTaskListFile;
+    if (!task || !listFile) return;
+    try {
+      const runs = await listAgentRuns(listFile, task.id, 0, AGENT_RUNS_PAGE);
+      setAgentRuns(sortRunsDesc(runs));
+      setAgentRunsHasMore(hasMoreRuns(runs, AGENT_RUNS_PAGE));
+      const top = latestRun(runs);
+      if (top) seedLatestFromRun(taskKey(listFile, task.id), top);
+    } catch {
+      // 忽略
+    }
+  }
+
+  // 防抖重取选中任务历史；按任务键校验，避免 400ms 窗口内切换任务时用旧闭包刷新
+  function scheduleReloadSelectedRuns(key: string) {
+    if (agentRunsRefetchRef.current !== null) {
+      window.clearTimeout(agentRunsRefetchRef.current);
+    }
+    agentRunsRefetchRef.current = window.setTimeout(() => {
+      agentRunsRefetchRef.current = null;
+      if (selectedAgentKeyRef.current !== key) return; // 选中已切换：丢弃过期刷新
+      void reloadSelectedRuns();
+    }, 400);
+  }
+
+  function onAgentEvent(event: AgentStateEvent) {
+    const key = taskKey(event.listFile, event.taskId);
+    setAgentStates((prev) => {
+      const cur = prev.get(key);
+      const next = new Map(prev);
+      next.set(key, {
+        runId: event.runId,
+        state: event.state,
+        attempt: event.attempt,
+        // 事件发 camelCase errorClass / stopReason（后端不发送 error_class）
+        errorClass: event.errorClass ?? cur?.errorClass ?? null,
+        stopReason: event.stopReason ?? cur?.stopReason ?? null,
+        resultDir: cur?.resultDir ?? null,
+      });
+      return next;
+    });
+    if (selectedAgentKeyRef.current === key) scheduleReloadSelectedRuns(key);
+  }
+  agentEventRef.current = onAgentEvent;
+
+  // 订阅 agent://state（一次；载荷无密钥）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    subscribeAgentState((event) => agentEventRef.current?.(event))
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // 订阅失败：靠状态 / 历史兜底
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // 挂载后兜底拉取全局状态
+  useEffect(() => {
+    void refreshAgentStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 当前视图内启用中、且尚未获知状态的任务 → 拉最新一次运行做行尾着色
+  const agentSeedSignature = useMemo(
+    () =>
+      viewTasks
+        .filter((e) => e.task.agent?.enabled)
+        .map((e) => taskKey(e.listFile, e.task.id))
+        .join("|"),
+    [viewTasks],
+  );
+  useEffect(() => {
+    const pending = viewTasks.filter((entry) => {
+      if (!entry.task.agent?.enabled) return false;
+      const key = taskKey(entry.listFile, entry.task.id);
+      if (agentStatesRef.current.has(key)) return false;
+      if (seededAgentKeysRef.current.has(key)) return false;
+      return true;
+    });
+    if (pending.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      for (const entry of pending) {
+        const key = taskKey(entry.listFile, entry.task.id);
+        seededAgentKeysRef.current.add(key);
+        try {
+          const runs = await listAgentRuns(entry.listFile, entry.task.id, 0, 1);
+          if (cancelled) return;
+          const top = latestRun(runs);
+          if (top) seedLatestFromRun(key, top);
+        } catch {
+          // 忽略：保持中性
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentSeedSignature]);
+
+  // 选中任务变化 → 拉取历史首页
+  useEffect(() => {
+    // 切换选中即作废未触发的防抖刷新（避免用旧闭包刷新历史）
+    if (agentRunsRefetchRef.current !== null) {
+      window.clearTimeout(agentRunsRefetchRef.current);
+      agentRunsRefetchRef.current = null;
+    }
+    setAgentRuns([]);
+    setAgentRunsHasMore(false);
+    const task = selectedEntry?.task ?? null;
+    const listFile = selectedEntry?.listFile ?? null;
+    if (!task || !listFile) return;
+    let cancelled = false;
+    setAgentRunsLoading(true);
+    listAgentRuns(listFile, task.id, 0, AGENT_RUNS_PAGE)
+      .then((runs) => {
+        if (cancelled) return;
+        setAgentRuns(sortRunsDesc(runs));
+        setAgentRunsHasMore(hasMoreRuns(runs, AGENT_RUNS_PAGE));
+        const top = latestRun(runs);
+        if (top) seedLatestFromRun(taskKey(listFile, task.id), top);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setAgentRuns([]);
+        setAgentRunsHasMore(false);
+      })
+      .finally(() => {
+        if (!cancelled) setAgentRunsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskId, selectedTaskListFile]);
+
+  // 点击行尾图标 → 详情滚动到 Agent 区
+  useEffect(() => {
+    if (agentFocusTick === 0) return;
+    agentSectionRef.current?.scrollIntoView({ block: "start" });
+  }, [agentFocusTick, selectedTaskId]);
+
+  // 卸载清理防抖
+  useEffect(() => {
+    return () => {
+      if (agentRunsRefetchRef.current !== null) {
+        window.clearTimeout(agentRunsRefetchRef.current);
+      }
+    };
+  }, []);
+
+  function applyTaskAgent(
+    prev: TaskList[],
+    listFile: string,
+    taskId: string,
+    enabled: boolean,
+    paths: string[],
+  ): TaskList[] {
+    return prev.map((list) =>
+      list.file !== listFile
+        ? list
+        : {
+            ...list,
+            tasks: list.tasks.map((task) =>
+              task.id !== taskId
+                ? task
+                : { ...task, agent: { enabled, paths } },
+            ),
+          },
+    );
+  }
+
+  // 启用前置：需本机执行开关 + 已配置 Key + 有效结果根；缺条件则引导到 Agent 配置
+  async function ensureAgentReady(): Promise<boolean> {
+    try {
+      const cfg = await loadAgentConfig();
+      if (cfg.execution_enabled && cfg.key_present && cfg.result_root) {
+        return true;
+      }
+      setAgentGateNotice(
+        "启用 Agent 协助前，请先在「Agent 配置」中开启本机执行、配置 API Key 与结果主目录。",
+      );
+      setAgentConfigOpen(true);
+      return false;
+    } catch (e) {
+      setActionError(String(e));
+      return false;
+    }
+  }
+
+  async function persistTaskIntent(
+    entry: ViewTask,
+    enabled: boolean,
+    paths: string[],
+  ) {
+    try {
+      await setAgentTaskIntent(entry.listFile, entry.task.id, enabled, paths);
+      setLists((prev) =>
+        applyTaskAgent(prev, entry.listFile, entry.task.id, enabled, paths),
+      );
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function toggleTaskAgent(entry: ViewTask, enabled: boolean) {
+    if (enabled) {
+      const ready = await ensureAgentReady();
+      if (!ready) return;
+    }
+    await persistTaskIntent(entry, enabled, entry.task.agent?.paths ?? []);
+  }
+
+  async function addTaskPaths(entry: ViewTask, directories: boolean) {
+    try {
+      const picked = await pickAgentPaths(directories);
+      if (!picked || picked.length === 0) return;
+      const next = (entry.task.agent?.paths ?? []).slice();
+      for (const p of picked) if (!next.includes(p)) next.push(p);
+      await persistTaskIntent(entry, !!entry.task.agent?.enabled, next);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function removeTaskPath(entry: ViewTask, path: string) {
+    const next = (entry.task.agent?.paths ?? []).filter((p) => p !== path);
+    await persistTaskIntent(entry, !!entry.task.agent?.enabled, next);
+  }
+
+  async function startTaskAgent(entry: ViewTask) {
+    const key = taskKey(entry.listFile, entry.task.id);
+    if (agentBusyRef.current.has(key)) return;
+    markAgentBusy(key, true);
+    try {
+      const res = await startAgentTask(entry.listFile, entry.task.id, true);
+      setAgentStates((prev) => {
+        const next = new Map(prev);
+        next.set(key, {
+          runId: res.runId,
+          state: "running",
+          attempt: prev.get(key)?.attempt ?? 1,
+          errorClass: null,
+          stopReason: null,
+          resultDir: prev.get(key)?.resultDir ?? null,
+        });
+        return next;
+      });
+      await refreshAgentStatus();
+      if (selectedAgentKeyRef.current === key) scheduleReloadSelectedRuns(key);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      markAgentBusy(key, false);
+    }
+  }
+
+  async function stopTaskAgent(entry: ViewTask) {
+    const key = taskKey(entry.listFile, entry.task.id);
+    if (agentBusyRef.current.has(key)) return;
+    markAgentBusy(key, true);
+    try {
+      await stopAgentTask(entry.listFile, entry.task.id);
+      await refreshAgentStatus();
+      if (selectedAgentKeyRef.current === key) scheduleReloadSelectedRuns(key);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      markAgentBusy(key, false);
+    }
+  }
+
+  async function openAgentResult(runId: string) {
+    try {
+      await openAgentResultDir(runId);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function loadMoreAgentRuns() {
+    const task = selectedTask;
+    const listFile = selectedTaskListFile;
+    if (!task || !listFile || agentRunsLoading) return;
+    const offset = agentRuns.length;
+    setAgentRunsLoading(true);
+    try {
+      const page = await listAgentRuns(listFile, task.id, offset, AGENT_RUNS_PAGE);
+      setAgentRuns((prev) => mergeRuns(prev, page));
+      setAgentRunsHasMore(hasMoreRuns(page, AGENT_RUNS_PAGE));
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setAgentRunsLoading(false);
+    }
+  }
+
+  function openTaskAgent(entry: ViewTask) {
+    openTask(entry.task.id);
+    setAgentFocusTick((t) => t + 1);
+  }
+
+  function openTaskMenu(event: MouseEvent, entry: ViewTask) {
+    event.preventDefault();
+    event.stopPropagation();
+    setMenu(null);
+    setTaskMenu({
+      listFile: entry.listFile,
+      taskId: entry.task.id,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }
+
+  function buildTaskMenuItems(entry: ViewTask): MenuItem[] {
+    const { task, listFile } = entry;
+    const key = taskKey(listFile, task.id);
+    const live = agentStates.get(key);
+    const enabled = !!task.agent?.enabled;
+    const model = agentMenuModel({
+      agentEnabled: enabled,
+      hasRun: !!live,
+      isActive: isAgentActive(live?.state),
+      latestResultDir: live?.resultDir ?? null,
+    });
+    const isDone = task.status === "done";
+    return [
+      {
+        key: "open",
+        label: "打开详情",
+        onSelect: () => openTask(task.id),
+      },
+      {
+        key: "toggle-done",
+        label: isDone ? "取消完成" : "完成",
+        onSelect: () => toggle(listFile, task, !isDone),
+      },
+      {
+        key: "agent",
+        label: "Agent",
+        children: [
+          {
+            key: "agent-toggle",
+            label: model.toggleLabel,
+            onSelect: () => void toggleTaskAgent(entry, !enabled),
+          },
+          {
+            key: "agent-add-file",
+            label: "添加关联文件",
+            disabled: !model.addFileEnabled,
+            onSelect: () => void addTaskPaths(entry, false),
+          },
+          {
+            key: "agent-add-dir",
+            label: "添加关联目录",
+            disabled: !model.addDirEnabled,
+            onSelect: () => void addTaskPaths(entry, true),
+          },
+          {
+            key: "agent-start",
+            label: model.startLabel,
+            disabled: !model.startEnabled,
+            onSelect: () => void startTaskAgent(entry),
+          },
+          {
+            key: "agent-stop",
+            label: "停止",
+            disabled: !model.stopEnabled,
+            onSelect: () => void stopTaskAgent(entry),
+          },
+          {
+            key: "agent-result",
+            label: "查看结果",
+            disabled: !model.viewResultEnabled,
+            onSelect: () => {
+              const l = agentStatesRef.current.get(key);
+              if (l?.runId) void openAgentResult(l.runId);
+            },
+          },
+        ],
+      },
+      {
+        key: "delete",
+        label: "删除",
+        danger: true,
+        onSelect: () => removeTask(listFile, task),
+      },
+    ];
   }
 
   // 启动：先确定主题（首帧前 setTheme）并读取功能栏顺序，再加载清单；主题未定前不画亮色内容
@@ -1122,6 +1672,13 @@ function App() {
     const subs = task.subtasks ?? [];
     const total = subs.length;
     const doneCount = subs.filter((s) => s.status === "done").length;
+    const agentKey = taskKey(entry.listFile, task.id);
+    const agentLive = agentStates.get(agentKey);
+    const badgeState = rowBadgeState(
+      !!task.agent?.enabled,
+      agentLive?.state,
+      undefined,
+    );
     return (
       <div className="task-row">
         <input
@@ -1158,43 +1715,67 @@ function App() {
           )}
         </button>
         <div className="task-actions">
-          {total > 0 && (
-            <span
-              className="task-subtask-count"
-              title={`已完成 ${doneCount} / 共 ${total} 子任务`}
+          {badgeState && (
+            <button
+              type="button"
+              className={`task-agent-badge agent-tone-${
+                agentStateMeta(badgeState).tone
+              }`}
+              onClick={() => openTaskAgent(entry)}
+              onPointerDown={(e) => e.stopPropagation()}
+              aria-label={agentStateTitle(
+                badgeState,
+                agentLive?.errorClass,
+                agentLive?.stopReason,
+              )}
+              title={agentStateTitle(
+                badgeState,
+                agentLive?.errorClass,
+                agentLive?.stopReason,
+              )}
             >
-              {doneCount}/{total}
-            </span>
+              <AgentRobotGlyph />
+            </button>
           )}
-          <button
-            type="button"
-            className="row-action danger"
-            onClick={(e) => {
-              e.stopPropagation();
-              removeTask(entry.listFile, task);
-            }}
-            onPointerDown={(e) => e.stopPropagation()}
-            disabled={busy || !task.id}
-            aria-label="删除任务"
-            title="删除任务"
-          >
-            <svg
-              className="trash-icon"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
+          <div className="task-actions-swap">
+            {total > 0 && (
+              <span
+                className="task-subtask-count"
+                title={`已完成 ${doneCount} / 共 ${total} 子任务`}
+              >
+                {doneCount}/{total}
+              </span>
+            )}
+            <button
+              type="button"
+              className="row-action danger"
+              onClick={(e) => {
+                e.stopPropagation();
+                removeTask(entry.listFile, task);
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              disabled={busy || !task.id}
+              aria-label="删除任务"
+              title="删除任务"
             >
-              <path d="M3 6h18" />
-              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-            </svg>
-          </button>
+              <svg
+                className="trash-icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M3 6h18" />
+                <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1484,6 +2065,31 @@ function App() {
             <dd className="mono">{selectedTask.id || "—"}</dd>
           </div>
         </dl>
+
+        <AgentTaskPanel
+          enabled={!!selectedTask.agent?.enabled}
+          paths={selectedTask.agent?.paths ?? []}
+          liveState={selectedAgentLive?.state ?? null}
+          liveErrorClass={selectedAgentLive?.errorClass ?? null}
+          liveStopReason={selectedAgentLive?.stopReason ?? null}
+          isActive={isAgentActive(selectedAgentLive?.state)}
+          busy={selectedAgentKey !== null && agentBusyKeys.has(selectedAgentKey)}
+          runs={agentRuns}
+          runsLoading={agentRunsLoading}
+          runsHasMore={agentRunsHasMore}
+          sectionRef={agentSectionRef}
+          onToggleEnabled={(enabled) =>
+            void toggleTaskAgent(selectedEntry!, enabled)
+          }
+          onAddPaths={(directories) =>
+            void addTaskPaths(selectedEntry!, directories)
+          }
+          onRemovePath={(path) => void removeTaskPath(selectedEntry!, path)}
+          onStart={() => void startTaskAgent(selectedEntry!)}
+          onStop={() => void stopTaskAgent(selectedEntry!)}
+          onOpenResult={(runId) => void openAgentResult(runId)}
+          onLoadMore={() => void loadMoreAgentRuns()}
+        />
       </div>
     );
   }
@@ -1503,6 +2109,13 @@ function App() {
           onSelect: () => removeList(menuList),
         },
       ]
+    : [];
+
+  const taskMenuEntry = taskMenu
+    ? entryById.get(taskMenu.taskId) ?? null
+    : null;
+  const taskMenuItems: MenuItem[] = taskMenuEntry
+    ? buildTaskMenuItems(taskMenuEntry)
     : [];
 
   // 「已完成」固定项（非真实清单，不可拖拽 / 右键）
@@ -1609,6 +2222,10 @@ function App() {
                         taskRowClass(entryById.get(id)!)
                       }
                       renderItem={(id) => renderTaskCard(entryById.get(id)!)}
+                      onItemContextMenu={(id, event) => {
+                        const entry = entryById.get(id);
+                        if (entry) openTaskMenu(event, entry);
+                      }}
                     />
                   )}
                 </div>
@@ -1637,6 +2254,10 @@ function App() {
                       onReorder={handleTaskReorder}
                       onDragStart={markDragStart}
                       onDragEnd={markDragEnd}
+                      onItemContextMenu={(id, event) => {
+                        const entry = entryById.get(id);
+                        if (entry) openTaskMenu(event, entry);
+                      }}
                     />
                   )}
                 </div>
@@ -1778,6 +2399,15 @@ function App() {
         />
       )}
 
+      {taskMenu && taskMenuEntry && (
+        <ContextMenu
+          x={taskMenu.x}
+          y={taskMenu.y}
+          items={taskMenuItems}
+          onClose={() => setTaskMenu(null)}
+        />
+      )}
+
       {settingsOpen && (
         <SettingsModal
           theme={theme}
@@ -1793,7 +2423,13 @@ function App() {
       )}
 
       {agentConfigOpen && (
-        <AgentConfigModal onClose={() => setAgentConfigOpen(false)} />
+        <AgentConfigModal
+          onClose={() => {
+            setAgentConfigOpen(false);
+            setAgentGateNotice(null);
+          }}
+          notice={agentGateNotice}
+        />
       )}
 
       {pendingDeleteList && (
@@ -1806,6 +2442,31 @@ function App() {
         />
       )}
     </main>
+  );
+}
+
+/** 行尾 Agent 机器人小图标（与既有内联图标同风格）。 */
+function AgentRobotGlyph() {
+  return (
+    <svg
+      className="task-agent-icon"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="4" y="8" width="16" height="11" rx="3" />
+      <path d="M12 8V5.2" />
+      <circle cx="12" cy="4" r="1.1" />
+      <path d="M9 12v2" />
+      <path d="M15 12v2" />
+      <path d="M9.5 16.5h5" />
+      <path d="M4 12.5H2.6" />
+      <path d="M20 12.5h1.4" />
+    </svg>
   );
 }
 

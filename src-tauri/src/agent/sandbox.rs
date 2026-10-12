@@ -202,6 +202,14 @@ fn normalize_final_path(raw: &str) -> PathBuf {
     }
 }
 
+/// 目录项（按句柄枚举）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
 /// open-first 守卫：持有 OS 句柄期间 `final_path` 可信；文件读取走**同一句柄**。
 #[allow(dead_code)] // P2 runner：读取阶段持有句柄，杜绝按路径重开。
 pub struct PathGuard {
@@ -245,7 +253,166 @@ impl PathGuard {
         budget.reserve(filled as u64)?;
         Ok(buf)
     }
+
+    /// **按句柄**枚举目录的一页（每页 ≤ [`DIR_PAGE_LIMIT`] 项），返回 `(items, has_more)`。
+    ///
+    /// 经 `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` 在**已持有**的目录句柄上枚举，
+    /// 不按路径重开。
+    #[cfg(windows)]
+    pub fn list_dir_page(&mut self, page: usize) -> Result<(Vec<DirEntryInfo>, bool), String> {
+        if !self.is_dir {
+            return Err("不是目录".to_string());
+        }
+        list_dir_handle(self, page)
+    }
+
+    #[cfg(not(windows))]
+    pub fn list_dir_page(&mut self, _page: usize) -> Result<(Vec<DirEntryInfo>, bool), String> {
+        Err("目录枚举仅支持 Windows".to_string())
+    }
 }
+
+/// 在已持有的目录句柄上枚举（Windows）。
+#[cfg(windows)]
+fn list_dir_handle(guard: &PathGuard, page: usize) -> Result<(Vec<DirEntryInfo>, bool), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandleEx, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+    };
+
+    const ERROR_MORE_DATA: i32 = 234;
+
+    fn win32_code(e: &windows::core::Error) -> i32 {
+        (e.code().0 as u32 & 0xFFFF) as i32
+    }
+
+    let handle = HANDLE(guard.file.as_raw_handle());
+    let needed = (page + 1) * DIR_PAGE_LIMIT;
+    let mut collected: Vec<DirEntryInfo> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    // 句柄枚举是**有状态**的（游标随调用前进）：首次用 Restart 复位，保证每次调用可独立分页。
+    let mut first = true;
+    loop {
+        let class = if first {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        first = false;
+        let res = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                class,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                buf.len() as u32,
+            )
+        };
+        match res {
+            Ok(()) => {
+                parse_dir_buffer(&buf, &mut collected);
+                break;
+            }
+            Err(e) if win32_code(&e) == ERROR_MORE_DATA => {
+                parse_dir_buffer(&buf, &mut collected);
+                if collected.len() > needed {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let start = page.saturating_mul(DIR_PAGE_LIMIT);
+    let slice: Vec<DirEntryInfo> = collected
+        .iter()
+        .skip(start)
+        .take(DIR_PAGE_LIMIT)
+        .cloned()
+        .collect();
+    let has_more = collected.len() > start + slice.len();
+    Ok((slice, has_more))
+}
+
+#[cfg(windows)]
+fn parse_dir_buffer(buf: &[u8], out: &mut Vec<DirEntryInfo>) {
+    use windows::Win32::Storage::FileSystem::FILE_ID_BOTH_DIR_INFO;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+    let mut offset = 0usize;
+    while offset + 8 <= buf.len() {
+        let info = unsafe { &*(buf.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+        let name_len = info.FileNameLength as usize / 2;
+        let base = buf.as_ptr() as usize;
+        let name_start = info.FileName.as_ptr() as usize - base;
+        if name_start + name_len * 2 > buf.len() {
+            break;
+        }
+        let name = String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(info.FileName.as_ptr(), name_len)
+        });
+        if name != "." && name != ".." {
+            out.push(DirEntryInfo {
+                name,
+                is_dir: info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                size: info.EndOfFile.max(0) as u64,
+            });
+        }
+        if info.NextEntryOffset == 0 {
+            break;
+        }
+        let next = offset + info.NextEntryOffset as usize;
+        if next <= offset || next + 8 > buf.len() {
+            break;
+        }
+        offset = next;
+    }
+}
+
+/// 结果目录安全创建：`result_root`(校验) + `task_id`(ULID) + `{timestamp}_{run_id}`(ULID)。
+///
+/// 逐级 `create_dir_all` 后 open-first 复核最终路径未被重解析替换；失败 fail closed。
+#[allow(dead_code)] // P2 runner：结果落盘。
+pub fn create_result_dir(
+    app_config_base: &Path,
+    result_root: &str,
+    task_id: &str,
+    run_id: &str,
+    timestamp: &str,
+) -> Result<PathBuf, String> {
+    if ulid::Ulid::from_string(task_id).is_err() {
+        return Err("任务缺少合法 ULID，拒绝生成结果路径".to_string());
+    }
+    if ulid::Ulid::from_string(run_id).is_err() {
+        return Err("非法的 run_id".to_string());
+    }
+    if timestamp.is_empty()
+        || timestamp.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|', ' '])
+    {
+        return Err("非法的时间戳".to_string());
+    }
+    validate_result_root_in(app_config_base, result_root)?;
+
+    let root = Path::new(result_root);
+    let run_dir = root.join(task_id).join(format!("{timestamp}_{run_id}"));
+    std::fs::create_dir_all(&run_dir).map_err(|e| format!("创建结果目录失败：{e}"))?;
+
+    // reparse 安全：最终路径必须与预期一致（防 junction 替换）
+    verify_result_dir(&run_dir)?;
+    Ok(run_dir)
+}
+
+/// 目录复核（写入前 / 后）：open-first 取最终路径，必须与预期路径一致，否则 fail closed。
+#[allow(dead_code)] // P2 runner：结果写入前后目录复核。
+pub fn verify_result_dir(dir: &Path) -> Result<(), String> {
+    let resolved = open_readonly_final_path(dir)?;
+    if !same_path_ci(&resolved, dir) {
+        return Err("结果目录被重解析 / 替换，已拒绝".to_string());
+    }
+    Ok(())
+}
+
 
 /// 校验 `path` 可安全只读并返回**持句柄**的 [`PathGuard`]：字符串护栏 → open-first →
 /// 最终路径仍在授权根之下。调用方只能经守卫从句柄读取，不得按路径重开。
@@ -574,5 +741,85 @@ mod tests {
         );
         // open-first 会解析到真实目标；授权根为 link 时最终路径不在其下 → 拒绝
         assert!(resolve_allowed(&link, std::slice::from_ref(&link)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_dir_by_handle_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(DIR_PAGE_LIMIT + 5) {
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), b"x").unwrap();
+        }
+        let mut guard = resolve_allowed(dir.path(), &[dir.path().to_path_buf()]).unwrap();
+        assert!(guard.is_dir());
+        let (page0, more0) = guard.list_dir_page(0).unwrap();
+        assert_eq!(page0.len(), DIR_PAGE_LIMIT);
+        assert!(more0, "第一页后仍有剩余");
+        let (page1, more1) = guard.list_dir_page(1).unwrap();
+        assert_eq!(page1.len(), 5);
+        assert!(!more1);
+        // 目录句柄不可作为文件读取
+        let mut budget = ReadBudget::new();
+        assert!(guard.read_page(0, &mut budget).is_err());
+    }
+
+    #[test]
+    fn result_dir_requires_ulid_segments_and_creates() {
+        let cfg = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("results");
+        let task = ulid::Ulid::generate().to_string();
+        let run = ulid::Ulid::generate().to_string();
+
+        let dir = create_result_dir(
+            cfg.path(),
+            &root.to_string_lossy(),
+            &task,
+            &run,
+            "2026-10-12T01-00-00",
+        )
+        .unwrap();
+        assert!(dir.is_dir());
+        assert!(dir.ends_with(format!("2026-10-12T01-00-00_{run}")));
+
+        // 非法 task_id(非 ULID) / run_id / 时间戳 → 拒绝
+        assert!(create_result_dir(cfg.path(), &root.to_string_lossy(), "T1", &run, "ts").is_err());
+        assert!(create_result_dir(
+            cfg.path(),
+            &root.to_string_lossy(),
+            &task,
+            "../evil",
+            "ts"
+        )
+        .is_err());
+        assert!(create_result_dir(
+            cfg.path(),
+            &root.to_string_lossy(),
+            &task,
+            &run,
+            "a/b"
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verify_result_dir_rejects_junction() {
+        let target = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let link = work.path().join("link");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            return;
+        }
+        // link 的最终路径解析到 target，与预期不一致 → 拒绝
+        assert!(verify_result_dir(&link).is_err());
+        assert!(verify_result_dir(target.path()).is_ok());
     }
 }

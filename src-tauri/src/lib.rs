@@ -1,6 +1,10 @@
 mod agent;
 mod storage;
 
+use std::sync::Arc;
+
+use agent::clock::SystemClock;
+use agent::commands::AgentRuntime;
 use tauri::Manager;
 
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
@@ -164,10 +168,28 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 把主窗口标题设为「TodoList <版本>」；找不到窗口时静默忽略。
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("TodoList {}", app.package_info().version));
+            }
+            // Agent 运行编排：独占 runner.lock + 并发 1 队列（应用运行期间）。
+            if let (Ok(config_base), Ok(data_base)) = (storage::settings_dir(), storage::data_dir()) {
+                // 先取独占 runner.lock（构造 runtime），**再**恢复 running→interrupted：
+                // 非持有锁的实例不得把在跑记录误标 interrupted。
+                let runtime = Arc::new(AgentRuntime::new(
+                    config_base,
+                    data_base,
+                    Arc::new(SystemClock::new()),
+                ));
+                let now = chrono::Local::now()
+                    .naive_local()
+                    .format("%Y-%m-%dT%H:%M")
+                    .to_string();
+                let _ = runtime.recover_interrupted(&now);
+                app.manage(runtime.clone());
+                runtime.spawn_worker(app.handle().clone());
             }
             Ok(())
         })
@@ -199,7 +221,12 @@ pub fn run() {
             agent::commands::agent_probe,
             agent::commands::agent_set_task_intent,
             agent::commands::agent_pick_result_root,
-            agent::commands::agent_pick_paths
+            agent::commands::agent_pick_paths,
+            agent::commands::agent_start_task,
+            agent::commands::agent_stop_task,
+            agent::commands::agent_get_status,
+            agent::commands::agent_list_runs,
+            agent::commands::agent_open_result_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

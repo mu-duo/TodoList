@@ -13,6 +13,8 @@ import {
 
 type AgentConfigModalProps = {
   onClose: () => void;
+  /** 可选：从别处跳转进来时的说明横幅（如任务启用前置不足的引导）。 */
+  notice?: string | null;
 };
 
 type Feedback = { ok: boolean; text: string } | null;
@@ -29,7 +31,7 @@ const FOCUSABLE =
  * - 测试连接为**显式二次费用确认**后的付费探测；未确认前**不 invoke**。
  * - 本机执行 `execution_enabled` 默认关闭；false→true 需**显式云端同意**（并随保存传 `consentCloud`）。
  */
-export function AgentConfigModal({ onClose }: AgentConfigModalProps) {
+export function AgentConfigModal({ onClose, notice }: AgentConfigModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
   const mountedRef = useRef(true);
@@ -374,6 +376,8 @@ export function AgentConfigModal({ onClose }: AgentConfigModalProps) {
             ×
           </button>
         </div>
+
+        {notice && <p className="agent-notice">{notice}</p>}
 
         {phase === "loading" && <p className="hint">加载中…</p>}
         {phase === "error" && (

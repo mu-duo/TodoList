@@ -1,0 +1,8 @@
+{
+  "chat": [
+    {
+      "error_class": "Transport",
+      "error_message": "离线失败脚本：模拟网络传输错误"
+    }
+  ]
+}

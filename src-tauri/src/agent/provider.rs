@@ -15,19 +15,24 @@ use super::secret::SecretStore;
 /// Anthropic 兼容协议版本。
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// 服务端搜索工具类型（固定版本名）。
+#[allow(dead_code)] // feature 构建下 DeepSeekProvider 搜索路径不被工厂使用。
 pub const SEARCH_TOOL_TYPE: &str = "web_search_20250305";
 /// 服务端搜索工具名。
+#[allow(dead_code)] // feature 构建下 DeepSeekProvider 搜索路径不被工厂使用。
 pub const SEARCH_TOOL_NAME: &str = "web_search";
 /// 生产固定端点（**不可**经配置 / 环境任意改动）。
+#[allow(dead_code)] // feature 构建下 DeepSeekProvider 不被工厂使用。
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/anthropic/v1";
 /// chat 默认 max_tokens。
 #[allow(dead_code)] // P2 runner：主 chat 循环消费。
 pub const CHAT_MAX_TOKENS: u32 = 4096;
 /// 辅助 search 默认 max_tokens（小）。
+#[allow(dead_code)] // feature 构建下 DeepSeekProvider 搜索路径不被工厂使用。
 pub const SEARCH_MAX_TOKENS: u32 = 1024;
 /// 响应体字节上限（防止内存放大 / 日志泄漏）。
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// 客户端整体超时（兜底；单请求另设 `deadline`）。
+#[allow(dead_code)] // feature 构建下 DeepSeekProvider 不被工厂使用。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub const CLASS_MISSING_CREDENTIAL: &str = "MissingCredential";
@@ -40,6 +45,30 @@ pub const CLASS_NO_RESULT_BLOCK: &str = "NoResultBlock";
 pub const CLASS_ABORTED: &str = "Aborted";
 /// 2xx 响应体内含上游 `error` 对象（**区别于** `HttpStatus`，供 P2 判定致命而非可重试）。
 pub const CLASS_PROVIDER_ERROR: &str = "ProviderError";
+
+/// 编译期事实：本构建的 [`make_provider`] 是否返回假实现。
+///
+/// 仅 `agent-test-provider` feature 开启时为 `true`；默认 / release 构建恒为 `false`（编译期确定，
+/// **不是**运行时 env 开关）。供测试断言“默认构建绝不返回假实现”。
+#[allow(dead_code)]
+pub const TEST_PROVIDER_ENABLED: bool = cfg!(feature = "agent-test-provider");
+
+/// 归一化脚本中的错误类名到内部 `&'static str` 常量（仅 fixture 脚本解析用）。
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[allow(dead_code)]
+pub fn class_name_to_static(name: &str) -> &'static str {
+    match name {
+        "MissingCredential" => CLASS_MISSING_CREDENTIAL,
+        "HttpAuth" => CLASS_HTTP_AUTH,
+        "HttpStatus" => CLASS_HTTP_STATUS,
+        "Transport" => CLASS_TRANSPORT,
+        "Redirect" => CLASS_REDIRECT,
+        "Parse" => CLASS_PARSE,
+        "NoResultBlock" => CLASS_NO_RESULT_BLOCK,
+        "Aborted" => CLASS_ABORTED,
+        _ => CLASS_PROVIDER_ERROR,
+    }
+}
 
 /// Provider 错误（分类 + 安全消息，不含密钥 / 原始响应体）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +129,7 @@ pub fn build_chat_request(model: &str, messages: Value, tools: Value, max_tokens
 }
 
 /// 构造**独立** native search 请求：唯一工具为服务端 `web_search_20250305`。
+#[allow(dead_code)] // feature 构建下由假实现替代。
 pub fn build_search_request(model: &str, query: &str, max_uses: u32, max_tokens: u32) -> Value {
     json!({
         "model": model,
@@ -126,14 +156,24 @@ pub struct SearchOutcome {
     pub had_server_tool_use: bool,
 }
 
+/// 客户端工具调用（主 chat 循环执行）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
 /// chat 结果（宽容：citations / server_tool_use 缺失均可）。
 #[allow(dead_code)] // P2 runner：主 chat 循环消费。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatOutcome {
     pub text: String,
     pub had_server_tool_use: bool,
     pub had_search_result: bool,
     pub citations: Vec<String>,
+    /// 客户端工具调用（`tool_use` 块）；供 runner 执行 fs / native_search。
+    pub tool_calls: Vec<ToolCall>,
 }
 
 fn classify_status(status: u16) -> Result<(), ProviderError> {
@@ -159,6 +199,7 @@ fn classify_status(status: u16) -> Result<(), ProviderError> {
 }
 
 /// 解析 search 响应：**无结果块或空来源 ⇒ 失败**，绝不判为联网成功。
+#[allow(dead_code)] // feature 构建下由假实现替代；测试仍直接消费。
 pub fn parse_search_response(status: u16, body: &str) -> Result<SearchOutcome, ProviderError> {
     classify_status(status)?;
     let value: Value = serde_json::from_str(body)
@@ -263,6 +304,7 @@ pub fn parse_chat_response(status: u16, body: &str) -> Result<ChatOutcome, Provi
     let mut had_server_tool_use = false;
     let mut had_search_result = false;
     let mut citations = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
     for block in content {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -279,6 +321,17 @@ pub fn parse_chat_response(status: u16, body: &str) -> Result<ChatOutcome, Provi
             }
             Some("server_tool_use") => had_server_tool_use = true,
             Some("web_search_tool_result") => had_search_result = true,
+            Some("tool_use") => {
+                let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+                if !name.is_empty() {
+                    tool_calls.push(ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        input: block.get("input").cloned().unwrap_or(Value::Null),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -287,6 +340,7 @@ pub fn parse_chat_response(status: u16, body: &str) -> Result<ChatOutcome, Provi
         had_server_tool_use,
         had_search_result,
         citations,
+        tool_calls,
     })
 }
 
@@ -313,6 +367,7 @@ pub trait Provider: Send + Sync {
 }
 
 /// DeepSeek（Anthropic 兼容端点）provider；HTTP 全在 Rust，密钥仅本机读取。
+#[allow(dead_code)] // feature 构建（agent-test-provider）下工厂改用假实现，本实现仅供默认 / release。
 pub struct DeepSeekProvider {
     client: reqwest::Client,
     base_url: String,
@@ -320,6 +375,7 @@ pub struct DeepSeekProvider {
     secret: Arc<dyn SecretStore>,
 }
 
+#[allow(dead_code)] // feature 构建下工厂改用假实现。
 impl DeepSeekProvider {
     /// 生产构造：端点固定为官方域，禁跟随重定向；client 构建失败向上传播（fail closed）。
     pub fn new(secret: Arc<dyn SecretStore>, model: String) -> Result<Self, ProviderError> {
@@ -465,10 +521,16 @@ impl Provider for DeepSeekProvider {
 
 /// 测试用假 provider（仅替换网络，不绕过任何安全规则）；`#[cfg]` 门禁。
 #[cfg(any(test, feature = "agent-test-provider"))]
-#[allow(dead_code)] // 假实现字段供 P2 测试扩展。
+#[allow(dead_code)] // 假实现字段供 P2 / 集成测试扩展。
 pub struct FakeProvider {
     pub search: std::sync::Mutex<Result<SearchOutcome, ProviderError>>,
     pub chat: std::sync::Mutex<Result<ChatOutcome, ProviderError>>,
+    /// 可选多步脚本：非空时每次 `chat` 弹出队首，用于主循环测试。
+    pub chat_script: std::sync::Mutex<std::collections::VecDeque<Result<ChatOutcome, ProviderError>>>,
+    /// 可选搜索脚本：非空时每次 `search` 弹出队首。
+    pub search_script: std::sync::Mutex<std::collections::VecDeque<Result<SearchOutcome, ProviderError>>>,
+    /// 为真时 `chat` 反复返回脚本队首（不弹出）——用于驱动步数上限。
+    pub repeat_last_chat: bool,
     pub delay: Duration,
 }
 
@@ -482,9 +544,29 @@ impl FakeProvider {
                 had_server_tool_use: false,
                 had_search_result: false,
                 citations: Vec::new(),
+                tool_calls: Vec::new(),
             })),
+            chat_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            search_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            repeat_last_chat: false,
             delay: Duration::ZERO,
         }
+    }
+
+    /// 主循环脚本：按序返回 `chat` 结果；`search` 用给定结果。
+    #[allow(dead_code)] // feature 构建下仅测试消费。
+    pub fn scripted(
+        chat_steps: Vec<Result<ChatOutcome, ProviderError>>,
+        search: Result<SearchOutcome, ProviderError>,
+    ) -> Self {
+        let mut provider = Self::search_ok(SearchOutcome {
+            sources: Vec::new(),
+            text: String::new(),
+            had_server_tool_use: false,
+        });
+        provider.search = std::sync::Mutex::new(search);
+        provider.chat_script = std::sync::Mutex::new(chat_steps.into());
+        provider
     }
 }
 
@@ -505,6 +587,16 @@ impl Provider for FakeProvider {
                 _ = tokio::time::sleep(self.delay) => {}
             }
         }
+        {
+            let mut script = self.chat_script.lock().unwrap();
+            if self.repeat_last_chat {
+                if let Some(last) = script.front() {
+                    return last.clone();
+                }
+            } else if let Some(next) = script.pop_front() {
+                return next;
+            }
+        }
         self.chat.lock().unwrap().clone()
     }
 
@@ -521,8 +613,210 @@ impl Provider for FakeProvider {
                 _ = tokio::time::sleep(self.delay) => {}
             }
         }
+        if let Some(next) = self.search_script.lock().unwrap().pop_front() {
+            return next;
+        }
         self.search.lock().unwrap().clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 脚本化假 provider（fixture 驱动）+ 编译期 feature 门禁的统一工厂
+// ---------------------------------------------------------------------------
+
+/// 内置默认脚本（`agent-test-provider` 构建下 `make_provider` 使用）：仅 native_search + 终答，
+/// 不含 fs 路径（授权根由任务运行时提供），完全离线。供 CDP 全链路验证。
+#[cfg(feature = "agent-test-provider")]
+pub const DEFAULT_TEST_SCRIPT: &str =
+    include_str!("../../tests/fixtures/agent/default_success.json");
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[derive(serde::Deserialize)]
+struct ScriptFile {
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    repeat_last_chat: bool,
+    #[serde(default)]
+    chat: Vec<ScriptChatStep>,
+    #[serde(default)]
+    search: Vec<ScriptSearchStep>,
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[derive(serde::Deserialize)]
+struct ScriptChatStep {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    tool_calls: Vec<ScriptToolCall>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+impl ScriptChatStep {
+    fn into_result(self) -> Result<ChatOutcome, ProviderError> {
+        if let Some(class) = self.error_class {
+            return Err(ProviderError::new(
+                class_name_to_static(&class),
+                self.error_message.unwrap_or_default(),
+            ));
+        }
+        Ok(ChatOutcome {
+            text: self.text,
+            had_server_tool_use: false,
+            had_search_result: false,
+            citations: Vec::new(),
+            tool_calls: self
+                .tool_calls
+                .into_iter()
+                .map(|t| ToolCall {
+                    id: t.id,
+                    name: t.name,
+                    input: t.input,
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[derive(serde::Deserialize)]
+struct ScriptToolCall {
+    #[serde(default)]
+    id: String,
+    name: String,
+    #[serde(default)]
+    input: Value,
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[derive(serde::Deserialize)]
+struct ScriptSearchStep {
+    #[serde(default)]
+    sources: Vec<ScriptSource>,
+    #[serde(default)]
+    error_class: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+impl ScriptSearchStep {
+    fn into_result(self) -> Result<SearchOutcome, ProviderError> {
+        if let Some(class) = self.error_class {
+            return Err(ProviderError::new(
+                class_name_to_static(&class),
+                self.error_message.unwrap_or_default(),
+            ));
+        }
+        Ok(SearchOutcome {
+            sources: self
+                .sources
+                .into_iter()
+                .map(|s| SearchSource {
+                    url: s.url,
+                    title: s.title,
+                    page_age: s.page_age,
+                    snippet: s.snippet,
+                })
+                .collect(),
+            text: String::new(),
+            had_server_tool_use: false,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[derive(serde::Deserialize)]
+struct ScriptSource {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    page_age: Option<String>,
+    #[serde(default)]
+    snippet: Option<String>,
+}
+
+/// 从 fixture 文件加载脚本（`vars` 为 JSON 字符串内的占位替换，如 `("$ROOT", 绝对路径)`）。
+///
+/// 路径可注入；**不触网**。占位值按 JSON 字符串转义后替换。
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[allow(dead_code)] // 供集成测试 / CDP 注入脚本路径。
+pub fn load_fake_script(
+    path: &std::path::Path,
+    vars: &[(&str, &str)],
+) -> Result<FakeProvider, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("读取脚本失败：{e}"))?;
+    load_fake_script_str(&text, vars)
+}
+
+/// 从脚本字符串加载（`make_provider` 内置脚本 / 单元测试用）。
+#[cfg(any(test, feature = "agent-test-provider"))]
+#[allow(dead_code)]
+pub fn load_fake_script_str(text: &str, vars: &[(&str, &str)]) -> Result<FakeProvider, String> {
+    let mut rendered = text.to_string();
+    for (key, value) in vars {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        rendered = rendered.replace(key, &escaped);
+    }
+    let file: ScriptFile =
+        serde_json::from_str(&rendered).map_err(|e| format!("解析脚本失败：{e}"))?;
+
+    let chat: Vec<Result<ChatOutcome, ProviderError>> =
+        file.chat.into_iter().map(ScriptChatStep::into_result).collect();
+    let search: Vec<Result<SearchOutcome, ProviderError>> = file
+        .search
+        .into_iter()
+        .map(ScriptSearchStep::into_result)
+        .collect();
+
+    let mut provider = FakeProvider::search_ok(SearchOutcome {
+        sources: Vec::new(),
+        text: String::new(),
+        had_server_tool_use: false,
+    });
+    provider.chat_script = std::sync::Mutex::new(chat.into());
+    provider.search_script = std::sync::Mutex::new(search.into());
+    provider.delay = Duration::from_millis(file.delay_ms);
+    provider.repeat_last_chat = file.repeat_last_chat;
+    Ok(provider)
+}
+
+#[cfg(feature = "agent-test-provider")]
+impl FakeProvider {
+    /// `agent-test-provider` 构建下的工厂默认假实现（内置离线脚本）。
+    pub fn from_default_script() -> Self {
+        load_fake_script_str(DEFAULT_TEST_SCRIPT, &[]).expect("内置测试脚本应可解析")
+    }
+}
+
+/// 统一 provider 工厂（编译期 feature 门禁）。
+///
+/// - `agent-test-provider` **开启**：返回离线 [`FakeProvider`]（**只替换网络**，不绕过沙箱 /
+///   路径 / 预算 / 密钥规则）。
+/// - 默认 / **release（feature 关闭）**：返回 [`DeepSeekProvider`]（真实端点，fail-closed）。
+///
+/// **不是运行时环境变量开关**：分支由 `#[cfg(feature = ...)]` 在编译期决定，release 二进制
+/// 不包含假实现（见 `agent-test-provider` feature 定义与 `TEST_PROVIDER_ENABLED`）。
+#[cfg(feature = "agent-test-provider")]
+pub fn make_provider(
+    _secret: Arc<dyn SecretStore>,
+    _model: String,
+) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(Arc::new(FakeProvider::from_default_script()))
+}
+
+#[cfg(not(feature = "agent-test-provider"))]
+pub fn make_provider(
+    secret: Arc<dyn SecretStore>,
+    model: String,
+) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(Arc::new(DeepSeekProvider::new(secret, model)?))
 }
 
 #[cfg(test)]
@@ -659,6 +953,9 @@ mod tests {
         let provider = FakeProvider {
             search: std::sync::Mutex::new(Err(ProviderError::new(CLASS_NO_RESULT_BLOCK, "x"))),
             chat: std::sync::Mutex::new(Err(ProviderError::new(CLASS_NO_RESULT_BLOCK, "x"))),
+            chat_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            search_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            repeat_last_chat: false,
             delay: Duration::from_secs(5),
         };
         let cancel = CancelToken::new();
@@ -822,5 +1119,35 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.class(), CLASS_ABORTED);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn factory_is_compile_time_feature_gated() {
+        // 编译期事实与 feature 一致（经局部变量避免常量断言 lint）
+        let enabled = TEST_PROVIDER_ENABLED;
+        assert_eq!(enabled, cfg!(feature = "agent-test-provider"));
+
+        #[cfg(feature = "agent-test-provider")]
+        {
+            // feature 开：工厂返回离线假实现（无真实网络也可返回脚本来源）
+            let store: Arc<dyn SecretStore> =
+                Arc::new(crate::agent::secret::FakeSecretStore::new(Some("k")));
+            let p = make_provider(store, "m".to_string()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = rt
+                .block_on(p.search("q", 1, CancelToken::new(), Duration::from_secs(1)))
+                .unwrap();
+            assert!(!out.sources.is_empty(), "feature 开 → 工厂返回离线假实现");
+        }
+
+        #[cfg(not(feature = "agent-test-provider"))]
+        {
+            // 默认构建证明：`make_provider` 走 `#[cfg(not(feature))]` 定义（真实 DeepSeekProvider），
+            // 假实现分支未被编译进该定义。
+            assert!(!enabled, "默认构建不得返回假实现");
+        }
     }
 }

@@ -130,7 +130,11 @@ export function SortableList({
     return (
       <ul className={className}>
         {ids.map((id) => (
-          <li key={id} className={rowClassName(id)}>
+          <li
+            key={id}
+            className={rowClassName(id)}
+            onContextMenu={(event) => onItemContextMenu?.(id, event)}
+          >
             {renderItem(id)}
           </li>
         ))}

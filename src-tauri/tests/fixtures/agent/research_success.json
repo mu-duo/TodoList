@@ -1,0 +1,36 @@
+{
+  "chat": [
+    {
+      "tool_calls": [
+        { "id": "c1", "name": "fs_list", "input": { "path": "$ROOT" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "id": "c2", "name": "fs_read", "input": { "path": "$TXT" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "id": "c3", "name": "fs_read", "input": { "path": "$BIN" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "id": "c4", "name": "native_search", "input": { "query": "offline research" } }
+      ]
+    },
+    { "text": "研究完成：已读取授权文件并获取离线来源（未触网）。" }
+  ],
+  "search": [
+    {
+      "sources": [
+        {
+          "url": "https://research.test/x",
+          "title": "离线研究来源 X",
+          "snippet": "offline research snippet"
+        }
+      ]
+    }
+  ]
+}

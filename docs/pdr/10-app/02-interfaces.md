@@ -113,9 +113,9 @@ app_bar:
 - **写入时机**：排序放下即原子写；写失败**回滚到最后一次成功顺序**并向用户报错。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
-## 6. Agent 协助（Phase 1 接口冻结，**实现中待核，未实测**）
+## 6. Agent 协助（**已实现（Phase1+Phase2），待验证**）
 
-> **状态（2026-10-12）：Phase 1 契约冻结，实现中待核**——命令与字段已按 architecture.md（含父会话修正）冻结，**尚在实现、未经核验**；**不得据此声称已实现或可用**。运行时（run）记录与结果 schema 属 **Phase 2，待实现**。**真实联网未验证**（见 §6.6）。
+> **状态（2026-10-12）：已实现**（Phase 1 + Phase 2；后端 **117 个 Rust 测试**、前端纯逻辑断言、`pnpm build` 通过）——契约按 architecture.md（含父会话修正）落地；**已通过隔离集成复验（假 provider、零真实网络）并经用户验收通过；真实 DeepSeek 联网仍未实测**（见 §6.6）。
 
 ### 6.1 任务 YAML `agent` 形状（冻结）
 
@@ -160,10 +160,24 @@ agent:
 - `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
 - 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
 
-### 6.5 运行记录与结果（**Phase 2，待实现，schema 待定**）
+### 6.5 运行记录、结果与运行命令 / 事件（**已实现**）
 
-- 本机记录计划为 `%APPDATA%\com.lftan.todolist\agent\runs\{run_id}.json`（一次运行一文件＝事实源，temp+rename 原子写；列表＝扫描目录；损坏→跳过+告警）；**schema 待 Phase 2 落地**。
-- 结果计划输出到 `{result_root}\{task_id}\{时间}_{run_id}\`（`report.md` + `sources.json`）；**字段待定**。
+**运行命令（Phase 2，已实现；冻结名）**：
+
+- `agent_start_task({ listFile, taskId, force }) -> { runId }`（手动立即 / 重跑，`force` 绕夜窗；**去重**：已在运行或排队则拒绝）
+- `agent_stop_task({ listFile, taskId }) -> void`（停止；**本夜不再自动重排**，见 §6.6）
+- `agent_get_status() -> { active: RunSummary | null, queue: RunRef[] }`
+- `agent_list_runs({ listFile, taskId, offset, limit }) -> RunSummary[]`
+- `agent_open_result_dir({ runId }) -> void`（路径**由记录推导**，JS 不能传任意路径）
+- 事件 `agent://state`：`{ runId, listFile, taskId, state, attempt, errorClass?, stopReason?, startedAt, endedAt? }`（**载荷不含密钥**）
+
+**运行记录与结果**：
+
+- 本机记录：`%APPDATA%\com.lftan.todolist\agent\runs\{run_id}.json`（一次运行一文件＝事实源；temp+rename 原子写；列表＝扫描目录；损坏→跳过+告警）。
+- 结果：`{result_root}\{task_id}\{时间戳}_{run_id}\` → `report.md` + `sources.json`（**原子写 + 写入前后目录复核**）。
+- `RunSummary` 字段（snake_case）：`run_id, task_id, list_file, state, attempt, error_class?, stop_reason?, started_at, ended_at?, result_dir, partial, model, stats{ chat_calls, search_calls, server_search_requests?, bytes_read, steps }`。
+  - `stop_reason ∈ { manual | disabled | completed | deleted }`：用于**区分**手动停止与停用 / 完成 / 删除导致的停止。
+  - `stats.steps`：本 run 主循环**实际步数**；步数护栏见 §6.6。
 - 运行状态 / 重试 / 历史索引**仅存本机**，**不写入任务 YAML**。
 
 ### 6.6 联网与运行约束（规范；**未实测**）
@@ -172,6 +186,8 @@ agent:
 - 主循环仅用**客户端只读 fs 工具**；联网仅走**独立辅助 native search 请求**（`tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]`），**不与客户端文件工具混在同一请求**；`max_uses` 是**单请求内**上限、**非运行总帽**。
 - 2xx 但**无 `web_search_tool_result` 块＝失败**，**不得判为联网成功**；检索结果 / 引用为**不可信外部内容**，仅作数据、绝不执行。
 - 运行**无全局模型 / 搜索调用次数帽**；保留 **30 分钟 deadline / 取消 / 读取限制**（ADR-0007：单次文本 ≤256KiB、运行累计 ≤5MiB、分页不可绕）。
+- **步数护栏**：每 run 主循环步数上限 **40**（`MAX_STEPS`）——**防失控护栏，不是调用次数帽、不计入预算 / 次数统计口径**；达上限 → `failed(StepLimit)` **不重试**；实际步数记入运行记录 `stats.steps`。
+- **交付 / 判据警告**：**不得**用 `--features agent-test-provider`（或 `--all-features`）构建的产物**交付**，**也不得**据此判断联网可用——该构建返回**离线假来源**（`example.test`），**仅供测试**。
 - **联网未经真实调用验证**（仅 DeepSeek 原生 Anthropic 兼容端点有官方一方源码，字段存在未决项），**不声称可用或已验收**。
 
 ## Log
@@ -181,3 +197,6 @@ agent:
 - 2026-10-12 **落地 §5**：`load_settings` 增 `app_bar_order: string[] | null`（取自 `app_bar.order`）；新增 `save_app_bar_order({ order })`——Value 级补丁**仅改 `app_bar.order`**，`null` / 空数组删除该字段恢复默认，保留 `theme` 与全部未知字段，空白 id / `app_bar` 非对象报中文错误。契约与 01-spec §8 一致，**未改数据目录 schema**。
 - 2026-10-12 新增 §6「Agent 协助：任务意图与本机运行记录」（**概念契约，待架构冻结**）：任务 YAML 记启用状态 / 关联路径（字段名待定），本机运行记录不进数据目录；成果输出主目录 / 任务 ULID / 时间（+ 运行 ID）、`report.md` 来源摘要、独立稳定 id 历史。**未改 schema、未新增命令**。
 - 2026-10-12 **冻结 §6 Phase 1 接口（实现中待核）**：任务 YAML `agent.enabled/paths`；本机配置 `agent{model/result_root/execution_enabled/max_uses}`（execution 默认 false、false→true 需显式 `consentCloud`）；DPAPI 凭据独立本机、密钥不回 JS；命令 `agent_load_config` / `agent_save_config` / `agent_set_key`·`clear`·`present` / `agent_validate_result_root` / `agent_probe`(仅 `confirmPaid=true` 且本阶段无真实调用) / `agent_set_task_intent` / `TaskView.agent` / dialog 桥 `agent_pick_result_root`·`agent_pick_paths`；运行 / 结果 schema 属 **P2 待实现**。**未实现、未实测**。
+- 2026-10-12 **Phase 3 文档同步（已实现待验证）**：§6 由「Phase 1 冻结 / P2 待实现」更新为**后端与前端已实现（Phase1+Phase2）待真机集成验证 / 未实测**；补 Phase 2 运行命令与 `agent://state` 事件（含 `stopReason`、无密钥）、`RunSummary`（含 `stop_reason`、`stats.steps`）、结果布局与本机记录路径；记**步数护栏 40（非次数帽）**。**未验收、未联网实测**。
+- 2026-10-12 **Phase 3 收尾修正**：状态改「**已通过隔离集成复验（假 provider、零真实网络）；真实 DeepSeek 联网仍未实测；未经用户验收**」；`RunSummary` **移除后端不存在的可选 `message` 字段**；新增 **`agent-test-provider` 交付 / 判据警告**；测试数更正为 117。
+- 2026-10-12 **用户验收通过**：§6 状态改「**已实现、隔离集成复验通过、用户验收通过；真实联网未实测**」；随 **1.4.0** 发布（构建与提交由父会话执行）。

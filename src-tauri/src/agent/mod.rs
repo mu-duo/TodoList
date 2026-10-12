@@ -8,11 +8,15 @@
 //! 可在临时目录注入；Phase 1 **不做任何真实付费调用**，probe 仅在用户显式确认时才会
 //! 走网络。Phase 2 的 runner / 调度 / 结果不在此实现。
 
+pub mod clock;
 pub mod commands;
 pub mod config;
 pub mod intent;
 pub mod provider;
+pub mod record;
+pub mod runner;
 pub mod sandbox;
+pub mod schedule;
 pub mod secret;
 
 pub use intent::TaskAgent;

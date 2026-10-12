@@ -1,0 +1,17 @@
+{
+  "repeat_last_chat": true,
+  "chat": [
+    {
+      "tool_calls": [
+        { "id": "loop", "name": "native_search", "input": { "query": "loop until step limit" } }
+      ]
+    }
+  ],
+  "search": [
+    {
+      "sources": [
+        { "url": "https://loop.test/1", "title": "循环来源" }
+      ]
+    }
+  ]
+}
