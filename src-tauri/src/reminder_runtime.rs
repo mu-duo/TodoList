@@ -15,7 +15,7 @@ use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::reminder::{
-    self, ReminderDiagnostic, ReminderEvent, ReminderEventType, ReminderLedger, ReminderPlan,
+    self, ReadyReminder, ReminderDiagnostic, ReminderEventType, ReminderLedger, ReminderPlan,
     ReminderTask, SystemLocalTimeResolver,
 };
 use crate::storage::{self, LoadResult};
@@ -171,7 +171,7 @@ pub fn reminder_tasks(loaded: &LoadResult) -> Vec<ReminderTask> {
                 title: task.title.clone(),
                 status: task.status.clone(),
                 due: task.due.clone(),
-                reminder_offset_days: task.reminder_offset_days,
+                reminder_enabled: task.reminder != Some(false),
             })
         })
         .collect()
@@ -219,8 +219,11 @@ impl LedgerStore for FileLedgerStore {
 
 trait Notifier {
     fn permission_granted(&self) -> Result<bool, String>;
-    fn show(&self, event: &ReminderEvent) -> Result<(), String>;
+    fn show(&self, ready: &ReadyReminder) -> Result<(), String>;
 }
+
+/// 「不再提醒」动作的 action type id，须与 `lib.rs` 注册值一致。
+pub const REMINDER_ACTION_TYPE_ID: &str = "due-reminder";
 
 struct TauriNotifier(AppHandle);
 
@@ -233,15 +236,37 @@ impl Notifier for TauriNotifier {
             .map_err(|error| format!("查询系统通知权限失败：{error}"))
     }
 
-    fn show(&self, event: &ReminderEvent) -> Result<(), String> {
+    fn show(&self, ready: &ReadyReminder) -> Result<(), String> {
+        let body = ready
+            .body
+            .clone()
+            .unwrap_or_else(|| notification_body(ready.event.key.event_type).to_string());
         self.0
             .notification()
             .builder()
-            .title(&event.task_title)
-            .body(notification_body(event.key.event_type))
+            .title(&ready.event.task_title)
+            .body(body)
+            .action_type_id(REMINDER_ACTION_TYPE_ID)
+            .extra("taskId", ready.event.key.task_id.clone())
+            .extra("listFile", ready.event.list_file.clone())
             .show()
             .map_err(|error| format!("显示系统通知失败：{error}"))
     }
+}
+
+/// 「不再提醒」动作回写：走与 `update_task_metadata` 命令相同的存储路径
+/// （任务文件位于数据目录），写入 `reminder: false`。
+pub fn disable_task_reminder(list_file: &str, task_id: &str) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    disable_task_reminder_in(&base, list_file, task_id)
+}
+
+pub fn disable_task_reminder_in(base: &Path, list_file: &str, task_id: &str) -> Result<(), String> {
+    let patch = storage::TaskMetadataPatch {
+        reminder: storage::FieldPatch::Value(false),
+        ..storage::TaskMetadataPatch::default()
+    };
+    storage::update_task_metadata_in(base, list_file, task_id, patch)
 }
 
 /// Claim and deliver one event per task. The store is updated before `show`,
@@ -270,7 +295,7 @@ fn deliver_ready<L: LedgerStore, N: Notifier>(
             break;
         }
         *ledger = claimed;
-        if let Err(error) = notifier.show(&ready.event) {
+        if let Err(error) = notifier.show(ready) {
             warnings.push(error);
         }
     }
@@ -279,8 +304,12 @@ fn deliver_ready<L: LedgerStore, N: Notifier>(
 
 fn notification_body(event_type: ReminderEventType) -> &'static str {
     match event_type {
-        ReminderEventType::Advance => "任务将于明天到期",
-        ReminderEventType::Due => "任务已到截止时间",
+        ReminderEventType::Advance7 => "还有 7 天到期",
+        ReminderEventType::Advance1 => "还有 1 天到期",
+        ReminderEventType::Advance1h => "还有 1 小时到期",
+        ReminderEventType::Due => "已到截止时间",
+        // 旧账本键仅用于读取兼容；不再生成，也不会被发送。
+        ReminderEventType::Advance => "还有 1 天到期",
     }
 }
 
@@ -301,7 +330,7 @@ async fn run_worker(
     let mut background_warnings = initial_warnings;
 
     if snapshot_complete {
-        background_warnings.extend(observe_snapshot(&tasks, true, &mut ledger, &store));
+        background_warnings.extend(observe_snapshot(&tasks, &mut ledger, &store));
     } else if !background_warnings
         .iter()
         .any(|warning| warning == PAUSED_WARNING)
@@ -368,7 +397,7 @@ fn accept_snapshot<L: LedgerStore>(
         return vec![PAUSED_WARNING.to_string()];
     }
 
-    let warnings = observe_snapshot(incoming, true, ledger, store);
+    let warnings = observe_snapshot(incoming, ledger, store);
     *active_tasks = incoming.to_vec();
     *snapshot_complete = true;
     warnings
@@ -401,12 +430,11 @@ fn reconcile_and_deliver<L: LedgerStore, N: Notifier>(
     (plan, warnings)
 }
 
-/// Persist newly observed statuses and reopen suppression in one ledger write.
-/// Partial snapshots may safely describe present tasks, but cannot prove that
-/// absent IDs were deleted and therefore never update/prune status checkpoints.
+/// 观察一次完整快照：更新 `observed` 标记并静默记账首帧已过的提前档。
+///
+/// 只在完整快照时调用；部分快照不得触碰 `observed`（保持既有 fail-closed 暂停）。
 fn observe_snapshot<L: LedgerStore>(
     tasks: &[ReminderTask],
-    complete_snapshot: bool,
     ledger: &mut Result<ReminderLedger, String>,
     store: &L,
 ) -> Vec<String> {
@@ -415,54 +443,12 @@ fn observe_snapshot<L: LedgerStore>(
         Err(error) => return vec![error.clone()],
     };
 
-    let mut counts = std::collections::HashMap::<&str, usize>::new();
-    for task in tasks {
-        *counts.entry(&task.task_id).or_default() += 1;
-    }
-
     let mut updated = current.clone();
-    let mut warnings = Vec::new();
-    let mut changed = false;
+    let outcome =
+        reminder::observe_snapshot(tasks, &mut updated, Utc::now(), &SystemLocalTimeResolver);
+    let mut warnings = diagnostic_lines(&outcome.diagnostics);
 
-    for task in tasks {
-        if counts.get(task.task_id.as_str()) != Some(&1) {
-            // A duplicate ID is ambiguous; retain its last known checkpoint.
-            continue;
-        }
-
-        if task.status == "open" && updated.last_status.get(&task.task_id) == Some(&false) {
-            let plan = reminder::reconcile(
-                std::slice::from_ref(task),
-                &updated,
-                Utc::now(),
-                &SystemLocalTimeResolver,
-            );
-            warnings.extend(diagnostic_warnings(&plan));
-            if !plan.claimed_ledger_keys.is_empty() {
-                updated.claim(plan.claimed_ledger_keys);
-                changed = true;
-            }
-        }
-
-        if complete_snapshot {
-            let was_open = task.status == "open";
-            if updated.last_status.get(&task.task_id) != Some(&was_open) {
-                updated.last_status.insert(task.task_id.clone(), was_open);
-                changed = true;
-            }
-        }
-    }
-
-    if complete_snapshot {
-        let present: std::collections::HashSet<&str> = counts.keys().copied().collect();
-        let before = updated.last_status.len();
-        updated
-            .last_status
-            .retain(|task_id, _| present.contains(task_id.as_str()));
-        changed |= before != updated.last_status.len();
-    }
-
-    if changed {
+    if outcome.changed {
         if let Err(error) = store.save(&updated) {
             let failure = format!("写入提醒 ledger 失败，刷新已 fail closed：{error}");
             *ledger = Err(failure.clone());
@@ -475,14 +461,43 @@ fn observe_snapshot<L: LedgerStore>(
 }
 
 fn next_poll_delay(next_due: Option<chrono::DateTime<Utc>>) -> StdDuration {
-    let until_due = next_due
-        .and_then(|due| (due - Utc::now()).to_std().ok())
-        .unwrap_or(MAX_POLL_INTERVAL);
-    until_due.min(MAX_POLL_INTERVAL).max(MIN_POLL_INTERVAL)
+    let Some(due) = next_due else {
+        return MAX_POLL_INTERVAL;
+    };
+    match (due - Utc::now()).to_std() {
+        Ok(until_due) => until_due.min(MAX_POLL_INTERVAL).max(MIN_POLL_INTERVAL),
+        // 已过期（或负时长）→ 立即重查，而不是退避到 MAX，避免把迟到触发掩盖成按时。
+        Err(_) => MIN_POLL_INTERVAL,
+    }
+}
+
+#[cfg(test)]
+mod next_poll_delay_tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn past_due_rechecks_immediately_and_future_is_clamped() {
+        assert_eq!(next_poll_delay(None), MAX_POLL_INTERVAL);
+        // 已过期 → 立即重查（原实现会退避 60s）。
+        let past = Utc::now() - Duration::seconds(5);
+        assert_eq!(next_poll_delay(Some(past)), MIN_POLL_INTERVAL);
+        // 近期未来 → 取实际间隔（夹在 [MIN, MAX]）。
+        let soon = Utc::now() + Duration::seconds(2);
+        let delay = next_poll_delay(Some(soon));
+        assert!(delay >= MIN_POLL_INTERVAL && delay < MAX_POLL_INTERVAL);
+        // 远期未来 → 夹到 MAX。
+        let far = Utc::now() + Duration::days(1);
+        assert_eq!(next_poll_delay(Some(far)), MAX_POLL_INTERVAL);
+    }
 }
 
 fn diagnostic_warnings(plan: &ReminderPlan) -> Vec<String> {
-    plan.diagnostics
+    diagnostic_lines(&plan.diagnostics)
+}
+
+fn diagnostic_lines(diagnostics: &[ReminderDiagnostic]) -> Vec<String> {
+    diagnostics
         .iter()
         .map(|diagnostic| match diagnostic {
             ReminderDiagnostic::DuplicateTaskIds(ids) => {
@@ -490,9 +505,6 @@ fn diagnostic_warnings(plan: &ReminderPlan) -> Vec<String> {
             }
             ReminderDiagnostic::InvalidDue { task_id, due } => {
                 format!("任务 {task_id} 的截止时间无效，已跳过提醒：{due}")
-            }
-            ReminderDiagnostic::UnsupportedOffset { task_id, offset } => {
-                format!("任务 {task_id} 使用不支持的提醒提前天数：{offset}")
             }
             ReminderDiagnostic::AdvanceDateOutOfRange { task_id, due } => {
                 format!("任务 {task_id} 无法计算提前提醒日期：{due}")
@@ -537,7 +549,7 @@ pub fn startup_snapshot(data_dir: &Path) -> ReminderSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reminder::{ReadyReminder, ReminderEventKey};
+    use crate::reminder::{ReadyReminder, ReminderEvent, ReminderEventKey};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -587,8 +599,11 @@ mod tests {
             self.permission.clone()
         }
 
-        fn show(&self, event: &ReminderEvent) -> Result<(), String> {
-            self.calls.lock().unwrap().push(event.task_title.clone());
+        fn show(&self, ready: &ReadyReminder) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ready.event.task_title.clone());
             if let Some(timeline) = &self.timeline {
                 timeline.lock().unwrap().push("show");
             }
@@ -607,6 +622,7 @@ mod tests {
                 canonical_due: "2026-10-13".to_string(),
                 event_type,
             },
+            list_file: "list.yaml".to_string(),
             task_title: "Important task".to_string(),
             scheduled_local: chrono::NaiveDate::from_ymd_opt(2026, 10, 13)
                 .unwrap()
@@ -619,6 +635,7 @@ mod tests {
             ready_notifications: vec![ReadyReminder {
                 event,
                 claim_keys: claim_keys.clone(),
+                body: None,
             }],
             claimed_ledger_keys: claim_keys,
             ..ReminderPlan::default()
@@ -684,7 +701,7 @@ mod tests {
         };
         let mut ledger = ReminderLedger::default();
         let warnings = deliver_ready(
-            &ready_plan(ReminderEventType::Advance),
+            &ready_plan(ReminderEventType::Advance1),
             &mut ledger,
             &store,
             &notifier,
@@ -698,12 +715,20 @@ mod tests {
         );
         assert_eq!(ledger.attempted.len(), 1);
         assert_eq!(
-            notification_body(ReminderEventType::Advance),
-            "任务将于明天到期"
+            notification_body(ReminderEventType::Advance7),
+            "还有 7 天到期"
+        );
+        assert_eq!(
+            notification_body(ReminderEventType::Advance1),
+            "还有 1 天到期"
+        );
+        assert_eq!(
+            notification_body(ReminderEventType::Advance1h),
+            "还有 1 小时到期"
         );
         assert_eq!(
             notification_body(ReminderEventType::Due),
-            "任务已到截止时间"
+            "已到截止时间"
         );
     }
 
@@ -726,7 +751,7 @@ mod tests {
             title: "Persisted task".to_string(),
             status: "open".to_string(),
             due: Some("2000-01-01".to_string()),
-            reminder_offset_days: None,
+            reminder_enabled: true,
         };
         let now = Utc::now();
         let mut ledger = store.load().unwrap();
@@ -773,7 +798,7 @@ mod tests {
             title: "Advance task".to_string(),
             status: "open".to_string(),
             due: Some(due),
-            reminder_offset_days: Some(1),
+            reminder_enabled: true,
         };
         let now = Utc::now();
         let mut ledger = ReminderLedger::default();
@@ -783,14 +808,22 @@ mod tests {
             now,
             &SystemLocalTimeResolver,
         );
+        // due in 12h: advance7 and advance1 are past; advance1h and due are future.
         assert_eq!(plan.ready_notifications.len(), 1);
         assert_eq!(
             plan.ready_notifications[0].event.key.event_type,
-            ReminderEventType::Advance
+            ReminderEventType::Advance1
         );
-        assert_eq!(plan.ready_notifications[0].claim_keys.len(), 1);
-        assert_eq!(plan.future_events.len(), 1);
-        assert_eq!(plan.future_events[0].key.event_type, ReminderEventType::Due);
+        assert_eq!(plan.ready_notifications[0].claim_keys.len(), 2);
+        assert_eq!(plan.future_events.len(), 2);
+        assert!(plan
+            .future_events
+            .iter()
+            .any(|event| event.key.event_type == ReminderEventType::Advance1h));
+        assert!(plan
+            .future_events
+            .iter()
+            .any(|event| event.key.event_type == ReminderEventType::Due));
 
         let dir = tempfile::tempdir().unwrap();
         let store = FileLedgerStore::new(dir.path().join(LEDGER_FILE));
@@ -820,34 +853,27 @@ mod tests {
     }
 
     #[test]
-    fn reopening_suppresses_past_keys_but_keeps_future_events() {
+    fn reopening_seeds_past_advance_silently_but_keeps_future_due() {
         let due = (chrono::Local::now().naive_local() + chrono::Duration::hours(12))
             .format("%Y-%m-%dT%H:%M")
             .to_string();
-        let done = ReminderTask {
+        let reopened = ReminderTask {
             list_file: "list.yaml".to_string(),
             task_id: "reopen".to_string(),
             title: "Reopened task".to_string(),
-            status: "done".to_string(),
-            due: Some(due),
-            reminder_offset_days: Some(1),
+            status: "open".to_string(),
+            due: Some(due.clone()),
+            reminder_enabled: true,
         };
-        let mut reopened = done.clone();
-        reopened.status = "open".to_string();
-        let mut prior = ReminderLedger::default();
-        prior.last_status.insert("reopen".to_string(), false);
-        let mut ledger = Ok(prior);
+        // No prior observed marker (e.g. previously done) → first frame.
+        let mut ledger = Ok(ReminderLedger::default());
         let store = FakeStore::default();
         assert!(
-            observe_snapshot(std::slice::from_ref(&reopened), true, &mut ledger, &store,)
-                .is_empty()
+            observe_snapshot(std::slice::from_ref(&reopened), &mut ledger, &store).is_empty()
         );
         let ledger = ledger.unwrap();
-        assert_eq!(ledger.attempted.len(), 1);
-        assert_eq!(
-            ledger.attempted.iter().next().unwrap().event_type,
-            ReminderEventType::Advance
-        );
+        assert_eq!(ledger.attempted.len(), 2);
+        assert_eq!(ledger.observed.get("reopen"), Some(&due));
         let plan = reminder::reconcile(
             std::slice::from_ref(&reopened),
             &ledger,
@@ -855,10 +881,11 @@ mod tests {
             &SystemLocalTimeResolver,
         );
         assert!(plan.ready_notifications.is_empty());
-        assert_eq!(plan.future_events.len(), 1);
-        assert_eq!(plan.future_events[0].key.event_type, ReminderEventType::Due);
-        assert_eq!(ledger.last_status.get("reopen"), Some(&true));
-        assert!(done.status != reopened.status);
+        assert_eq!(plan.future_events.len(), 2);
+        assert!(plan
+            .future_events
+            .iter()
+            .any(|event| event.key.event_type == ReminderEventType::Due));
     }
 
     fn past_due_task(id: &str, status: &str) -> ReminderTask {
@@ -868,12 +895,156 @@ mod tests {
             title: format!("Task {id}"),
             status: status.to_string(),
             due: Some("2000-01-01".to_string()),
-            reminder_offset_days: None,
+            reminder_enabled: true,
         }
     }
 
     #[test]
+    fn restart_seeds_without_observed_but_observed_keeps_normal_catch_up() {
+        // Old ledger / first run (no observed marker): first frame seeds silently,
+        // advancing the three past tiers and leaving the due for catch-up.
+        let fresh = past_due_task("fresh", "open");
+        let mut ledger = Ok(ReminderLedger::default());
+        let store = FakeStore::default();
+        assert!(observe_snapshot(std::slice::from_ref(&fresh), &mut ledger, &store).is_empty());
+        let seeded = ledger.unwrap();
+        assert_eq!(seeded.attempted.len(), 3);
+        assert_eq!(seeded.observed.get("fresh"), Some(&"2000-01-01".to_string()));
+        assert_eq!(store.writes.lock().unwrap().len(), 1);
+        let plan = reminder::reconcile(&[fresh], &seeded, Utc::now(), &SystemLocalTimeResolver);
+        assert_eq!(plan.ready_notifications.len(), 1);
+        assert_eq!(plan.ready_notifications[0].event.key.event_type, ReminderEventType::Due);
+
+        // A persisted observed marker does not re-seed: no silent claims, but the
+        // normal catch-up still fires once.
+        let mut existing = ReminderLedger::default();
+        existing
+            .observed
+            .insert("fresh2".to_string(), "2000-01-01".to_string());
+        let task2 = past_due_task("fresh2", "open");
+        let mut ledger2 = Ok(existing.clone());
+        assert!(
+            observe_snapshot(std::slice::from_ref(&task2), &mut ledger2, &FakeStore::default())
+                .is_empty()
+        );
+        assert!(ledger2.unwrap().attempted.is_empty());
+        let normal =
+            reminder::reconcile(&[task2], &existing, Utc::now(), &SystemLocalTimeResolver);
+        assert_eq!(normal.ready_notifications.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_open_snapshot_is_isolated_and_does_not_seed() {
+        let task = past_due_task("dup", "open");
+        let mut ledger = Ok(ReminderLedger::default());
+        let store = FakeStore::default();
+        assert!(observe_snapshot(
+            &[task.clone(), past_due_task("dup", "done")],
+            &mut ledger,
+            &store,
+        )
+        .is_empty());
+        assert!(ledger.as_ref().unwrap().observed.is_empty());
+        assert!(ledger.as_ref().unwrap().attempted.is_empty());
+        assert!(store.writes.lock().unwrap().is_empty());
+
+        // A unique snapshot then seeds and leaves the due catch-up.
+        assert!(
+            observe_snapshot(std::slice::from_ref(&task), &mut ledger, &store).is_empty()
+        );
+        assert_eq!(ledger.as_ref().unwrap().attempted.len(), 3);
+        let plan = reminder::reconcile(
+            &[task],
+            ledger.as_ref().unwrap(),
+            Utc::now(),
+            &SystemLocalTimeResolver,
+        );
+        assert_eq!(plan.ready_notifications.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_is_isolated_and_done_then_open_reseeds() {
+        let mut ledger = Ok(ReminderLedger::default());
+        let store = FakeStore::default();
+        let duplicate = [
+            past_due_task("d", "open"),
+            past_due_task("d", "done"),
+        ];
+        assert!(observe_snapshot(&duplicate, &mut ledger, &store).is_empty());
+        assert!(ledger.as_ref().unwrap().observed.is_empty());
+        assert!(ledger.as_ref().unwrap().last_status.is_empty());
+        assert!(ledger.as_ref().unwrap().attempted.is_empty());
+        assert!(store.writes.lock().unwrap().is_empty());
+
+        // A done task records a closed checkpoint and carries no observed marker.
+        assert!(
+            observe_snapshot(&[past_due_task("d", "done")], &mut ledger, &store).is_empty()
+        );
+        assert!(ledger.as_ref().unwrap().observed.is_empty());
+        assert_eq!(ledger.as_ref().unwrap().last_status.get("d"), Some(&false));
+
+        // Reopen claims ALL overdue keys silently (advance tiers + due) → no catch-up.
+        let reopened = past_due_task("d", "open");
+        assert!(
+            observe_snapshot(std::slice::from_ref(&reopened), &mut ledger, &store).is_empty()
+        );
+        let saved = ledger.unwrap();
+        assert_eq!(saved.last_status.get("d"), Some(&true));
+        assert_eq!(saved.attempted.len(), 4);
+        assert!(saved
+            .attempted
+            .iter()
+            .any(|key| key.event_type == ReminderEventType::Due));
+        let plan = reminder::reconcile(&[reopened], &saved, Utc::now(), &SystemLocalTimeResolver);
+        assert!(plan.ready_notifications.is_empty());
+    }
+
+    #[test]
+    fn reopening_suppresses_past_keys_but_keeps_future_events() {
+        let due = (chrono::Local::now().naive_local() + chrono::Duration::hours(12))
+            .format("%Y-%m-%dT%H:%M")
+            .to_string();
+        let reopened = ReminderTask {
+            list_file: "list.yaml".to_string(),
+            task_id: "reopen".to_string(),
+            title: "Reopened task".to_string(),
+            status: "open".to_string(),
+            due: Some(due),
+            reminder_enabled: true,
+        };
+        // Prior complete snapshot observed this task as non-open (done).
+        let mut prior = ReminderLedger::default();
+        prior.last_status.insert("reopen".to_string(), false);
+        let mut ledger = Ok(prior);
+        let store = FakeStore::default();
+        assert!(
+            observe_snapshot(std::slice::from_ref(&reopened), &mut ledger, &store).is_empty()
+        );
+        let ledger = ledger.unwrap();
+        // due in 12h: advance7 + advance1 are overdue and claimed on reopen.
+        assert_eq!(ledger.attempted.len(), 2);
+        assert!(ledger
+            .attempted
+            .iter()
+            .all(|key| key.event_type != ReminderEventType::Due));
+        assert_eq!(ledger.last_status.get("reopen"), Some(&true));
+        let plan = reminder::reconcile(
+            std::slice::from_ref(&reopened),
+            &ledger,
+            Utc::now(),
+            &SystemLocalTimeResolver,
+        );
+        assert!(plan.ready_notifications.is_empty());
+        assert_eq!(plan.future_events.len(), 2);
+        assert!(plan
+            .future_events
+            .iter()
+            .any(|event| event.key.event_type == ReminderEventType::Due));
+    }
+
+    #[test]
     fn restart_closed_checkpoint_suppresses_catch_up_but_open_checkpoint_keeps_it() {
+        // Old ledger JSON on disk still carries last_status; it is honored on load.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LEDGER_FILE);
         let old_checkpoint = ReminderLedger {
@@ -887,33 +1058,34 @@ mod tests {
         let checkpoint_store = FakeStore::default();
         assert!(observe_snapshot(
             std::slice::from_ref(&task),
-            true,
             &mut restarted,
             &checkpoint_store,
         )
         .is_empty());
         let persisted = restarted.unwrap();
         assert_eq!(persisted.last_status.get("reopen"), Some(&true));
-        assert_eq!(persisted.attempted.len(), 1);
+        // Reopen claims ALL overdue keys (advance tiers + due) silently.
+        assert_eq!(persisted.attempted.len(), 4);
         let writes = checkpoint_store.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].last_status.get("reopen"), Some(&true));
-        assert_eq!(writes[0].attempted.len(), 1);
-        assert_eq!(
-            writes[0].attempted.iter().next().unwrap().event_type,
-            ReminderEventType::Due
-        );
+        assert_eq!(writes[0].attempted.len(), 4);
+        assert!(writes[0]
+            .attempted
+            .iter()
+            .any(|key| key.event_type == ReminderEventType::Due));
         drop(writes);
         let plan = reminder::reconcile(&[task], &persisted, Utc::now(), &SystemLocalTimeResolver);
         assert!(plan.ready_notifications.is_empty());
         assert!(plan.future_events.is_empty());
 
+        // An open checkpoint (observed as open before) is NOT a reopen: normal
+        // due catch-up still fires.
         let ordinary_open = past_due_task("ordinary", "open");
         let mut open_ledger = ReminderLedger::default();
         open_ledger.last_status.insert("ordinary".to_string(), true);
         assert!(observe_snapshot(
             std::slice::from_ref(&ordinary_open),
-            true,
             &mut Ok(open_ledger.clone()),
             &FakeStore::default(),
         )
@@ -925,6 +1097,10 @@ mod tests {
             &SystemLocalTimeResolver,
         );
         assert_eq!(normal.ready_notifications.len(), 1);
+        assert_eq!(
+            normal.ready_notifications[0].event.key.event_type,
+            ReminderEventType::Due
+        );
     }
 
     #[test]
@@ -939,19 +1115,22 @@ mod tests {
         let store = FakeStore::default();
         assert!(observe_snapshot(
             &[task.clone(), past_due_task("dup", "done")],
-            true,
             &mut ledger,
             &store,
         )
         .is_empty());
+        // Duplicate is ambiguous: checkpoint preserved, nothing claimed, no write.
         assert_eq!(ledger.as_ref().unwrap().last_status.get("dup"), Some(&true));
         assert!(ledger.as_ref().unwrap().attempted.is_empty());
         assert!(store.writes.lock().unwrap().is_empty());
 
+        // A unique snapshot seeds the observed marker (no reopen suppression), and
+        // the normal due catch-up still fires.
         assert!(
-            observe_snapshot(std::slice::from_ref(&task), true, &mut ledger, &store).is_empty()
+            observe_snapshot(std::slice::from_ref(&task), &mut ledger, &store).is_empty()
         );
-        assert!(ledger.as_ref().unwrap().attempted.is_empty());
+        assert_eq!(ledger.as_ref().unwrap().attempted.len(), 3);
+        assert!(ledger.as_ref().unwrap().observed.contains_key("dup"));
         let plan = reminder::reconcile(
             &[task],
             ledger.as_ref().unwrap(),
@@ -959,6 +1138,30 @@ mod tests {
             &SystemLocalTimeResolver,
         );
         assert_eq!(plan.ready_notifications.len(), 1);
+    }
+
+    #[test]
+    fn reminder_disabled_task_yields_no_notifications() {
+        let mut disabled = past_due_task("off", "open");
+        disabled.reminder_enabled = false;
+        let mut ledger = Ok(ReminderLedger::default());
+        let store = FakeStore::default();
+        assert!(
+            observe_snapshot(std::slice::from_ref(&disabled), &mut ledger, &store).is_empty()
+        );
+        let saved = ledger.unwrap();
+        // Disabled task: no observed marker, no claims, but still tracks open status.
+        assert!(!saved.observed.contains_key("off"));
+        assert!(saved.attempted.is_empty());
+        assert_eq!(saved.last_status.get("off"), Some(&true));
+        let plan = reminder::reconcile(
+            std::slice::from_ref(&disabled),
+            &saved,
+            Utc::now(),
+            &SystemLocalTimeResolver,
+        );
+        assert!(plan.ready_notifications.is_empty());
+        assert!(plan.future_events.is_empty());
     }
 
     #[test]
@@ -974,7 +1177,8 @@ mod tests {
             past_due_task("dup-done", "open"),
             past_due_task("dup-done", "done"),
         ];
-        assert!(observe_snapshot(&duplicate, true, &mut ledger, &store).is_empty());
+        assert!(observe_snapshot(&duplicate, &mut ledger, &store).is_empty());
+        // Duplicate keeps the closed checkpoint and claims nothing.
         assert_eq!(
             ledger.as_ref().unwrap().last_status.get("dup-done"),
             Some(&false)
@@ -983,12 +1187,12 @@ mod tests {
 
         let reopened = past_due_task("dup-done", "open");
         assert!(
-            observe_snapshot(std::slice::from_ref(&reopened), true, &mut ledger, &store,)
-                .is_empty()
+            observe_snapshot(std::slice::from_ref(&reopened), &mut ledger, &store).is_empty()
         );
         let saved = ledger.unwrap();
         assert_eq!(saved.last_status.get("dup-done"), Some(&true));
-        assert_eq!(saved.attempted.len(), 1);
+        // Reopen claims all overdue keys silently → no catch-up notification.
+        assert_eq!(saved.attempted.len(), 4);
         let plan = reminder::reconcile(&[reopened], &saved, Utc::now(), &SystemLocalTimeResolver);
         assert!(plan.ready_notifications.is_empty());
     }
@@ -1006,8 +1210,8 @@ mod tests {
         ledger
             .as_mut()
             .unwrap()
-            .last_status
-            .insert("unread-list-task".to_string(), false);
+            .observed
+            .insert("unread-list-task".to_string(), "2000-01-01".to_string());
         let store = FakeStore::default();
         let notifier = FakeNotifier::default();
 
@@ -1023,8 +1227,8 @@ mod tests {
         assert!(!snapshot_complete);
         assert_eq!(active_tasks[0].task_id, "old");
         assert_eq!(
-            ledger.as_ref().unwrap().last_status.get("unread-list-task"),
-            Some(&false)
+            ledger.as_ref().unwrap().observed.get("unread-list-task"),
+            Some(&"2000-01-01".to_string())
         );
         assert!(store.writes.lock().unwrap().is_empty());
 
@@ -1068,7 +1272,7 @@ mod tests {
         assert!(!ledger
             .as_ref()
             .unwrap()
-            .last_status
+            .observed
             .contains_key("unread-list-task"));
     }
 
@@ -1190,11 +1394,43 @@ mod tests {
     }
 
     #[test]
-    fn old_ledger_without_status_checkpoints_remains_readable() {
-        let old: ReminderLedger = serde_json::from_str(r#"{"attempted":[]}"#).unwrap();
-        assert!(old.last_status.is_empty());
-        assert!(old.attempted.is_empty());
-        let encoded = serde_json::to_value(old).unwrap();
-        assert_eq!(encoded.get("last_status"), Some(&serde_json::json!({})));
+    fn old_ledger_without_observed_loads_and_legacy_advance_keys_are_tolerated() {
+        let old: ReminderLedger = serde_json::from_str(
+            r#"{"last_status":{"t":true},"attempted":[{"task_id":"t","canonical_due":"2026-10-13","event_type":"advance"}]}"#,
+        )
+        .unwrap();
+        assert!(old.observed.is_empty());
+        assert_eq!(old.attempted.len(), 1);
+        assert_eq!(
+            old.attempted.iter().next().unwrap().event_type,
+            ReminderEventType::Advance
+        );
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert_eq!(encoded.get("observed"), Some(&serde_json::json!({})));
+        assert_eq!(encoded["attempted"][0]["event_type"], "advance");
+    }
+
+    #[test]
+    fn disable_task_reminder_in_writes_false_and_rejects_unknown_without_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let lists = base.join(storage::LISTS_DIR);
+        std::fs::create_dir_all(&lists).unwrap();
+        std::fs::write(
+            lists.join("L.yaml"),
+            "tasks:\n  - id: T1\n    title: T\n    due: '2026-10-13'\n    reminder_offset_days: 1\n  - id: T2\n    title: T2\n",
+        )
+        .unwrap();
+
+        disable_task_reminder_in(base, "L.yaml", "T1").unwrap();
+        let text = std::fs::read_to_string(lists.join("L.yaml")).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&text).unwrap();
+        let task = &value.get("tasks").and_then(yaml_serde::Value::as_sequence).unwrap()[0];
+        assert_eq!(task.get("reminder").and_then(yaml_serde::Value::as_bool), Some(false));
+        assert!(task.get("reminder_offset_days").is_none());
+
+        // 无 due 的任务无法写入 reminder:false → 报错（调用方只记日志）。
+        assert!(disable_task_reminder_in(base, "L.yaml", "T2").is_err());
+        assert!(disable_task_reminder_in(base, "L.yaml", "NOPE").is_err());
     }
 }

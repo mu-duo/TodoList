@@ -6,9 +6,27 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use yaml_serde::{Mapping, Value};
+
+/// 进程级写锁：串行化所有「读取-修改-写回」任务 / 清单文件的操作。
+///
+/// 存在的理由：通知线程上的「不再提醒」回写（`disable_task_reminder` →
+/// `update_task_metadata_in`）可能与前端命令的写操作（元数据 / 状态 / 子任务 / 移动 /
+/// 排序 / 新建 / 删除等）并发；同一清单文件的读-改-写若交错会造成静默丢失更新
+/// （lost update）。本锁完全包含在每个存储操作内部：进入操作体即获取、返回前释放，
+/// 不与运行时的 `load_lists_lock` 嵌套或交叉持有（锁序平凡）。纯读取（`load_lists_from`
+/// 等）不做加锁，依赖 `atomic_write` 的临时文件 + rename 保证读到完整内容。
+static TASK_FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 获取进程级写锁；中毒时取回内部值（仍有 `()` 可用，等价于未中毒）。
+fn task_file_write_guard() -> MutexGuard<'static, ()> {
+    TASK_FILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub const LISTS_DIR: &str = "lists";
 pub const EXAMPLE_LIST_FILE: &str = "收集箱.yaml";
@@ -61,8 +79,9 @@ pub struct TaskView {
     pub completed: Option<String>,
     pub priority: Option<String>,
     pub due: Option<String>,
-    #[serde(rename = "reminderOffsetDays")]
-    pub reminder_offset_days: Option<i64>,
+    /// 是否关闭提醒；`Some(false)` = 不再提醒，`None` = 默认开启。
+    /// 契约：仅序列化为 `null | false`，绝不出现 `true`（`true` / 缺省均归一化为 `None`）。
+    pub reminder: Option<bool>,
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub subtasks: Option<Vec<SubtaskView>>,
@@ -106,7 +125,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPatch<T> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskMetadataPatch {
     #[serde(default)]
@@ -115,8 +134,9 @@ pub struct TaskMetadataPatch {
     pub due: FieldPatch<String>,
     #[serde(default)]
     pub tags: FieldPatch<Vec<String>>,
+    /// 省略 = 不变；`false` = 写 `reminder: false`；`null` = 删键；`true` = 非法。
     #[serde(default)]
-    pub reminder_offset_days: FieldPatch<i64>,
+    pub reminder: FieldPatch<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -523,6 +543,7 @@ pub fn set_task_status_in(
     task_id: &str,
     done: bool,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     if task_id.is_empty() {
         return Err("任务缺少 id，无法写回".to_string());
@@ -556,6 +577,7 @@ fn push_task(value: &mut Value, list_file: &str, task: Mapping) -> Result<(), St
 
 /// 向清单末尾追加新任务（自动 ULID `id` 与 `created`），Value 级补丁后原子写回。
 pub fn create_task_in(base: &Path, list_file: &str, title: &str) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let title = title.trim();
     if title.is_empty() {
         return Err("任务标题不能为空".to_string());
@@ -584,6 +606,7 @@ pub fn update_task_in(
     title: &str,
     notes: &str,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let title = title.trim();
     if title.is_empty() {
         return Err("任务标题不能为空".to_string());
@@ -614,6 +637,7 @@ pub fn update_task_metadata_in(
     task_id: &str,
     patch: TaskMetadataPatch,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
     let map = find_task_mut(&mut value, list_file, task_id)?;
@@ -636,19 +660,21 @@ pub fn update_task_metadata_in(
             Some(Some(value))
         }
     };
-    let offset = match patch.reminder_offset_days {
+    let reminder = match patch.reminder {
         FieldPatch::Missing => None,
         FieldPatch::Null => Some(None),
-        FieldPatch::Value(1) => Some(Some(1)),
-        FieldPatch::Value(_) => return Err("提醒提前天数当前仅支持 1".to_string()),
+        FieldPatch::Value(false) => Some(Some(false)),
+        FieldPatch::Value(true) => {
+            return Err("提醒默认开启，reminder 仅支持 false 或 null".to_string());
+        }
     };
 
     let resulting_due = match &due {
         Some(value) => value.as_deref(),
         None => map.get("due").and_then(Value::as_str),
     };
-    if offset == Some(Some(1)) && resulting_due.is_none() {
-        return Err("没有截止日期时不能启用提醒".to_string());
+    if reminder == Some(Some(false)) && resulting_due.is_none() {
+        return Err("没有截止日期时不能设置不再提醒".to_string());
     }
 
     if let Some(priority) = priority {
@@ -658,7 +684,7 @@ pub fn update_task_metadata_in(
         let cleared = due.is_none();
         set_optional_string(map, "due", due);
         if cleared {
-            map.remove("reminder_offset_days");
+            map.remove("reminder");
         }
     }
     match patch.tags {
@@ -676,16 +702,20 @@ pub fn update_task_metadata_in(
             );
         }
     }
-    if let Some(offset) = offset {
-        match offset {
-            Some(days) => {
-                map.insert(key("reminder_offset_days"), Value::Number(days.into()));
+    if let Some(reminder) = reminder {
+        match reminder {
+            Some(false) => {
+                map.insert(key("reminder"), Value::Bool(false));
             }
             None => {
-                map.remove("reminder_offset_days");
+                map.remove("reminder");
             }
+            // 上面的 match 已拒绝 `true`，此处不可达。
+            Some(true) => unreachable!(),
         }
     }
+    // 旧版 `reminder_offset_days` 不再写入：任意保存都清理遗留键。
+    map.remove("reminder_offset_days");
     write_list(&path, &value)
 }
 
@@ -721,6 +751,7 @@ fn validate_due(value: &str) -> Result<(), String> {
 
 /// 从清单的 `tasks` 数组中移除指定任务。
 pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
     let tasks = value
@@ -751,6 +782,7 @@ pub fn move_task_in(
     task_id: &str,
     to_list_file: &str,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     if list_file == to_list_file {
         return Err("源清单与目标清单相同，无法移动".to_string());
     }
@@ -819,6 +851,7 @@ pub fn add_subtask_in(
     task_id: &str,
     title: &str,
 ) -> Result<SubtaskView, String> {
+    let _guard = task_file_write_guard();
     let title = title.trim();
     if title.is_empty() {
         return Err("子任务标题不能为空".to_string());
@@ -862,6 +895,7 @@ pub fn remove_subtask_in(
     task_id: &str,
     subtask_id: &str,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
     let map = find_task_mut(&mut value, list_file, task_id)?;
@@ -889,6 +923,7 @@ pub fn set_subtask_status_in(
     subtask_id: &str,
     status: &str,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let status = match status {
         "open" | "done" => status,
         other => return Err(format!("非法的子任务状态：{other}")),
@@ -924,6 +959,7 @@ pub fn set_subtask_title_in(
     subtask_id: &str,
     title: &str,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let title = title.trim();
     if title.is_empty() {
         return Err("子任务标题不能为空".to_string());
@@ -958,6 +994,7 @@ pub fn reorder_task_in(
     task_id: &str,
     before_task_id: Option<&str>,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
     let tasks = value
@@ -999,6 +1036,7 @@ pub fn reorder_task_in(
 /// 文件名由清单名规整化（见 [`sanitize_file_stem`]）并对重名追加 `-2`/`-3`…；
 /// `order` 取目录内其余清单最大 order + 10。
 pub fn create_list_in(base: &Path, name: &str) -> Result<String, String> {
+    let _guard = task_file_write_guard();
     let name = name.trim();
     if name.is_empty() {
         return Err("清单名称不能为空".to_string());
@@ -1025,6 +1063,7 @@ pub fn create_list_in(base: &Path, name: &str) -> Result<String, String> {
 ///
 /// 目标文件名与现文件名相同则仅就地改写；不同则先写新文件再删除旧文件。
 pub fn rename_list_in(base: &Path, list_file: &str, new_name: &str) -> Result<String, String> {
+    let _guard = task_file_write_guard();
     let new_name = new_name.trim();
     if new_name.is_empty() {
         return Err("清单名称不能为空".to_string());
@@ -1059,6 +1098,7 @@ pub fn rename_list_in(base: &Path, list_file: &str, new_name: &str) -> Result<St
 
 /// 删除清单文件（不存在 → 错误）。
 pub fn delete_list_in(base: &Path, list_file: &str) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     if !path.is_file() {
         return Err(format!("清单文件不存在：{list_file}"));
@@ -1070,6 +1110,7 @@ pub fn delete_list_in(base: &Path, list_file: &str) -> Result<(), String> {
 ///
 /// 已在边界时为无操作。
 pub fn move_list_in(base: &Path, list_file: &str, direction: &str) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let step: isize = match direction {
         "up" => -1,
         "down" => 1,
@@ -1111,6 +1152,7 @@ pub fn reorder_list_in(
     list_file: &str,
     before_list_file: Option<&str>,
 ) -> Result<(), String> {
+    let _guard = task_file_write_guard();
     let lists_dir = base.join(LISTS_DIR);
     let mut ordered = read_ordered_lists(&lists_dir)?;
     let current = ordered
@@ -1306,7 +1348,9 @@ fn mapping_to_task(value: &Value) -> Option<TaskView> {
         completed: get_str(m, "completed"),
         priority: get_str(m, "priority"),
         due: get_str(m, "due"),
-        reminder_offset_days: m.get("reminder_offset_days").and_then(Value::as_i64),
+        // 仅字面 `false` = 关；`true` / 缺省 = 默认开（归一化为 None）。
+        reminder: matches!(m.get("reminder").and_then(Value::as_bool), Some(false))
+            .then_some(false),
         tags,
         notes: get_str(m, "notes"),
         subtasks,
@@ -1487,20 +1531,24 @@ mod tests {
             "L.yaml",
             "T1",
             metadata_patch(
-                r#"{"priority":"high","due":"2026-10-13","tags":["a","b"],"reminderOffsetDays":1}"#,
+                r#"{"priority":"high","due":"2026-10-13","tags":["a","b"],"reminder":false}"#,
             ),
         )
         .unwrap();
 
         let loaded = load_lists_from(base).unwrap();
         let task = &loaded.lists[0].tasks[0];
-        assert_eq!(task.reminder_offset_days, Some(1));
+        assert_eq!(task.reminder, Some(false));
         let frontend = serde_json::to_value(task).unwrap();
-        assert_eq!(frontend.get("reminderOffsetDays").and_then(serde_json::Value::as_i64), Some(1));
-        assert!(frontend.get("reminder_offset_days").is_none());
+        assert_eq!(
+            frontend.get("reminder").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(frontend.get("reminderOffsetDays").is_none());
         let disk_task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
-        assert_eq!(disk_task.get("reminder_offset_days").and_then(Value::as_i64), Some(1));
+        assert_eq!(disk_task.get("reminder").and_then(Value::as_bool), Some(false));
         assert!(disk_task.get("reminderOffsetDays").is_none());
+        assert!(disk_task.get("reminder_offset_days").is_none());
 
         update_task_metadata_in(
             base,
@@ -1517,12 +1565,12 @@ mod tests {
             base,
             "L.yaml",
             "T1",
-            metadata_patch(r#"{"priority":null,"due":null,"tags":[],"reminderOffsetDays":null}"#),
+            metadata_patch(r#"{"priority":null,"due":null,"tags":[],"reminder":null}"#),
         )
         .unwrap();
         let value = read_value(&path);
         let task = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
-        for field in ["priority", "due", "tags", "reminder_offset_days"] {
+        for field in ["priority", "due", "tags", "reminder"] {
             assert!(task.get(field).is_none());
         }
         assert_eq!(task.get("title").and_then(Value::as_str), Some("Keep title"));
@@ -1545,17 +1593,110 @@ mod tests {
         update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"due":null}"#)).unwrap();
         let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
         assert_eq!(task.get("priority").and_then(Value::as_str), Some("medium"));
+        assert!(task.get("reminder").is_none());
         assert!(task.get("reminder_offset_days").is_none());
 
         for patch in [
             r#"{"due":"2026-02-30"}"#,
             r#"{"priority":"urgent"}"#,
-            r#"{"reminderOffsetDays":2}"#,
+            r#"{"reminder":true}"#,
         ] {
             let before = fs::read(&path).unwrap();
             assert!(update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(patch)).is_err());
             assert_eq!(fs::read(&path).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn reminder_patch_writes_omitted_unchanged_and_null_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "tasks:\n  - id: T1\n    title: T\n    due: '2026-10-13'\n",
+        );
+
+        // 省略 → 不变（且不产生 reminder 键）
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"priority":"high"}"#))
+            .unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert!(task.get("reminder").is_none());
+
+        // false → 写键
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"reminder":false}"#))
+            .unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert_eq!(task.get("reminder").and_then(Value::as_bool), Some(false));
+
+        // null → 删键
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"reminder":null}"#))
+            .unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert!(task.get("reminder").is_none());
+    }
+
+    #[test]
+    fn reminder_false_without_due_is_rejected_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(base, "L.yaml", "tasks:\n  - id: T1\n    title: T\n");
+        let before = fs::read(&path).unwrap();
+
+        // 无 due 时设置 reminder:false → 报错且不写盘；同补丁清 due 也拒绝。
+        assert!(update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"reminder":false}"#))
+            .is_err());
+        assert!(update_task_metadata_in(
+            base,
+            "L.yaml",
+            "T1",
+            metadata_patch(r#"{"due":null,"reminder":false}"#)
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn clearing_due_removes_reminder_and_legacy_key_cleaned_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "tasks:\n  - id: T1\n    title: T\n    due: '2026-10-13'\n    reminder: false\n    reminder_offset_days: 1\n",
+        );
+
+        // 任意保存（即使只改无关字段）都清理遗留 reminder_offset_days。
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"priority":"low"}"#))
+            .unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert!(task.get("reminder_offset_days").is_none());
+        assert_eq!(task.get("reminder").and_then(Value::as_bool), Some(false));
+
+        // 清 due 同时清 reminder 键。
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"due":null}"#)).unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert!(task.get("due").is_none());
+        assert!(task.get("reminder").is_none());
+        assert!(task.get("reminder_offset_days").is_none());
+    }
+
+    #[test]
+    fn task_view_normalizes_reminder_true_and_absent_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "tasks:\n  - id: off\n    title: off\n    due: '2026-10-13'\n    reminder: false\n  - id: on\n    title: on\n    due: '2026-10-13'\n    reminder: true\n  - id: absent\n    title: absent\n",
+        );
+        let loaded = load_lists_from(base).unwrap();
+        let tasks = &loaded.lists[0].tasks;
+        assert_eq!(tasks[0].reminder, Some(false), "字面 false 应为关");
+        assert_eq!(tasks[1].reminder, None, "true 应归一化为默认开");
+        assert_eq!(tasks[2].reminder, None, "缺失应归一化为默认开");
+        let frontend = serde_json::to_value(&tasks[1]).unwrap();
+        assert_eq!(frontend.get("reminder"), Some(&serde_json::Value::Null));
     }
 
     #[test]

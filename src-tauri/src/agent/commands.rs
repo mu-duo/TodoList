@@ -784,7 +784,7 @@ mod p2_tests {
             completed: None,
             priority: None,
             due: None,
-            reminder_offset_days: None,
+            reminder: None,
             tags: None,
             notes: None,
             subtasks: None,

@@ -28,7 +28,7 @@ tasks:
     status: open
     priority: high
     due: 2026-10-10
-    reminder_offset_days: 1
+    reminder: false
     tags: [汇报, 周]
     created: 2026-10-08T09:30
     completed: 2026-10-08T11:00   # done 时存在
@@ -59,7 +59,7 @@ tasks:
 | `completed` | 本地时间 | done 时 | 完成时间 |
 | `priority` | `high` \| `medium` \| `low` |  | 优先级 |
 | `due` | `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM` |  | 截止（本地时间） |
-| `reminder_offset_days` | `1` |  | 可选；在 due 前一个本地日历日、同一当地时刻提醒；无 due 时不可启用 |
+| `reminder` | `false` |  | 可选；`false`＝该任务不再提醒；缺省（或 `true` / 非法值）按默认开启处理；无 due 时不可设为 `false`；旧 `reminder_offset_days` 不再写入，任务元数据保存时移除 |
 | `tags` | string[] |  | 标签 |
 | `notes` | string（多行） |  | 备注 |
 | `subtasks` | array（一层，**元素不可嵌套**） |  | 子任务；元素为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；数组顺序 = 显示顺序；增 / 删 / 勾选 / 改名经**按 id 的命令**原子写入（不做整数组覆盖）；可扩展 |
@@ -79,8 +79,8 @@ tasks:
 
 ### 任务详情元数据命令
 
-- `update_task_metadata({ listFile, taskId, patch }) -> void`：patch 使用 camelCase 可选字段 `priority?: "high" | "medium" | "low" | null`、`due?: string | null`、`tags?: string[]`、`reminderOffsetDays?: 1 | null`。字段缺省不修改，显式 `null` 清除；空 tags 清除。`due` 只接受本地 `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`，无时区转换。保存为最新 YAML 上的目标字段 Value 级补丁并原子写。
-- `TaskView` 前端属性为 `reminderOffsetDays: number | null`；磁盘字段名仍是 `reminder_offset_days`。清除 due 同时清除提醒 offset。
+- `update_task_metadata({ listFile, taskId, patch }) -> void`：patch 使用 camelCase 可选字段 `priority?: "high" | "medium" | "low" | null`、`due?: string | null`、`tags?: string[]`、`reminder?: false | null`。字段缺省不修改，显式 `null` 清除（`reminder: null` 删除开关键＝恢复默认提醒）；`reminder: false` 写入关闭（无 due 时报错不写）；空 tags 清除。`due` 只接受本地 `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`，无时区转换。保存为最新 YAML 上的目标字段 Value 级补丁并原子写。
+- `TaskView` 前端属性为 `reminder: false | null`；磁盘字段名 `reminder`（缺省开启 → `null`）。清除 due 同时清除提醒开关。旧 `reminder_offset_days` 视同开启、任务元数据保存时移除。
 
 ## 4. 版本与演进
 
@@ -195,7 +195,7 @@ agent:
 - `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。**不提供自动 / 保存流 / 测试流**，**不做任何真实付费调用**。
 - `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`
 - `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
-- `load_lists` 的 `TaskView` 另暴露 `reminderOffsetDays: number | null`（YAML 键 `reminder_offset_days`）。
+- `load_lists` 的 `TaskView` 另暴露 `reminder: false | null`（YAML 键 `reminder`；缺省开启 → `null`）。
 - 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
 
 ### 6.5 运行记录、结果与运行命令 / 事件（**已实现**）
@@ -228,14 +228,15 @@ agent:
 - **交付 / 判据警告**：**不得**用 `--features agent-test-provider`（或 `--all-features`）构建的产物**交付**，**也不得**据此判断联网可用——该构建返回**离线假来源**（`example.test`），**仅供测试**。
 - **联网未经真实调用验证**（仅 DeepSeek 原生 Anthropic 兼容端点有官方一方源码，字段存在未决项），**不声称可用或已验收**。
 
-## 7. 提醒运行时与发送尝试账本（已实现并本地验证）
+## 7. 提醒运行时与发送尝试账本（1.6.0 已实现并本地验证）
 
-- **计划**：due 为本地 `YYYY-MM-DD` 时刻取当地 09:00；`YYYY-MM-DDTHH:MM` 使用指定本地时刻。`reminder_offset_days: 1` 在前一**本地日历日**同一时刻生成 advance event。夏令时 gap 顺延到下一有效分钟；ambiguous 取 earliest。
-- **快照与调度**：应用启动及 `load_lists` 手动刷新同步快照；load_lists 的读盘、提交快照与 worker ack 在同一异步互斥区内串行；无文件 watcher。仅 `status == open` 参与。单 worker timer 最多每 60 秒校时；catch-up 每 task 最多一条（due 优先），只 claim 已过期事件，future event 保留排程。done / delete 取消；已观察到的 reopen 抑制逾期历史，只保留未来未试事件。
-- **事件去重**：ledger key = `task_id + canonical due + event type(advance|due)`，不含清单文件名；due 修改产生新 key，同 due 设回已尝试值仍去重。
-- **账本结构与 status checkpoint**：`%APPDATA%\com.lftan.todolist\reminder-ledger.json`（通过 `settings_dir()`），包含 `attempted` event keys 和 `last_status: { task_id: bool }`；缺少 `last_status` 的旧 JSON 兼容读取。status 仅在完整快照且 task ID 唯一时更新（`true=open`，`false=非 open`）；完整快照确认缺席时才移除对应 checkpoint。重复 ID 保留上次 checkpoint。跨重启观察到 done→open 时，把当前 due 的所有逾期未尝试 keys 与新状态一次原子持久化后再正常 reconcile；future keys 不 claim。损坏或读取失败 fail closed 并报告 warning。
+- **计划**：due 为本地 `YYYY-MM-DD` 时刻取当地 09:00；`YYYY-MM-DDTHH:MM` 使用指定本地时刻。四档事件：`advance7` / `advance1`（due 前 7 / 1 个**本地日历日**同一时刻）、`advance1h`（前 1 小时墙钟）与 `due`；`reminder: false` 的任务不参与（缺省开启）。夏令时 gap 顺延到下一有效分钟；ambiguous 取 earliest。
+- **快照与调度**：应用启动及 `load_lists` 手动刷新同步快照；load_lists 的读盘、提交快照与 worker ack 在同一异步互斥区内串行；无文件 watcher。仅 `status == open` 参与。单 worker timer 最多每 60 秒校时（已过事件立即复查）；catch-up 每 task 最多一条并 claim 本次全部已过档，文案：due 已过→「已到截止时间」，否则按真实剩余时长；future event 保留排程。done / delete 取消；已观察到 done→open 抑制全部已过档、只保留未来未试事件；首帧（新建 / 改 due / 升级 / 关闭后再开启）静默 claim 已过的提前档、首帧已过的到期档补一条。
+- **事件去重**：ledger key = `task_id + canonical due + event type(advance7|advance1|advance1h|due)`，不含清单文件名（旧 `advance` 兼容读取、不再生成）；due 修改产生新 key，同 due 设回已尝试值仍去重。
+- **账本结构与 checkpoint**：`%APPDATA%\com.lftan.todolist\reminder-ledger.json`（通过 `settings_dir()`），包含 `attempted` event keys、`observed: { task_id: canonical due }`（首帧标记）与 `last_status: { task_id: bool }`；缺少新字段的旧 JSON 兼容读取（旧 `last_status` 继续生效）。两 checkpoint 仅在完整快照且 task ID 唯一时更新；完整快照确认缺席时才移除；重复 ID 保留上次值。跨重启观察到 done→open 时，把该任务当前全部逾期未尝试 keys 与新状态一次原子持久化后再正常 reconcile；future keys 不 claim。损坏或读取失败 fail closed 并报告 warning。
 - **不完整快照**：目录遍历 / 文件读取失败、解析错误、根节点非 mapping、缺少或非 sequence 的 `tasks`、任务项被跳过，均使快照 incomplete。可展示成功读取的清单，但提醒整体暂停；不 reconcile / send，不更新或清理 checkpoint，也不把部分任务集当作 active schedule。完整 `load_lists` 刷新成功后恢复。硬读取错误先暂停并等待 worker ack，再返回 UI 错误；刷新读盘至 worker ack 串行。
-- **存储与发送顺序**：确认 plugin permission-state 为 Granted 后，对每 task 先将全部本次 overdue claim keys 原子持久化，再调用系统通知；写账本失败不 show，show 失败仍保留 attempt。此策略偏向 at-most-once，不承诺 exactly-once。
+- **存储与发送顺序**：确认 plugin permission-state 为 Granted 后，对每 task 先将全部本次 overdue claim keys 原子持久化，再调用系统通知；写账本失败不 show，show 失败仍保留 attempt。此策略偏向 at-most-once，不承诺 exactly-once。任务 / 清单文件的读改写操作持进程级写锁（通知线程写回与命令写并发时防丢失更新）。
+- **通知动作（Tier 1）**：通知注册 action type `due-reminder`（动作 `remind-off`＝「不再提醒」），`extra` 携带 `taskId` / `listFile`；点击动作写回 `reminder: false`（与元数据命令同路径）并发 Tauri 事件 `reminder-disabled { listFile, taskId }`，同时触发提醒运行时快照刷新；点通知本体＝显示并聚焦主窗口；失败静默记日志。Windows 限制：点击仅在通知停留屏幕时被接收（进通知中心 / 应用退出后点击无响应）。
 - **平台限制**：Windows toast best effort；permission API 不能探测 Windows 设置 / 专注助手屏蔽；`show` 返回成功不代表系统实际展示或用户已送达。当前无 UI 状态面板；账本只表示发送尝试，不是送达回执。
 - **离线状态限制**：无 watcher / 事件日志时，应用关闭期间完整发生的 open→done→open 不可识别；按产品确认，启动以最终 open 状态作普通 catch-up，不推断曾完成。
 
@@ -250,3 +251,4 @@ agent:
 - 2026-10-12 **Phase 3 收尾修正**：状态改「**已通过隔离集成复验（假 provider、零真实网络）；真实 DeepSeek 联网仍未实测；未经用户验收**」；`RunSummary` **移除后端不存在的可选 `message` 字段**；新增 **`agent-test-provider` 交付 / 判据警告**；测试数更正为 117。
 - 2026-10-12 **用户验收通过**：§6 状态改「**已实现、隔离集成复验通过、用户验收通过；真实联网未实测**」；随 **1.4.0** 发布（构建与提交由父会话执行）。
 - 2026-10-13 新增 §5.1「已完成」视图分组折叠偏好（FR-APP-18）：`load_settings` 增 `completed_collapsed: string[] | null`、新增 `save_completed_collapsed({ collapsed })`——Value 级补丁**仅改 `completed.collapsed`**，`null` / 空数组删除该字段恢复默认（全部展开），保留 `theme` / `app_bar` / 未知字段，空白文件名 / `completed` 非对象报中文错误不写盘；键 = 清单文件名、失效键由 UI 静默忽略。同批记 **`move_task(list_file, task_id, to_list_file)`**（FR-APP-04 任务跨清单转移）为**命令级移动**、**不新增字段 / 文件**；双文件写序为「先向目标追加、再自源移除 + 失败回滚」。**未改数据目录 schema**。
+- 2026-10-13 **提醒改造（1.6.0）**：字段 `reminder_offset_days: 1`（提前 1 天 opt-in）改为 `reminder: false`（默认四档 opt-out）；`update_task_metadata` patch 改 `reminder?: false | null`（`false` 写入、`null` 删键）；`TaskView.reminder: false | null`。四档事件 `advance7/advance1/advance1h/due`（旧 `advance` 兼容读取）；ledger 增 `observed`（首帧标记），`last_status` 语义保持（done→open 抑制全部已过档）；首帧静默 claim 已过提前档、首帧到期档补一条；合并 catch-up 文案按 due 是否已过。通知注册 `due-reminder`/`remind-off` 动作 + `reminder-disabled` 事件；点击仅在通知停留屏幕时被接收（Tier 1）。**未改数据目录 schema**。

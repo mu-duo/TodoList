@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use agent::clock::SystemClock;
 use agent::commands::AgentRuntime;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_notification::{Action, ActionPerformed, ActionType, NotificationExt};
 
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
 /// 单个文件失败不影响其余清单，失败信息通过 `warnings` 返回。
@@ -185,6 +186,56 @@ fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String
     storage::save_completed_collapsed_in(&base, collapsed.as_deref())
 }
 
+/// 处理提醒通知上的动作：`remind-off`（不再提醒）与 `tap`（前置窗口）。
+///
+/// 运行于插件的通知线程：只记日志、不向用户抛错；刷新提醒快照走
+/// `ReminderRuntime::load_lists`（与 `load_lists` 命令同一条路径），并放到
+/// async runtime 上执行，避免阻塞通知线程。
+fn handle_reminder_action(app: &tauri::AppHandle, performed: &ActionPerformed) {
+    match performed.action_id() {
+        "remind-off" => {
+            let Some(notification) = performed.notification() else {
+                eprintln!("「不再提醒」动作缺少通知上下文，已忽略");
+                return;
+            };
+            let extra = notification.extra();
+            let task_id = extra.get("taskId").and_then(serde_json::Value::as_str);
+            let list_file = extra.get("listFile").and_then(serde_json::Value::as_str);
+            let (Some(task_id), Some(list_file)) = (task_id, list_file) else {
+                eprintln!("「不再提醒」动作缺少 taskId/listFile，已忽略");
+                return;
+            };
+            if let Err(error) = reminder_runtime::disable_task_reminder(list_file, task_id) {
+                eprintln!("「不再提醒」回写失败：{error}");
+                return;
+            }
+            if let Err(error) = app.emit(
+                "reminder-disabled",
+                serde_json::json!({ "listFile": list_file, "taskId": task_id }),
+            ) {
+                eprintln!("发送 reminder-disabled 事件失败：{error}");
+            }
+            let runtime = app
+                .try_state::<reminder_runtime::ReminderRuntime>()
+                .map(|state| state.inner().clone());
+            if let Some(runtime) = runtime {
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = runtime.load_lists().await {
+                        eprintln!("「不再提醒」后刷新提醒快照失败：{error}");
+                    }
+                });
+            }
+        }
+        "tap" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -198,6 +249,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // 提醒动作须在任何通知显示前注册：action type 决定 toast 按钮，
+            // on_action 处理器同时让插件认为存在监听者（否则不显示按钮）。
+            let notification = app.notification();
+            if let Err(error) = notification.register_action_types(vec![ActionType::builder(
+                reminder_runtime::REMINDER_ACTION_TYPE_ID,
+            )
+            .actions(vec![Action::builder("remind-off", "不再提醒").build()])
+            .build()])
+            {
+                eprintln!("注册提醒动作类型失败：{error}");
+            }
+            let action_handle = app.handle().clone();
+            if let Err(error) = notification.on_action(move |performed| {
+                handle_reminder_action(&action_handle, performed);
+            }) {
+                eprintln!("注册提醒动作处理器失败：{error}");
+            }
             // 把主窗口标题设为「TodoList <版本>」；找不到窗口时静默忽略。
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("TodoList {}", app.package_info().version));

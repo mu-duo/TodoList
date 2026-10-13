@@ -23,15 +23,15 @@
 
 | FR | 功能 | 验收判据 |
 | :--- | :--- | :--- |
-| FR-APP-08 | 提醒：截止与可选提前一天 | 仅 open 任务参与；到达 due 或启用的提前事件时尝试系统通知。可检查本机发送尝试账本文件；不表示 OS 已展示或用户已送达 |
+| FR-APP-08 | 提醒：默认三档 + 到期（可「不再提醒」） | 仅 open 任务参与；默认在 due 前 7 天 / 1 天 / 1 小时及 due 时刻尝试系统通知；任务详情勾选框与通知上的「不再提醒」为同一开关（任务 YAML `reminder: false`）（**1.6.0 已实现并本地验证**：四档默认开启；通知按钮仅在通知停留屏幕时可点（Windows Tier 1 限制）；点通知本体前置窗口） |
 | FR-APP-09 | 重复任务（规则字段于该切片定稿） | 完成任务后按规则生成下一实例；不重复、不丢失 |
 | FR-APP-10 | 逾期高亮 | 过 due 且未完成任务有标识；完成或改期后消失 |
 
-**提醒语义（FR-APP-08，已实现并本地验证）**：可选 YAML 字段 `reminder_offset_days: 1` 表示在 due 前一个本地日历日、同一当地时刻提醒；纯日期 due 当地 09:00，date-time 使用指定时刻。夏令时不存在的当地时刻顺延至下一有效分钟，重复时刻取 earliest。启动与手动刷新同步任务快照；运行时单 worker 定时，最多每 60 秒重新校时；无文件 watcher。逾期 catch-up 每 task 最多一条，due 优先，并只 claim 本次已过期事件；未来事件继续排程。due 变更按 `task_id + canonical due + event type` 形成新 key；done / delete 取消提醒，已观察到的 done→open 会抑制逾期历史、只保留未来未试事件。
+**提醒语义（FR-APP-08，1.6.0 已实现并本地验证）**：默认对带 `due` 的 open 任务在 4 个档位尝试提醒：due 前 7 个本地日历日 / 前 1 个本地日历日 / 前 1 小时（本地墙钟减 1 小时）与 due 时刻；纯日期 due 当地 09:00，date-time 使用指定时刻；`reminder: false` 关闭（缺省开启；旧 `reminder_offset_days` 视同开启、元数据保存时移除）。夏令时不存在的当地时刻顺延至下一有效分钟，重复时刻取 earliest。启动与手动刷新同步任务快照；运行时单 worker 定时，最多每 60 秒重新校时；无文件 watcher。首帧（新建 / 改 due / 升级 / 关闭后再开启）静默 claim 已过的提前档、不发通知；首帧已过的「到期档」补一条；完成→重开（观察到非 open→open）静默 claim 全部已过档（含到期档）、只保留未来档。运行中错过的档按 task 合并一条（due 已过→「已到截止时间」，否则按真实剩余时长），并 claim 本次全部已过档；未来事件继续排程。due 变更按 `task_id + canonical due + event type` 形成新 key；done / delete 取消提醒。
 
-提醒仅根据完整快照运行：清单目录/文件读取错误、无效 YAML 根节点或 `tasks` 结构、被跳过的任务项等会使快照不完整；即使成功读取的清单仍可展示，提醒也会全局 fail closed 暂停，不发送、不更新或清理状态 checkpoint。完整 `load_lists` 刷新成功后恢复；读盘与 worker ack 串行。ledger 在同一文件持久化 `attempted` event keys 与 `last_status: { task_id: bool }`（仅完整快照中的唯一 ID；`true=open`，`false=非 open`）。跨重启观察到 done→open 时，先原子 claim 当前 due 的全部逾期未尝试事件，再 reconcile；未来事件仍排程。应用关闭期间完整发生的 open→done→open 无法识别；按已确认语义，启动按最终 open 状态做普通 catch-up。
+提醒仅根据完整快照运行：清单目录/文件读取错误、无效 YAML 根节点或 `tasks` 结构、被跳过的任务项等会使快照不完整；即使成功读取的清单仍可展示，提醒也会全局 fail closed 暂停，不发送、不更新或清理状态 checkpoint。完整 `load_lists` 刷新成功后恢复；读盘与 worker ack 串行。ledger 在同一文件持久化 `attempted` event keys、`observed: { task_id: canonical due }`（首帧标记）与 `last_status: { task_id: bool }`（仅完整快照中的唯一 ID；`true=open`，`false=非 open`）。跨重启观察到 done→open 时，先原子 claim 该任务当前全部逾期未尝试事件（含到期档）、只保留未来未试事件，再 reconcile。应用关闭期间完整发生的 open→done→open 无法识别；按已确认语义，启动按最终 open 状态做普通 catch-up。
 
-主窗最小化时运行；关闭主窗后进程退出。Windows toast 为 best effort；plugin permission API 无法探测 Windows 通知设置 / 专注助手等系统抑制，`show` 成功不代表用户实际看到。账本只记录本机发送尝试，不是送达回执；当前无 UI 状态面板。
+主窗最小化时运行；关闭主窗后进程退出。Windows toast 为 best effort；plugin permission API 无法探测 Windows 通知设置 / 专注助手等系统抑制，`show` 成功不代表用户实际看到；通知带「不再提醒」动作按钮，但点击仅在通知停留屏幕时被接收（进入通知中心 / 应用退出后点击无响应——Tier 1 限制，已接受）；点通知本体＝显示并聚焦主窗口。账本只记录本机发送尝试，不是送达回执；当前无 UI 状态面板。
 
 ## 4. 检索
 

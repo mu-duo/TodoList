@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { DragMoveEvent } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
@@ -70,7 +71,7 @@ type Task = {
   priority: string | null;
   due: string | null;
   tags: string[] | null;
-  reminderOffsetDays?: number | null;
+  reminder?: false | null;
   notes: string | null;
   subtasks: Subtask[] | null;
   /** 任务级 Agent 意图（启用状态 + 关联原路径）；由后端 `load_lists` 返回，P2 已接线。 */
@@ -524,6 +525,27 @@ function App() {
       cancelled = true;
       unlisten?.();
     };
+  }, []);
+
+  // 订阅 reminder-disabled（通知按钮关闭提醒后回写）→ 刷新列表与选中详情
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ listFile: string; taskId: string }>("reminder-disabled", () => {
+      void refresh();
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // 订阅失败：静默降级（手动刷新仍可用）
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 挂载后兜底拉取全局状态
@@ -2080,7 +2102,7 @@ function App() {
   }
 
   // 任务详情内容（宽屏侧栏与窄屏抽屉共用）
-  function saveMetadata(patch: { priority?: "high" | "medium" | "low" | null; due?: string | null; tags?: string[]; reminderOffsetDays?: 1 | null }): Promise<boolean> {
+  function saveMetadata(patch: { priority?: "high" | "medium" | "low" | null; due?: string | null; tags?: string[]; reminder?: false | null }): Promise<boolean> {
     if (!selectedTask || !selectedTaskListFile) return Promise.resolve(false);
     const listFile = selectedTaskListFile;
     const taskId = selectedTask.id;
@@ -2131,8 +2153,8 @@ function App() {
               <option value="">不设置</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option>
             </select>
           </label>
-          <DueEditor value={selectedTask.due} onSave={(due) => void saveMetadata({ due, ...(!due ? { reminderOffsetDays: null } : {}) })} />
-          {selectedTask.due && <><label className="reminder-toggle"><input type="checkbox" checked={selectedTask.reminderOffsetDays === 1} onChange={(e) => void saveMetadata({ reminderOffsetDays: e.currentTarget.checked ? 1 : null })} /><span>提前 1 天提醒</span></label><p className="reminder-help">设置截止会尝试通知：仅日期按当地 09:00，带时刻按指定时间。可选提前 1 天。提醒仅在应用运行时排程；退出期间错过的未完成任务，下次启动尝试补发一次。Windows 设置可能屏蔽通知。</p></>}
+          <DueEditor value={selectedTask.due} onSave={(due) => void saveMetadata({ due, ...(!due ? { reminder: null } : {}) })} />
+          {selectedTask.due && <label className="reminder-toggle"><input type="checkbox" checked={selectedTask.reminder === false} onChange={(e) => void saveMetadata({ reminder: e.currentTarget.checked ? false : null })} /><span>不再提醒</span></label>}
           <TagEditor key={selectedTask.id} tags={selectedTask.tags ?? []} suggestions={[...new Set(lists.flatMap((list) => list.tasks.flatMap((task) => task.tags ?? [])))]} onSave={(tags) => saveMetadata({ tags })} />
         </section>
 
