@@ -433,6 +433,99 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
+/* ---------------------------------------- 已完成：按来源清单分组 / 折叠 ---- */
+
+/* 分组容器：组间留白大于组内行距，形成清晰的来源分组节奏 */
+.completed-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.completed-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 组头：整行可点（button 语义），低调的分组标签观感 */
+.completed-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  text-align: left;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.005em;
+}
+
+.completed-group-head:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-muted);
+  border-color: transparent;
+}
+
+/* chevron：展开朝下，折叠旋 -90°；过渡在 reduced-motion 下被全局关闭 */
+.completed-group-chevron {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--text-faint);
+  transition: transform var(--ease);
+}
+
+.completed-group-chevron svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+.completed-group-head[aria-expanded="false"] .completed-group-chevron {
+  transform: rotate(-90deg);
+}
+
+.completed-group-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.completed-group-sep,
+.completed-group-count {
+  flex: none;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.completed-group-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 组体：展开时轻微淡入（不做高度动画，避免布局抖动） */
+.completed-group-body {
+  animation: group-open 150ms ease backwards;
+}
+
+@keyframes group-open {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* 任务列表内部滚动区 */
 .task-scroll {
   flex: 1;
@@ -798,7 +891,8 @@ button:focus-visible {
   position: relative;
   flex: none;
   border-radius: var(--radius-control);
-  transition: background-color var(--ease);
+  transition: background-color var(--ease), box-shadow var(--ease),
+    transform var(--ease);
 }
 
 .list-nav-item:hover {
@@ -861,6 +955,20 @@ button:focus-visible {
 .list-nav-item.is-fixed {
   margin-top: 4px;
   border-top: 1px solid var(--border);
+}
+
+/* 拖拽任务到清单条：目标清单高亮（源清单 / 固定项不会命中） */
+.list-nav-item.is-drop-target {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.list-nav-item.is-drop-target .list-nav-select {
+  color: var(--accent-strong);
+}
+
+.list-nav-item.is-drop-target .list-nav-count {
+  color: var(--accent-strong);
 }
 
 .list-nav-item.is-fixed .list-nav-select {
@@ -1742,6 +1850,8 @@ button:focus-visible {
   left: calc(100% - 2px);
   top: -5px;
   z-index: 1;
+  max-height: 70vh;
+  overflow-y: auto;
 }
 
 .context-menu--sub.is-flip {
@@ -2129,3 +2239,22 @@ button:focus-visible {
     background: rgba(0, 0, 0, 0.6);
   }
 }
+.metadata-editor { margin: 4px 0 16px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: linear-gradient(135deg, var(--surface-muted), var(--surface)); display: grid; gap: 12px; }
+.metadata-heading { display:flex; justify-content:space-between; align-items:baseline; color:var(--text); font-weight:650; font-size:13px; }
+.metadata-heading small { color:var(--text-faint); font-size:11px; font-weight:400; }
+.metadata-editor select,.metadata-editor input:not([type=checkbox]) { box-sizing:border-box; min-width:0; width:100%; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface); color:var(--text); padding:8px 10px; font:inherit; }
+.metadata-editor select:focus,.metadata-editor input:focus { outline:2px solid var(--accent-ring); border-color:var(--accent); }
+.due-controls { display:flex; gap:7px; align-items:center; }
+.due-controls input[type=date] { flex:1; }
+.due-controls input[type=time] { width:120px!important; }
+.clear-due { border:0; background:transparent; color:var(--text-muted); cursor:pointer; padding:7px; }
+.reminder-toggle { display:flex; gap:9px; align-items:center; font-size:13px; color:var(--text); cursor:pointer; }
+.reminder-toggle input { accent-color:var(--accent); width:16px; height:16px; }
+.tag-editor { display:flex; flex-wrap:wrap; gap:6px; align-items:center; min-height:38px; padding:5px; border:1px solid var(--border-strong); border-radius:9px; background:var(--surface); }
+.tag-editor input:not([type=checkbox]) { flex:1; width:90px!important; border:0!important; padding:5px!important; outline:none!important; }
+.tag-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:99px; background:var(--accent-soft); color:var(--metadata-accent); font-size:12px; }
+.tag-chip { color:var(--accent-strong); }
+.reminder-help { margin:-5px 0 2px; color:var(--text-muted); font-size:11px; line-height:1.55; }
+.due-controls { flex-wrap:wrap; }
+@media (max-width: 420px) { .due-controls input[type=date] { flex:1 1 100%; } .due-controls input[type=time] { flex:1; width:auto!important; } }
+.tag-chip button { border:0; padding:0 1px; background:none; color:inherit; cursor:pointer; font-size:15px; line-height:1; }

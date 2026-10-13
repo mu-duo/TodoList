@@ -9,6 +9,7 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragMoveEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
 import {
@@ -50,11 +51,19 @@ type SortableListProps = {
   footer?: ReactNode;
   onReorder?: (activeId: string, overId: string) => void;
   onDragStart?: () => void;
-  onDragEnd?: () => void;
+  /** 拖拽结束 / 取消回调：入参为被拖拽项的 id（取消时为 null）。 */
+  onDragEnd?: (activeId: string | null) => void;
+  /** 拖拽过程中的回调（用于指针命中测试等，如「拖到清单条」）。 */
+  onDragMove?: (event: DragMoveEvent) => void;
   /** 整行右键回调（用于清单操作菜单）。 */
   onItemContextMenu?: (id: string, event: MouseEvent) => void;
   /** 单项禁用拖拽。 */
   itemDisabled?: (id: string) => boolean;
+  /**
+   * 每个可拖拽 <li> 的额外 data-* 属性（如清单文件映射 `data-list-file`），
+   * 供拖拽命中测试等按 DOM 查询定位。固定 footer 项不带该属性。
+   */
+  rowDataAttributes?: (id: string) => Record<string, string> | undefined;
   /**
    * 拖拽激活方式：
    * - `pointer`（默认，保持既有行为）：鼠标 / 触屏均为「移动超过阈值」触发。
@@ -84,8 +93,10 @@ export function SortableList({
   onReorder,
   onDragStart,
   onDragEnd,
+  onDragMove,
   onItemContextMenu,
   itemDisabled,
+  rowDataAttributes,
   interaction = "pointer",
   keyboardDrag = true,
 }: SortableListProps) {
@@ -133,6 +144,7 @@ export function SortableList({
           <li
             key={id}
             className={rowClassName(id)}
+            {...rowDataAttributes?.(id)}
             onContextMenu={(event) => onItemContextMenu?.(id, event)}
           >
             {renderItem(id)}
@@ -151,7 +163,7 @@ export function SortableList({
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     setActiveId(null);
-    onDragEnd?.();
+    onDragEnd?.(String(active.id));
     if (over && active.id !== over.id) {
       onReorder?.(String(active.id), String(over.id));
     }
@@ -162,10 +174,11 @@ export function SortableList({
       sensors={sensors}
       collisionDetection={closestCenter}
       onDragStart={handleDragStart}
+      onDragMove={onDragMove}
       onDragEnd={handleDragEnd}
       onDragCancel={() => {
         setActiveId(null);
-        onDragEnd?.();
+        onDragEnd?.(null);
       }}
     >
       <SortableContext items={ids} strategy={strategy}>
@@ -177,6 +190,7 @@ export function SortableList({
               reduced={reduced}
               className={rowClassName(id)}
               disabled={itemDisabled?.(id) ?? false}
+              dataAttributes={rowDataAttributes?.(id)}
               onContextMenu={onItemContextMenu}
             >
               {(activatorRef) => renderItem(id, activatorRef)}
@@ -202,6 +216,8 @@ type SortableRowProps = {
   reduced: boolean;
   className: string;
   disabled: boolean;
+  /** 额外的 data-* 属性（拖拽命中测试用）。 */
+  dataAttributes?: Record<string, string>;
   onContextMenu?: (id: string, event: MouseEvent) => void;
   /** 渲染行内容；入参为「拖拽激活节点」ref，供键盘拖拽结束后归还焦点。 */
   children: (activatorRef: (element: HTMLElement | null) => void) => ReactNode;
@@ -212,6 +228,7 @@ function SortableRow({
   reduced,
   className,
   disabled,
+  dataAttributes,
   onContextMenu,
   children,
 }: SortableRowProps) {
@@ -237,6 +254,7 @@ function SortableRow({
       ref={setNodeRef}
       style={style}
       className={`${className}${isDragging ? " is-dragging" : ""}`}
+      {...dataAttributes}
       onContextMenu={(event) => onContextMenu?.(id, event)}
       {...listeners}
     >

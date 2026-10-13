@@ -1,27 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isThemePref, type ThemePref } from "./theme";
 import { sanitizeAppBarOrder } from "./appBar";
+import { sanitizeCompletedCollapsed } from "./completedGroups";
 
 export type AppSettings = {
   theme: ThemePref;
   /** 已保存的功能栏顺序；null = 默认（字段缺失 / 为空 / 非法）。 */
   appBarOrder: string[] | null;
+  /** 「已完成」视图折叠的清单文件名集合；null = 默认全展开（字段缺失 / 为空 / 非法）。 */
+  completedCollapsed: string[] | null;
 };
 
 /**
- * 一次性读取本机偏好（主题 + 功能栏顺序）。
+ * 一次性读取本机偏好（主题 + 功能栏顺序 + 已完成折叠集合）。
  * 读取失败 / 后端未就绪一律回退默认，不报错；启动时只读一次，避免多处各读造成竞争。
  */
 export async function loadSettings(): Promise<AppSettings> {
   try {
-    const raw = await invoke<{ theme?: unknown; app_bar_order?: unknown }>(
-      "load_settings",
-    );
+    const raw = await invoke<{
+      theme?: unknown;
+      app_bar_order?: unknown;
+      completed_collapsed?: unknown;
+    }>("load_settings");
     return {
       theme: isThemePref(raw?.theme) ? raw.theme : "system",
       appBarOrder: sanitizeAppBarOrder(raw?.app_bar_order),
+      completedCollapsed: sanitizeCompletedCollapsed(raw?.completed_collapsed),
     };
   } catch {
-    return { theme: "system", appBarOrder: null };
+    return { theme: "system", appBarOrder: null, completedCollapsed: null };
   }
 }

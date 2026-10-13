@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { DragMoveEvent } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
 import { SortableList } from "./components/SortableList";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
+import { moveTargetLists, resolveDropTarget, type RectLike } from "./taskMove";
 import { SettingsModal } from "./components/SettingsModal";
 import { ConfirmModal } from "./components/ConfirmModal";
 import { AppBar } from "./components/AppBar";
@@ -45,6 +47,12 @@ import {
   visibleAppBarIds,
   type AppBarEntryMeta,
 } from "./appBar";
+import {
+  activeCollapsedFiles,
+  buildCompletedGroups,
+  nextCollapsed,
+  sameCollapsed,
+} from "./completedGroups";
 import { useMediaQuery, usePrefersReducedMotion } from "./hooks";
 import "./App.css";
 
@@ -62,6 +70,7 @@ type Task = {
   priority: string | null;
   due: string | null;
   tags: string[] | null;
+  reminderOffsetDays?: number | null;
   notes: string | null;
   subtasks: Subtask[] | null;
   /** 任务级 Agent 意图（启用状态 + 关联原路径）；由后端 `load_lists` 返回，P2 已接线。 */
@@ -148,6 +157,18 @@ function App() {
   // 手动刷新按钮的忙碌态（入口忙碌时禁用并可反馈）
   const [refreshing, setRefreshing] = useState(false);
 
+  // 「已完成」视图：折叠的清单文件名集合（键 = 清单文件；空 = 全展开）
+  const [completedCollapsed, setCompletedCollapsed] = useState<string[]>([]);
+  const [completedCollapsedError, setCompletedCollapsedError] = useState<
+    string | null
+  >(null);
+  // 当前期望集合（供串行保存与失败回滚读取最新值）
+  const completedCollapsedRef = useRef<string[]>([]);
+  // 最近一次成功落盘的集合（失败时回滚目标）
+  const completedCollapsedSavedRef = useRef<string[]>([]);
+  // 串行写盘链：保证「始终保存最新完整集合」，避免并发乱序覆盖
+  const completedSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+
   // ---- Agent 任务 UI（Phase 2）----
   // 任务键 → 已知运行态（事件 / 状态轮询 / 历史最新）
   const [agentStates, setAgentStates] = useState<Map<string, AgentLiveState>>(
@@ -193,6 +214,8 @@ function App() {
   // 任务详情面板的编辑草稿
   const [editTitle, setEditTitle] = useState("");
   const [editNotes, setEditNotes] = useState("");
+  // Metadata patches share one YAML read-modify-write path: serialize per app session.
+  const metadataQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
 
   // 详情即时保存：输入值镜像到 ref，供防抖与 flush 读取最新值
   const editTitleRef = useRef("");
@@ -230,6 +253,18 @@ function App() {
 
   // 拖拽结束后的「点击抑制」：避免松手时误触发选中
   const suppressClickRef = useRef(false);
+
+  // 选中任务 id 的镜像：异步收尾（如跨清单移动）需读取最新选中，避免过期闭包
+  const selectedTaskIdRef = useRef<string | null>(null);
+  selectedTaskIdRef.current = selectedTaskId;
+
+  // ---- 任务拖拽到「清单条」：目标高亮 + 落点判定 ----
+  // 高亮的目标清单文件（null = 无有效目标）；state 驱动行类名，ref 供事件回调同步读取
+  const [dragDropTarget, setDragDropTarget] = useState<string | null>(null);
+  const dragDropTargetRef = useRef<string | null>(null);
+  // 本次拖拽是否已按「跨清单转移」处理（用于压掉随后的同清单排序回调）
+  const dragMoveHandledRef = useRef(false);
+
   // 详情由键盘打开（click.detail===0）→ 关闭时保留焦点；指针打开 → 清焦点环
   const openedByKeyboardRef = useRef(true);
   // 置顶前的最小化 / 缩放 / 最大化快照（用于逐条还原）
@@ -254,6 +289,18 @@ function App() {
           .map((task) => ({ task, listFile: list.file, listName: list.name })),
       ),
     [lists],
+  );
+
+  // 「已完成」视图按来源清单分组（组顺序 = 侧栏清单顺序；空组不显示）
+  const completedGroups = useMemo(
+    () => buildCompletedGroups(lists, completedTasks),
+    [lists, completedTasks],
+  );
+
+  // 当前生效的折叠集合（过滤重命名 / 删除后的失效键，静默忽略）
+  const collapsedCompletedSet = useMemo(
+    () => new Set(activeCollapsedFiles(completedCollapsed, lists)),
+    [completedCollapsed, lists],
   );
 
   // 当前视图的任务集合
@@ -750,6 +797,21 @@ function App() {
       latestResultDir: live?.resultDir ?? null,
     });
     const isDone = task.status === "done";
+    // 「移动到清单」目标：除任务所在清单外的全部真实清单（侧栏顺序）；无目标则整项不显示
+    const moveTargets = moveTargetLists(lists, listFile);
+    const moveItem: MenuItem[] = moveTargets.length
+      ? [
+          {
+            key: "move",
+            label: "移动到清单",
+            children: moveTargets.map((target) => ({
+              key: `move-${target.file}`,
+              label: target.name,
+              onSelect: () => void moveTask(listFile, task.id, target.file),
+            })),
+          },
+        ]
+      : [];
     return [
       {
         key: "open",
@@ -761,6 +823,7 @@ function App() {
         label: isDone ? "取消完成" : "完成",
         onSelect: () => toggle(listFile, task, !isDone),
       },
+      ...moveItem,
       {
         key: "agent",
         label: "Agent",
@@ -818,11 +881,19 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const { theme: pref, appBarOrder: order } = await loadSettings();
+      const {
+        theme: pref,
+        appBarOrder: order,
+        completedCollapsed: collapsed,
+      } = await loadSettings();
       if (cancelled) return;
       setTheme(pref);
       setAppBarSaved(order);
       setAppBarOrder(resolveAppBarOrder(order));
+      const initialCollapsed = collapsed ?? [];
+      completedCollapsedRef.current = initialCollapsed;
+      completedCollapsedSavedRef.current = initialCollapsed;
+      setCompletedCollapsed(initialCollapsed);
       try {
         await applyThemePref(pref);
       } catch {
@@ -974,6 +1045,114 @@ function App() {
     window.setTimeout(() => {
       suppressClickRef.current = false;
     }, 0);
+  }
+
+  // ---- 跨清单转移（右键子菜单 + 拖到清单条） ----
+
+  // 统一入口：移到目标清单末尾；成功后刷新；失败沿用现有错误提示。
+  // 关闭正打开在详情面板的该任务，避免残留指向源清单的编辑（先落盘待写改动）。
+  async function moveTask(
+    sourceListFile: string,
+    taskId: string,
+    toListFile: string,
+  ) {
+    if (busy || !taskId || !toListFile || toListFile === sourceListFile) return;
+    if (selectedTaskIdRef.current === taskId) {
+      flushPendingSave();
+      setDrawerOpen(false);
+      setSelectedTaskId(null);
+    }
+    setBusy(true);
+    setActionError(null);
+    try {
+      await invoke("move_task", {
+        listFile: sourceListFile,
+        taskId,
+        toListFile,
+      });
+      await refresh();
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 读取清单条中真实清单项的视口矩形（固定「已完成」项无 data-list-file，天然排除）
+  function listNavRects(): Array<RectLike & { file: string }> {
+    const nodes = document.querySelectorAll<HTMLElement>(
+      ".list-nav-item[data-list-file]",
+    );
+    const rects: Array<RectLike & { file: string }> = [];
+    nodes.forEach((el) => {
+      const file = el.dataset.listFile;
+      if (!file) return;
+      const rect = el.getBoundingClientRect();
+      rects.push({
+        file,
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+      });
+    });
+    return rects;
+  }
+
+  // 由拖拽起点事件 + 累计位移推算当前指针视口坐标；键盘拖拽无坐标 → null
+  function dragPointer(event: DragMoveEvent): { x: number; y: number } | null {
+    const src = event.activatorEvent as {
+      clientX?: number;
+      clientY?: number;
+      touches?: ArrayLike<{ clientX: number; clientY: number }>;
+    };
+    let x: number | undefined;
+    let y: number | undefined;
+    if (typeof src.clientX === "number" && typeof src.clientY === "number") {
+      x = src.clientX;
+      y = src.clientY;
+    } else if (src.touches && src.touches.length > 0) {
+      x = src.touches[0].clientX;
+      y = src.touches[0].clientY;
+    }
+    if (x === undefined || y === undefined) return null;
+    return { x: x + event.delta.x, y: y + event.delta.y };
+  }
+
+  function applyDragDropTarget(file: string | null) {
+    if (dragDropTargetRef.current === file) return;
+    dragDropTargetRef.current = file;
+    setDragDropTarget(file);
+  }
+
+  // 拖拽过程中：对清单条项做指针命中测试（仅普通清单视图）
+  function handleTaskDragMove(event: DragMoveEvent) {
+    if (isCompletedView || !selectedListFile) return;
+    applyDragDropTarget(
+      resolveDropTarget(dragPointer(event), listNavRects(), selectedListFile),
+    );
+  }
+
+  function handleTaskDragStart() {
+    markDragStart();
+    dragMoveHandledRef.current = false;
+  }
+
+  // 拖拽结束：落点为有效清单项 → 转移；否则保持既有同清单排序
+  function handleTaskDragEnd(activeId: string | null) {
+    markDragEnd();
+    const target = dragDropTargetRef.current;
+    applyDragDropTarget(null);
+    if (
+      target &&
+      activeId &&
+      selectedListFile &&
+      !isCompletedView &&
+      target !== selectedListFile
+    ) {
+      dragMoveHandledRef.current = true;
+      void moveTask(selectedListFile, activeId, target);
+    }
   }
 
   // ---- 窗口置顶（pin） ----
@@ -1139,6 +1318,45 @@ function App() {
         setAppBarSaving(false);
       }
     })();
+  }
+
+  // ---- 「已完成」分组折叠接线 ----
+
+  // 应用折叠集合并同步 state 与 ref
+  function applyCompletedCollapsed(next: string[]) {
+    completedCollapsedRef.current = next;
+    setCompletedCollapsed(next);
+  }
+
+  // 串行保存当前完整集合；失败报错，并在期间无更新改动时回滚到最后一次成功值
+  function persistCompletedCollapsed(next: string[]) {
+    const snapshot = next.slice();
+    const payload = snapshot.length > 0 ? snapshot : null;
+    completedSaveChainRef.current = completedSaveChainRef.current.then(
+      async () => {
+        setCompletedCollapsedError(null);
+        try {
+          await invoke("save_completed_collapsed", { collapsed: payload });
+          completedCollapsedSavedRef.current = snapshot;
+          setCompletedCollapsedError(null);
+        } catch (e) {
+          setCompletedCollapsedError(String(e));
+          // 仅当没有更新的改动时才回滚，避免覆盖用户后续操作
+          if (sameCollapsed(completedCollapsedRef.current, snapshot)) {
+            applyCompletedCollapsed(completedCollapsedSavedRef.current.slice());
+          }
+        }
+      },
+    );
+  }
+
+  // 切换某个来源分组的折叠态：立即生效，随后落盘完整集合
+  function toggleCompletedGroup(file: string) {
+    const current = activeCollapsedFiles(completedCollapsedRef.current, lists);
+    const collapsedNow = current.includes(file);
+    const next = nextCollapsed(current, file, !collapsedNow) ?? [];
+    applyCompletedCollapsed(next);
+    persistCompletedCollapsed(next);
   }
 
   // 切换主题：立即生效；失败记入 actionError（不弹窗）
@@ -1630,6 +1848,11 @@ function App() {
 
   // 依据「可见（未完成）任务」的相邻关系算出 before_task_id
   function handleTaskReorder(activeId: string, overId: string) {
+    // 本次拖拽已作为「跨清单转移」处理 → 吞掉随后触发的同清单排序
+    if (dragMoveHandledRef.current) {
+      dragMoveHandledRef.current = false;
+      return;
+    }
     if (busy || !selectedList) return;
     const from = taskIds.indexOf(activeId);
     const to = taskIds.indexOf(overId);
@@ -1666,9 +1889,12 @@ function App() {
   function renderTaskCard(
     entry: ViewTask,
     activatorRef?: (element: HTMLElement | null) => void,
+    hideSource = false,
   ) {
     const { task } = entry;
     const isDone = leaving.get(task.id) ?? task.status === "done";
+    // 分组视图的组头已承载来源，行内不再重复「来自 X」
+    const showSource = !hideSource && !!entry.listName;
     const subs = task.subtasks ?? [];
     const total = subs.length;
     const doneCount = subs.filter((s) => s.status === "done").length;
@@ -1702,9 +1928,9 @@ function App() {
           <span className={`task-title${isDone ? " done" : ""}`}>
             {task.title || "(无标题)"}
           </span>
-          {(task.priority || task.due || entry.listName) && (
+          {(task.priority || task.due || showSource) && (
             <span className="task-meta-row">
-              {entry.listName && <span className="meta">来自 {entry.listName}</span>}
+              {showSource && <span className="meta">来自 {entry.listName}</span>}
               {task.priority && (
                 <span className="meta">
                   优先级 {PRIORITY_LABEL[task.priority] ?? task.priority}
@@ -1854,6 +2080,22 @@ function App() {
   }
 
   // 任务详情内容（宽屏侧栏与窄屏抽屉共用）
+  function saveMetadata(patch: { priority?: "high" | "medium" | "low" | null; due?: string | null; tags?: string[]; reminderOffsetDays?: 1 | null }): Promise<boolean> {
+    if (!selectedTask || !selectedTaskListFile) return Promise.resolve(false);
+    const listFile = selectedTaskListFile;
+    const taskId = selectedTask.id;
+    const operation = metadataQueueRef.current.then(async () => {
+      try {
+        await invoke("update_task_metadata", { listFile, taskId, patch });
+        await refresh();
+        return true;
+      } catch (e) { setError(String(e)); return false; }
+    });
+    // operation handles its own failures; chain remains resolved and later patches still run.
+    metadataQueueRef.current = operation;
+    return operation;
+  }
+
   function renderDetail() {
     if (!selectedTask || !selectedTaskListFile) {
       return <p className="hint">选择任务查看详情</p>;
@@ -1881,6 +2123,18 @@ function App() {
             }}
           />
         </label>
+
+        <section className="metadata-editor" aria-label="任务元数据">
+          <div className="metadata-heading"><span>任务属性</span><small>随改随存</small></div>
+          <label className="field"><span className="field-label">优先级</span>
+            <select aria-label="优先级" value={selectedTask.priority ?? ""} onChange={(e) => void saveMetadata({ priority: (e.currentTarget.value || null) as "high" | "medium" | "low" | null })}>
+              <option value="">不设置</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option>
+            </select>
+          </label>
+          <DueEditor value={selectedTask.due} onSave={(due) => void saveMetadata({ due, ...(!due ? { reminderOffsetDays: null } : {}) })} />
+          {selectedTask.due && <><label className="reminder-toggle"><input type="checkbox" checked={selectedTask.reminderOffsetDays === 1} onChange={(e) => void saveMetadata({ reminderOffsetDays: e.currentTarget.checked ? 1 : null })} /><span>提前 1 天提醒</span></label><p className="reminder-help">设置截止会尝试通知：仅日期按当地 09:00，带时刻按指定时间。可选提前 1 天。提醒仅在应用运行时排程；退出期间错过的未完成任务，下次启动尝试补发一次。Windows 设置可能屏蔽通知。</p></>}
+          <TagEditor key={selectedTask.id} tags={selectedTask.tags ?? []} suggestions={[...new Set(lists.flatMap((list) => list.tasks.flatMap((task) => task.tags ?? [])))]} onSave={(tags) => saveMetadata({ tags })} />
+        </section>
 
         <div className="subtask-block">
           <div className="subtask-head">
@@ -2037,26 +2291,6 @@ function App() {
             <dd>{selectedTask.status === "done" ? "已完成" : "未完成"}</dd>
           </div>
           <div className="detail-row">
-            <dt>优先级</dt>
-            <dd>
-              {selectedTask.priority
-                ? PRIORITY_LABEL[selectedTask.priority] ?? selectedTask.priority
-                : "—"}
-            </dd>
-          </div>
-          <div className="detail-row">
-            <dt>截止</dt>
-            <dd>{selectedTask.due || "—"}</dd>
-          </div>
-          <div className="detail-row">
-            <dt>标签</dt>
-            <dd>
-              {selectedTask.tags && selectedTask.tags.length > 0
-                ? selectedTask.tags.join("、")
-                : "—"}
-            </dd>
-          </div>
-          <div className="detail-row">
             <dt>完成时间</dt>
             <dd>{selectedTask.completed || "—"}</dd>
           </div>
@@ -2192,6 +2426,12 @@ function App() {
           <p className="error">功能栏排序保存失败：{appBarError}</p>
         )}
 
+        {completedCollapsedError && (
+          <p className="error">
+            已完成分组折叠保存失败：{completedCollapsedError}
+          </p>
+        )}
+
         {error && (
           <p className="error">
             出错了：{error}
@@ -2211,22 +2451,81 @@ function App() {
                   <span className="pane-count">{completedTasks.length} 项</span>
                 </div>
                 <div className="task-scroll">
-                  {completedTasks.length === 0 ? (
+                  {completedGroups.length === 0 ? (
                     <p className="hint">暂无已完成任务。</p>
                   ) : (
-                    <SortableList
-                      sortable={false}
-                      className="task-list"
-                      ids={taskIds}
-                      rowClassName={(id) =>
-                        taskRowClass(entryById.get(id)!)
-                      }
-                      renderItem={(id) => renderTaskCard(entryById.get(id)!)}
-                      onItemContextMenu={(id, event) => {
-                        const entry = entryById.get(id);
-                        if (entry) openTaskMenu(event, entry);
-                      }}
-                    />
+                    <div className="completed-groups">
+                      {completedGroups.map((group) => {
+                        const collapsed = collapsedCompletedSet.has(group.file);
+                        const groupIds = group.tasks.map((e) => e.task.id);
+                        return (
+                          <section className="completed-group" key={group.file}>
+                            <button
+                              type="button"
+                              className="completed-group-head"
+                              aria-expanded={!collapsed}
+                              onClick={() => toggleCompletedGroup(group.file)}
+                              title={
+                                collapsed
+                                  ? `展开「${group.name}」`
+                                  : `折叠「${group.name}」`
+                              }
+                            >
+                              <span
+                                className="completed-group-chevron"
+                                aria-hidden="true"
+                              >
+                                <svg
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <path d="M6 9l6 6 6-6" />
+                                </svg>
+                              </span>
+                              <span className="completed-group-name">
+                                {group.name}
+                              </span>
+                              <span
+                                className="completed-group-sep"
+                                aria-hidden="true"
+                              >
+                                ·
+                              </span>
+                              <span className="completed-group-count">
+                                {group.tasks.length}
+                              </span>
+                            </button>
+                            {!collapsed && (
+                              <div className="completed-group-body">
+                                <SortableList
+                                  sortable={false}
+                                  className="task-list"
+                                  ids={groupIds}
+                                  rowClassName={(id) =>
+                                    taskRowClass(entryById.get(id)!)
+                                  }
+                                  renderItem={(id) =>
+                                    renderTaskCard(
+                                      entryById.get(id)!,
+                                      undefined,
+                                      true,
+                                    )
+                                  }
+                                  onItemContextMenu={(id, event) => {
+                                    const entry = entryById.get(id);
+                                    if (entry) openTaskMenu(event, entry);
+                                  }}
+                                />
+                              </div>
+                            )}
+                          </section>
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
               </>
@@ -2252,8 +2551,9 @@ function App() {
                       }
                       renderOverlay={renderOverlayTask}
                       onReorder={handleTaskReorder}
-                      onDragStart={markDragStart}
-                      onDragEnd={markDragEnd}
+                      onDragStart={handleTaskDragStart}
+                      onDragMove={handleTaskDragMove}
+                      onDragEnd={handleTaskDragEnd}
                       onItemContextMenu={(id, event) => {
                         const entry = entryById.get(id);
                         if (entry) openTaskMenu(event, entry);
@@ -2323,9 +2623,10 @@ function App() {
                 rowClassName={(id) =>
                   `list-nav-item${id === selectedListFile ? " is-active" : ""}${
                     editingListFile === id ? " is-editing" : ""
-                  }`
+                  }${dragDropTarget === id ? " is-drop-target" : ""}`
                 }
                 itemDisabled={(id) => editingListFile === id}
+                rowDataAttributes={(id) => ({ "data-list-file": id })}
                 renderItem={(id) => {
                   const list = listById.get(id);
                   return list ? renderListRow(list) : null;
@@ -2443,6 +2744,33 @@ function App() {
       )}
     </main>
   );
+}
+
+function DueEditor({ value, onSave }: { value: string | null; onSave: (value: string | null) => void }) {
+  const [date, setDate] = useState(value?.slice(0, 10) ?? "");
+  const [time, setTime] = useState(value && value.length > 10 ? value.slice(11, 16) : "");
+  useEffect(() => { setDate(value?.slice(0, 10) ?? ""); setTime(value && value.length > 10 ? value.slice(11, 16) : ""); }, [value]);
+  const save = (d: string, t: string) => onSave(d ? `${d}${t ? `T${t}` : ""}` : null);
+  return <div className="field"><span className="field-label">截止日期</span><div className="due-controls">
+    <input aria-label="截止日期" type="date" value={date} onChange={(e) => { setDate(e.currentTarget.value); save(e.currentTarget.value, time); }} />
+    <input aria-label="截止时间（可选）" type="time" value={time} disabled={!date} onChange={(e) => setTime(e.currentTarget.value)} onBlur={() => save(date, time)} />
+    {date && <button type="button" className="clear-due" onClick={() => { setDate(""); setTime(""); onSave(null); }}>清除</button>}
+  </div></div>;
+}
+
+function TagEditor({ tags, suggestions, onSave }: { tags: string[]; suggestions: string[]; onSave: (tags: string[]) => Promise<boolean> }) {
+  const [draft, setDraft] = useState("");
+  const [current, setCurrent] = useState(tags);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const committedRef = useRef(tags);
+  const persist = async (next: string[]) => { if (savingRef.current) return; savingRef.current = true; setSaving(true); setCurrent(next); try { const succeeded = await onSave(next); if (succeeded) committedRef.current = next; else setCurrent(committedRef.current); } catch { setCurrent(committedRef.current); } finally { savingRef.current = false; setSaving(false); } };
+  const add = (raw = draft) => { const tag = raw.trim(); if (tag && !current.includes(tag)) void persist([...current, tag]); setDraft(""); };
+  return <div className="field"><label className="field-label" htmlFor="task-tag-input">标签</label><div className="tag-editor">
+    {current.map((tag) => <span className="tag-chip" key={tag}>{tag}<button type="button" disabled={saving} aria-label={`移除标签 ${tag}`} onClick={() => void persist(current.filter((item) => item !== tag))}>×</button></span>)}
+    <input id="task-tag-input" disabled={saving} list="task-tag-suggestions" value={draft} placeholder="输入标签…" onChange={(e) => setDraft(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); } }} onBlur={() => { if (draft.trim()) add(); }} />
+    <datalist id="task-tag-suggestions">{suggestions.map((tag) => <option key={tag} value={tag} />)}</datalist>
+  </div></div>;
 }
 
 /** 行尾 Agent 机器人小图标（与既有内联图标同风格）。 */

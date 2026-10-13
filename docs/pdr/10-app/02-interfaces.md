@@ -14,7 +14,7 @@ TodoList/
 ```
 
 - 文件名 = 清单名（规整化）；清单显示名以文件内 `name` 为准。
-- 非任务数据（设置等）放**应用配置目录**，不进数据目录；当前为 `settings.yaml`（Windows：`%APPDATA%\com.lftan.todolist\settings.yaml`；文件名、字段与回退语义见 ADR-0006）。
+- 非任务数据（设置等）放**应用配置目录**，不进数据目录；当前包括 `settings.yaml` 与提醒账本 `reminder-ledger.json`（Windows：`%APPDATA%\com.lftan.todolist\`；设置文件名、字段与回退语义见 ADR-0006）。
 
 ## 2. 清单文件（schema v1）
 
@@ -28,6 +28,7 @@ tasks:
     status: open
     priority: high
     due: 2026-10-10
+    reminder_offset_days: 1
     tags: [汇报, 周]
     created: 2026-10-08T09:30
     completed: 2026-10-08T11:00   # done 时存在
@@ -58,6 +59,7 @@ tasks:
 | `completed` | 本地时间 | done 时 | 完成时间 |
 | `priority` | `high` \| `medium` \| `low` |  | 优先级 |
 | `due` | `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM` |  | 截止（本地时间） |
+| `reminder_offset_days` | `1` |  | 可选；在 due 前一个本地日历日、同一当地时刻提醒；无 due 时不可启用 |
 | `tags` | string[] |  | 标签 |
 | `notes` | string（多行） |  | 备注 |
 | `subtasks` | array（一层，**元素不可嵌套**） |  | 子任务；元素为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；数组顺序 = 显示顺序；增 / 删 / 勾选 / 改名经**按 id 的命令**原子写入（不做整数组覆盖）；可扩展 |
@@ -72,8 +74,13 @@ tasks:
 - **写入**：app 写回 = 重读最新文件 → Value 级补丁只改目标字段 → 原子写（同目录临时文件 + rename）。
 - **外部变更**：文件变更触发 app 自动重载（目标：≤2s 防抖；骨架阶段暂以刷新替代）。
 - **冲突**：同一任务被双方同时修改时，以磁盘后写为准（不做字段级合并，已知限制，见 ADR-0003）。
-- **容错**：单个清单文件损坏 / 解析失败不影响其它清单加载（跳过并在界面提示，需自行修复该文件）。
+- **容错**：单个清单文件损坏 / 解析失败不影响其它清单展示（跳过并在界面提示，需自行修复该文件）。根节点必须为 mapping，必需字段 `tasks` 必须为 sequence；非法任务项会产生 warning。目录迭代或单文件读取错误同样告警。任何 warning 都表示提醒快照不完整：提醒全局 fail closed 暂停，不更新 / 清理 status checkpoint，不发送；修复后完整 `load_lists` 刷新恢复。硬读取错误会先等待 worker 确认暂停，再向 UI 返回错误。
 - **备份**：v1 无内置备份；建议数据目录纳入 git / 网盘。
+
+### 任务详情元数据命令
+
+- `update_task_metadata({ listFile, taskId, patch }) -> void`：patch 使用 camelCase 可选字段 `priority?: "high" | "medium" | "low" | null`、`due?: string | null`、`tags?: string[]`、`reminderOffsetDays?: 1 | null`。字段缺省不修改，显式 `null` 清除；空 tags 清除。`due` 只接受本地 `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`，无时区转换。保存为最新 YAML 上的目标字段 Value 级补丁并原子写。
+- `TaskView` 前端属性为 `reminderOffsetDays: number | null`；磁盘字段名仍是 `reminder_offset_days`。清除 due 同时清除提醒 offset。
 
 ## 4. 版本与演进
 
@@ -81,7 +88,7 @@ tasks:
 - 不兼容变更：更新本文件 + 落 ADR + 提供迁移说明。
 
 - 权威定义：本文件（落地后以 `src-tauri` 解析实现为准，语义不得偏离本文件）。
-- 待决：提醒 / 重复字段（对应切片定稿）；清单文件名规整化细则。
+- 待决：重复任务字段；清单文件名规整化细则。
 
 ## 5. 应用功能栏入口顺序（不进数据目录）
 
@@ -111,6 +118,36 @@ app_bar:
 - **新增未配置入口**：默认追加到用户顺序末尾；用户重排后写回。
 - **恢复默认**：删除 `app_bar.order`（连同其中记录的未知 id 历史顺序一并清除）。
 - **写入时机**：排序放下即原子写；写失败**回滚到最后一次成功顺序**并向用户报错。
+- **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
+
+### 5.1 「已完成」视图分组折叠偏好（completed.collapsed）
+
+> **状态（2026-10-13）：已实现并经用户验收通过**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+> 「已完成」虚拟清单的分组规则与折叠交互见 [01-spec.md](01-spec.md) §6（FR-APP-18）；验证见 [04-current.md](04-current.md)。
+
+「已完成」视图的分组折叠状态是**本机偏好**，存现有应用配置 `settings.yaml`（**不写清单、不进数据目录**）。实际字段：
+
+```yaml
+theme: system                 # 现有
+app_bar:
+  order: [refresh, pin, settings]
+completed:
+  collapsed: [工作.yaml, 收集箱.yaml]   # 键 = 清单文件名（含扩展名，与 list.file 一致）
+```
+
+- 缺失 `completed.collapsed` = **全部展开**（默认）。
+
+**接口（Tauri 命令）**：
+
+- `load_settings()` 增 `completed_collapsed: string[] | null`，取自 `completed.collapsed`；缺失 / 空 / 非法 → `null`（= 全部展开）。
+- `save_completed_collapsed({ collapsed: string[] | null })`：Value 级补丁**仅改 `completed.collapsed`**（保留 `theme`、`app_bar`、`completed` 其它字段与全部未知字段，不做整份覆盖）；`collapsed` 为 `null` 或空数组 → **删除该字段**（恢复默认 = 全部展开）；空白文件名、或已有 `completed` 非对象 → 中文错误、不写盘。
+
+**折叠语义**：
+
+- `completed.collapsed`（string[]，可选）：**已折叠**来源清单的文件名集合；键 = 清单文件名（与侧栏 / 磁盘文件名一致）。
+- 空集合 / 字段缺失 = 全部展开；不在集合中的组默认展开。
+- **失效键**（清单重命名 / 删除后残留的旧文件名）：由 **UI 静默忽略**，对应组回退为**展开**，不报错、不主动清理。
+- 该字段与 `theme`、`app_bar.order` **互不覆盖**（三者各自 Value 级补丁）。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
 ## 6. Agent 协助（**已实现（Phase1+Phase2），待验证**）
@@ -158,6 +195,7 @@ agent:
 - `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。**不提供自动 / 保存流 / 测试流**，**不做任何真实付费调用**。
 - `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`
 - `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
+- `load_lists` 的 `TaskView` 另暴露 `reminderOffsetDays: number | null`（YAML 键 `reminder_offset_days`）。
 - 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
 
 ### 6.5 运行记录、结果与运行命令 / 事件（**已实现**）
@@ -190,6 +228,17 @@ agent:
 - **交付 / 判据警告**：**不得**用 `--features agent-test-provider`（或 `--all-features`）构建的产物**交付**，**也不得**据此判断联网可用——该构建返回**离线假来源**（`example.test`），**仅供测试**。
 - **联网未经真实调用验证**（仅 DeepSeek 原生 Anthropic 兼容端点有官方一方源码，字段存在未决项），**不声称可用或已验收**。
 
+## 7. 提醒运行时与发送尝试账本（已实现并本地验证）
+
+- **计划**：due 为本地 `YYYY-MM-DD` 时刻取当地 09:00；`YYYY-MM-DDTHH:MM` 使用指定本地时刻。`reminder_offset_days: 1` 在前一**本地日历日**同一时刻生成 advance event。夏令时 gap 顺延到下一有效分钟；ambiguous 取 earliest。
+- **快照与调度**：应用启动及 `load_lists` 手动刷新同步快照；load_lists 的读盘、提交快照与 worker ack 在同一异步互斥区内串行；无文件 watcher。仅 `status == open` 参与。单 worker timer 最多每 60 秒校时；catch-up 每 task 最多一条（due 优先），只 claim 已过期事件，future event 保留排程。done / delete 取消；已观察到的 reopen 抑制逾期历史，只保留未来未试事件。
+- **事件去重**：ledger key = `task_id + canonical due + event type(advance|due)`，不含清单文件名；due 修改产生新 key，同 due 设回已尝试值仍去重。
+- **账本结构与 status checkpoint**：`%APPDATA%\com.lftan.todolist\reminder-ledger.json`（通过 `settings_dir()`），包含 `attempted` event keys 和 `last_status: { task_id: bool }`；缺少 `last_status` 的旧 JSON 兼容读取。status 仅在完整快照且 task ID 唯一时更新（`true=open`，`false=非 open`）；完整快照确认缺席时才移除对应 checkpoint。重复 ID 保留上次 checkpoint。跨重启观察到 done→open 时，把当前 due 的所有逾期未尝试 keys 与新状态一次原子持久化后再正常 reconcile；future keys 不 claim。损坏或读取失败 fail closed 并报告 warning。
+- **不完整快照**：目录遍历 / 文件读取失败、解析错误、根节点非 mapping、缺少或非 sequence 的 `tasks`、任务项被跳过，均使快照 incomplete。可展示成功读取的清单，但提醒整体暂停；不 reconcile / send，不更新或清理 checkpoint，也不把部分任务集当作 active schedule。完整 `load_lists` 刷新成功后恢复。硬读取错误先暂停并等待 worker ack，再返回 UI 错误；刷新读盘至 worker ack 串行。
+- **存储与发送顺序**：确认 plugin permission-state 为 Granted 后，对每 task 先将全部本次 overdue claim keys 原子持久化，再调用系统通知；写账本失败不 show，show 失败仍保留 attempt。此策略偏向 at-most-once，不承诺 exactly-once。
+- **平台限制**：Windows toast best effort；permission API 不能探测 Windows 设置 / 专注助手屏蔽；`show` 返回成功不代表系统实际展示或用户已送达。当前无 UI 状态面板；账本只表示发送尝试，不是送达回执。
+- **离线状态限制**：无 watcher / 事件日志时，应用关闭期间完整发生的 open→done→open 不可识别；按产品确认，启动以最终 open 状态作普通 catch-up，不推断曾完成。
+
 ## Log
 
 - 2026-10-10 子任务**定形**（FR-APP-03）：`subtasks` 元素固定为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；**一层、元素不可嵌套**（深度恒为 1）；数组顺序 = 显示顺序；增 / 删 / 勾选 / **改名**经**按 id 的原子命令**写入（避免整数组覆盖冲掉外部并发改动）。schema 形状本身未变（与 §2 示例一致）。
@@ -200,3 +249,4 @@ agent:
 - 2026-10-12 **Phase 3 文档同步（已实现待验证）**：§6 由「Phase 1 冻结 / P2 待实现」更新为**后端与前端已实现（Phase1+Phase2）待真机集成验证 / 未实测**；补 Phase 2 运行命令与 `agent://state` 事件（含 `stopReason`、无密钥）、`RunSummary`（含 `stop_reason`、`stats.steps`）、结果布局与本机记录路径；记**步数护栏 40（非次数帽）**。**未验收、未联网实测**。
 - 2026-10-12 **Phase 3 收尾修正**：状态改「**已通过隔离集成复验（假 provider、零真实网络）；真实 DeepSeek 联网仍未实测；未经用户验收**」；`RunSummary` **移除后端不存在的可选 `message` 字段**；新增 **`agent-test-provider` 交付 / 判据警告**；测试数更正为 117。
 - 2026-10-12 **用户验收通过**：§6 状态改「**已实现、隔离集成复验通过、用户验收通过；真实联网未实测**」；随 **1.4.0** 发布（构建与提交由父会话执行）。
+- 2026-10-13 新增 §5.1「已完成」视图分组折叠偏好（FR-APP-18）：`load_settings` 增 `completed_collapsed: string[] | null`、新增 `save_completed_collapsed({ collapsed })`——Value 级补丁**仅改 `completed.collapsed`**，`null` / 空数组删除该字段恢复默认（全部展开），保留 `theme` / `app_bar` / 未知字段，空白文件名 / `completed` 非对象报中文错误不写盘；键 = 清单文件名、失效键由 UI 静默忽略。同批记 **`move_task(list_file, task_id, to_list_file)`**（FR-APP-04 任务跨清单转移）为**命令级移动**、**不新增字段 / 文件**；双文件写序为「先向目标追加、再自源移除 + 失败回滚」。**未改数据目录 schema**。

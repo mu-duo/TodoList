@@ -1,19 +1,21 @@
 mod agent;
+pub mod reminder;
+mod reminder_runtime;
 mod storage;
 
 use std::sync::Arc;
 
 use agent::clock::SystemClock;
 use agent::commands::AgentRuntime;
-use tauri::Manager;
+use tauri::{Manager, State};
 
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
 /// 单个文件失败不影响其余清单，失败信息通过 `warnings` 返回。
 #[tauri::command]
-fn load_lists() -> Result<storage::LoadResult, String> {
-    let base = storage::data_dir()?;
-    storage::ensure_data_dir(&base)?;
-    storage::load_lists_from(&base)
+async fn load_lists(
+    reminder_runtime: State<'_, reminder_runtime::ReminderRuntime>,
+) -> Result<storage::LoadResult, String> {
+    reminder_runtime.load_lists().await
 }
 
 /// 勾选 / 取消勾选任务：以 Value 级补丁原子写回，保留未知字段。
@@ -47,6 +49,17 @@ fn update_task(
 ) -> Result<(), String> {
     let base = storage::data_dir()?;
     storage::update_task_in(&base, &list_file, &task_id, &title, &notes)
+}
+
+/// 更新任务详情元数据（缺省字段不修改，null 清除可选字段）。
+#[tauri::command]
+fn update_task_metadata(
+    list_file: String,
+    task_id: String,
+    patch: storage::TaskMetadataPatch,
+) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::update_task_metadata_in(&base, &list_file, &task_id, patch)
 }
 
 /// 删除指定任务。
@@ -130,6 +143,13 @@ fn reorder_task(
     storage::reorder_task_in(&base, &list_file, &task_id, before_task_id.as_deref())
 }
 
+/// 把任务从一个清单转移到另一个清单末尾（id 与全部字段保留）。
+#[tauri::command]
+fn move_task(list_file: String, task_id: String, to_list_file: String) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::move_task_in(&base, &list_file, &task_id, &to_list_file)
+}
+
 /// 把清单移到指定清单之前（`before_list_file` 为空 → 末尾），整体重编号。
 #[tauri::command]
 fn reorder_list(list_file: String, before_list_file: Option<String>) -> Result<(), String> {
@@ -158,6 +178,13 @@ fn save_app_bar_order(order: Option<Vec<String>>) -> Result<(), String> {
     storage::save_app_bar_order_in(&base, order.as_deref())
 }
 
+/// 保存「已完成」视图折叠的清单文件名集合（`None` / 空数组 → 恢复默认，删除 `collapsed`）。
+#[tauri::command]
+fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_completed_collapsed_in(&base, collapsed.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -169,13 +196,35 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 把主窗口标题设为「TodoList <版本>」；找不到窗口时静默忽略。
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("TodoList {}", app.package_info().version));
             }
+            let initial_snapshot = match storage::data_dir() {
+                Ok(base) => reminder_runtime::startup_snapshot(&base),
+                Err(error) => reminder_runtime::ReminderSnapshot {
+                    tasks: Vec::new(),
+                    complete: false,
+                    warnings: vec![format!("启动时读取提醒快照失败：{error}")],
+                },
+            };
+            let reminder_runtime = match storage::settings_dir() {
+                Ok(settings_dir) => reminder_runtime::ReminderRuntime::start(
+                    app.handle().clone(),
+                    settings_dir,
+                    initial_snapshot,
+                ),
+                Err(error) => {
+                    eprintln!("无法启动提醒运行时：{error}");
+                    reminder_runtime::ReminderRuntime::disabled()
+                }
+            };
+            app.manage(reminder_runtime);
             // Agent 运行编排：独占 runner.lock + 并发 1 队列（应用运行期间）。
-            if let (Ok(config_base), Ok(data_base)) = (storage::settings_dir(), storage::data_dir()) {
+            if let (Ok(config_base), Ok(data_base)) = (storage::settings_dir(), storage::data_dir())
+            {
                 // 先取独占 runner.lock（构造 runtime），**再**恢复 running→interrupted：
                 // 非持有锁的实例不得把在跑记录误标 interrupted。
                 let runtime = Arc::new(AgentRuntime::new(
@@ -199,6 +248,7 @@ pub fn run() {
             create_task,
             create_list,
             update_task,
+            update_task_metadata,
             delete_task,
             add_subtask,
             remove_subtask,
@@ -208,10 +258,12 @@ pub fn run() {
             delete_list,
             move_list,
             reorder_task,
+            move_task,
             reorder_list,
             load_settings,
             save_settings,
             save_app_bar_order,
+            save_completed_collapsed,
             agent::commands::agent_load_config,
             agent::commands::agent_save_config,
             agent::commands::agent_set_key,

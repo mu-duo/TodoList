@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use yaml_serde::{Mapping, Value};
 
 pub const LISTS_DIR: &str = "lists";
@@ -27,6 +27,9 @@ pub struct Settings {
     /// 应用功能栏入口顺序（本机偏好）；缺失 / 空 / 非法 → `None`（前端用默认顺序）。
     #[serde(default)]
     pub app_bar_order: Option<Vec<String>>,
+    /// 「已完成」视图折叠的清单文件名集合（本机偏好）；缺失 / 空 / 非法 → `None`（默认全部展开）。
+    #[serde(default)]
+    pub completed_collapsed: Option<Vec<String>>,
 }
 
 /// 加载结果：成功解析的清单 + 被跳过的文件告警。
@@ -58,11 +61,62 @@ pub struct TaskView {
     pub completed: Option<String>,
     pub priority: Option<String>,
     pub due: Option<String>,
+    #[serde(rename = "reminderOffsetDays")]
+    pub reminder_offset_days: Option<i64>,
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub subtasks: Option<Vec<SubtaskView>>,
     /// Agent 任务意图（`agent: { enabled, paths }`）；缺失 / 非法 → `None`。
     pub agent: Option<crate::agent::TaskAgent>,
+}
+
+/// Distinguishes an omitted patch property from an explicit null.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum FieldPatch<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPatch<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PatchVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for PatchVisitor<T> {
+            type Value = FieldPatch<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a value or null")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(FieldPatch::Null)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(FieldPatch::Null)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(self, deserializer: D2) -> Result<Self::Value, D2::Error> {
+                T::deserialize(deserializer).map(FieldPatch::Value)
+            }
+        }
+
+        deserializer.deserialize_option(PatchVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMetadataPatch {
+    #[serde(default)]
+    pub priority: FieldPatch<String>,
+    #[serde(default)]
+    pub due: FieldPatch<String>,
+    #[serde(default)]
+    pub tags: FieldPatch<Vec<String>>,
+    #[serde(default)]
+    pub reminder_offset_days: FieldPatch<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,10 +178,12 @@ fn normalize_theme(theme: &str) -> String {
 /// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
 /// 且**不会**创建文件、不会 panic。`app_bar.order` 缺失 / 空 / 非法时 `app_bar_order` 为
 /// `None`；合法字符串 id 去重（首次保留）并保留未知 id 原顺序，不自动补已知 id。
+/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析。
 pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     let fallback = || Settings {
         theme: DEFAULT_THEME.to_string(),
         app_bar_order: None,
+        completed_collapsed: None,
     };
     let path = base.join(SETTINGS_FILE);
     if !path.is_file() {
@@ -149,6 +205,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     Ok(Settings {
         theme,
         app_bar_order: parse_app_bar_order(&value),
+        completed_collapsed: parse_completed_collapsed(&value),
     })
 }
 
@@ -170,6 +227,27 @@ fn parse_app_bar_order(value: &Value) -> Option<Vec<String>> {
         None
     } else {
         Some(order)
+    }
+}
+
+/// 从设置 Value 解析 `completed.collapsed`：缺失 / 非对象 / 非数组 / 含非字符串或空白元素 /
+/// 去重后为空 → `None`；否则按首次出现去重并保留原始顺序。
+fn parse_completed_collapsed(value: &Value) -> Option<Vec<String>> {
+    let seq = value.get("completed")?.get("collapsed")?.as_sequence()?;
+    let mut collapsed: Vec<String> = Vec::with_capacity(seq.len());
+    for item in seq {
+        let file = item.as_str()?;
+        if file.trim().is_empty() {
+            return None;
+        }
+        if !collapsed.iter().any(|existing| existing == file) {
+            collapsed.push(file.to_string());
+        }
+    }
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed)
     }
 }
 
@@ -254,6 +332,70 @@ pub fn save_app_bar_order_in(base: &Path, order: Option<&[String]>) -> Result<()
     write_list(&path, &value)
 }
 
+/// 写入 / 清除 `completed.collapsed`（`None` 或空数组 → 删除 `collapsed` 以恢复默认：全部展开）。
+///
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `completed.collapsed`** → 原子写，
+/// 保留 `theme`、`app_bar`、`completed` 其它字段及所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// 空白文件名 → 中文错误；已有 `completed` 若非对象 → 中文错误（不覆盖未知标量）。
+pub fn save_completed_collapsed_in(
+    base: &Path,
+    collapsed: Option<&[String]>,
+) -> Result<(), String> {
+    let files = collapsed.filter(|files| !files.is_empty());
+    if let Some(files) = files {
+        for file in files {
+            if file.trim().is_empty() {
+                return Err("已完成清单折叠键不能为空".to_string());
+            }
+        }
+    }
+
+    fs::create_dir_all(base).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let path = base.join(SETTINGS_FILE);
+
+    let mut value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("读取设置文件失败：{e}"))?;
+        yaml_serde::from_str(&text).map_err(|e| format!("解析设置文件失败：{e}"))?
+    } else {
+        Value::Mapping(Mapping::new())
+    };
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+
+    match files {
+        Some(files) => {
+            let completed = match root.get_mut("completed") {
+                Some(existing) => existing
+                    .as_mapping_mut()
+                    .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?,
+                None => {
+                    root.insert(key("completed"), Value::Mapping(Mapping::new()));
+                    root.get_mut("completed")
+                        .and_then(Value::as_mapping_mut)
+                        .expect("刚插入的 completed 应为对象")
+                }
+            };
+            let seq = files
+                .iter()
+                .map(|file| Value::String(file.clone()))
+                .collect();
+            completed.insert(key("collapsed"), Value::Sequence(seq));
+        }
+        None => {
+            if let Some(existing) = root.get_mut("completed") {
+                let completed = existing
+                    .as_mapping_mut()
+                    .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?;
+                completed.remove("collapsed");
+            }
+        }
+    }
+
+    write_list(&path, &value)
+}
+
 /// 读取 `lists/*.yaml` 全部清单；排序：文件内 order 升序，其次按名称。
 ///
 /// 单个文件读取 / 解析失败会被跳过并记入 [`LoadResult::warnings`]；
@@ -262,15 +404,22 @@ pub fn load_lists_from(base: &Path) -> Result<LoadResult, String> {
     let lists_dir = base.join(LISTS_DIR);
     let entries = fs::read_dir(&lists_dir).map_err(|e| format!("读取清单目录失败：{e}"))?;
 
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| is_yaml(p))
-        .collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if is_yaml(&path) {
+                    paths.push(path);
+                }
+            }
+            Err(error) => warnings.push(format!("遍历清单目录时读取条目失败：{error}")),
+        }
+    }
     paths.sort();
 
     let mut loaded: Vec<(i64, ListView)> = Vec::with_capacity(paths.len());
-    let mut warnings: Vec<String> = Vec::new();
     for path in &paths {
         let file = file_name(path);
         let text = match fs::read_to_string(path) {
@@ -287,7 +436,27 @@ pub fn load_lists_from(base: &Path) -> Result<LoadResult, String> {
                 continue;
             }
         };
-        let order = value.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX);
+        if value.as_mapping().is_none() {
+            warnings.push(format!("清单「{file}」根节点必须是 mapping，已跳过"));
+            continue;
+        }
+        let Some(task_values) = value.get("tasks").and_then(Value::as_sequence) else {
+            warnings.push(format!("清单「{file}」缺少有效的 tasks sequence，已跳过"));
+            continue;
+        };
+        let valid_task_count = task_values
+            .iter()
+            .filter(|task| task.as_mapping().is_some())
+            .count();
+        if valid_task_count != task_values.len() {
+            warnings.push(format!(
+                "清单「{file}」包含非 mapping 任务项，部分任务已跳过"
+            ));
+        }
+        let order = value
+            .get("order")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
         loaded.push((order, value_to_list(&file, &value)));
     }
 
@@ -438,6 +607,118 @@ pub fn update_task_in(
     write_list(&path, &value)
 }
 
+/// Value-level metadata patch that preserves all unrelated task/list fields.
+pub fn update_task_metadata_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    patch: TaskMetadataPatch,
+) -> Result<(), String> {
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+    let map = find_task_mut(&mut value, list_file, task_id)?;
+
+    let priority = match patch.priority {
+        FieldPatch::Missing => None,
+        FieldPatch::Null => Some(None),
+        FieldPatch::Value(value) => {
+            if !matches!(value.as_str(), "high" | "medium" | "low") {
+                return Err("优先级仅支持 high、medium、low".to_string());
+            }
+            Some(Some(value))
+        }
+    };
+    let due = match patch.due {
+        FieldPatch::Missing => None,
+        FieldPatch::Null => Some(None),
+        FieldPatch::Value(value) => {
+            validate_due(&value)?;
+            Some(Some(value))
+        }
+    };
+    let offset = match patch.reminder_offset_days {
+        FieldPatch::Missing => None,
+        FieldPatch::Null => Some(None),
+        FieldPatch::Value(1) => Some(Some(1)),
+        FieldPatch::Value(_) => return Err("提醒提前天数当前仅支持 1".to_string()),
+    };
+
+    let resulting_due = match &due {
+        Some(value) => value.as_deref(),
+        None => map.get("due").and_then(Value::as_str),
+    };
+    if offset == Some(Some(1)) && resulting_due.is_none() {
+        return Err("没有截止日期时不能启用提醒".to_string());
+    }
+
+    if let Some(priority) = priority {
+        set_optional_string(map, "priority", priority);
+    }
+    if let Some(due) = due {
+        let cleared = due.is_none();
+        set_optional_string(map, "due", due);
+        if cleared {
+            map.remove("reminder_offset_days");
+        }
+    }
+    match patch.tags {
+        FieldPatch::Missing => {}
+        FieldPatch::Null => {
+            map.remove("tags");
+        }
+        FieldPatch::Value(tags) if tags.is_empty() => {
+            map.remove("tags");
+        }
+        FieldPatch::Value(tags) => {
+            map.insert(
+                key("tags"),
+                Value::Sequence(tags.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+    if let Some(offset) = offset {
+        match offset {
+            Some(days) => {
+                map.insert(key("reminder_offset_days"), Value::Number(days.into()));
+            }
+            None => {
+                map.remove("reminder_offset_days");
+            }
+        }
+    }
+    write_list(&path, &value)
+}
+
+fn set_optional_string(map: &mut Mapping, field: &str, value: Option<String>) {
+    match value {
+        Some(value) => {
+            map.insert(key(field), Value::String(value));
+        }
+        None => {
+            map.remove(field);
+        }
+    }
+}
+
+fn validate_due(value: &str) -> Result<(), String> {
+    let valid = if value.len() == 10 {
+        chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map(|date| date.format("%Y-%m-%d").to_string() == value)
+            .unwrap_or(false)
+    } else if value.len() == 16 {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
+            .map(|date| date.format("%Y-%m-%dT%H:%M").to_string() == value)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("截止日期格式必须为 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM".to_string())
+    }
+}
+
 /// 从清单的 `tasks` 数组中移除指定任务。
 pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(), String> {
     let path = list_path(base, list_file)?;
@@ -452,6 +733,80 @@ pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(),
         .ok_or_else(|| format!("清单「{list_file}」中未找到任务 {task_id}"))?;
     tasks.remove(index);
     write_list(&path, &value)
+}
+
+/// 把任务从一个清单转移到另一个清单末尾（Value 级移动，id 与全部字段原样保留）。
+///
+/// 校验：源 ≠ 目标；源清单存在且含该 `task_id`；目标清单存在且**不含**同 id 任务
+/// （任一不满足即报错，且不写任何文件）。
+///
+/// 写序：先向目标清单 `tasks` 末尾追加并原子写，成功后再从源清单移除并原子写。
+/// 若源移除写失败：用此前读到的目标原 Value 尝试原子回滚目标——回滚成功返回错误
+/// （说明移动未生效）；回滚也失败返回明确错误（两处可能同 id 双份，绝不静默）。
+///
+/// 已知限制：Agent 运行中的任务转移无特殊保护（不在本切片解决）；拖拽 UI 由前端负责。
+pub fn move_task_in(
+    base: &Path,
+    list_file: &str,
+    task_id: &str,
+    to_list_file: &str,
+) -> Result<(), String> {
+    if list_file == to_list_file {
+        return Err("源清单与目标清单相同，无法移动".to_string());
+    }
+
+    let from_path = list_path(base, list_file)?;
+    let to_path = list_path(base, to_list_file)?;
+
+    // 读取源清单并取出目标任务（此时尚未写盘）。
+    let mut from_value = read_list_value(&from_path, list_file)?;
+    let from_tasks = from_value
+        .get_mut("tasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("清单「{list_file}」缺少 tasks 数组"))?;
+    let index = from_tasks
+        .iter()
+        .position(|t| t.get("id").and_then(Value::as_str) == Some(task_id))
+        .ok_or_else(|| format!("清单「{list_file}」中未找到任务 {task_id}"))?;
+    let task = from_tasks.remove(index);
+
+    // 读取目标清单并校验存在性与同 id 冲突；保留原值用于回滚。
+    if !to_path.is_file() {
+        return Err(format!("清单文件不存在：{to_list_file}"));
+    }
+    let mut to_value = read_list_value(&to_path, to_list_file)?;
+    let to_original = to_value.clone();
+    {
+        let to_tasks = to_value
+            .get_mut("tasks")
+            .and_then(Value::as_sequence_mut)
+            .ok_or_else(|| format!("清单「{to_list_file}」缺少 tasks 数组"))?;
+        if to_tasks
+            .iter()
+            .any(|t| t.get("id").and_then(Value::as_str) == Some(task_id))
+        {
+            return Err(format!("目标清单「{to_list_file}」已存在任务 {task_id}"));
+        }
+        to_tasks.push(task);
+    }
+
+    // 先写目标（追加），再写源（移除）。
+    write_list(&to_path, &to_value)?;
+
+    if let Err(source_error) = write_list(&from_path, &from_value) {
+        // 源移除失败：尝试把目标回滚为原内容。
+        return match write_list(&to_path, &to_original) {
+            Ok(()) => Err(format!(
+                "移动任务失败（源清单「{list_file}」写回失败，目标已回滚，移动未生效）：{source_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "移动任务失败且状态不一致：源清单「{list_file}」写回失败（{source_error}），\
+                 回滚目标清单「{to_list_file}」也失败（{rollback_error}）；\
+                 任务 {task_id} 可能同时存在于两个清单，请手动检查"
+            )),
+        };
+    }
+    Ok(())
 }
 
 /// 向指定任务的 `subtasks` 末尾追加一条子任务，返回其视图。
@@ -951,6 +1306,7 @@ fn mapping_to_task(value: &Value) -> Option<TaskView> {
         completed: get_str(m, "completed"),
         priority: get_str(m, "priority"),
         due: get_str(m, "due"),
+        reminder_offset_days: m.get("reminder_offset_days").and_then(Value::as_i64),
         tags,
         notes: get_str(m, "notes"),
         subtasks,
@@ -1053,6 +1409,153 @@ mod tests {
             .get("order")
             .and_then(Value::as_i64)
             .unwrap()
+    }
+
+    #[test]
+    fn list_loader_warns_on_invalid_tasks_shape_and_keeps_other_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(base, "missing-tasks.yaml", "name: Missing tasks\n");
+        write_list(base, "object-tasks.yaml", "name: Object tasks\ntasks: {}\n");
+        write_list(
+            base,
+            "non-mapping-task.yaml",
+            "name: Partial task list\ntasks:\n  - not-a-task-mapping\n  - id: valid-task\n    title: Valid task\n    status: open\n",
+        );
+        write_list(base, "empty-valid.yaml", "name: Valid empty\ntasks: []\n");
+
+        let loaded = load_lists_from(base).unwrap();
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("missing-tasks.yaml")));
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("object-tasks.yaml")));
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-mapping-task.yaml")));
+        assert_eq!(loaded.lists.len(), 2);
+        let partial = loaded
+            .lists
+            .iter()
+            .find(|list| list.file == "non-mapping-task.yaml")
+            .unwrap();
+        assert_eq!(partial.tasks.len(), 1);
+        assert_eq!(partial.tasks[0].id, "valid-task");
+        let valid_empty = loaded
+            .lists
+            .iter()
+            .find(|list| list.file == "empty-valid.yaml")
+            .unwrap();
+        assert!(valid_empty.tasks.is_empty());
+    }
+
+    #[test]
+    fn list_loader_warns_and_skips_non_mapping_root_but_loads_valid_neighbor() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(base, "scalar-root.yaml", "not a mapping\n");
+        write_list(base, "valid-neighbor.yaml", "name: Neighbor\ntasks: []\n");
+
+        let loaded = load_lists_from(base).unwrap();
+        assert_eq!(loaded.lists.len(), 1);
+        assert_eq!(loaded.lists[0].file, "valid-neighbor.yaml");
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("scalar-root.yaml")));
+    }
+
+    fn metadata_patch(json: &str) -> TaskMetadataPatch {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn metadata_round_trip_uses_snake_disk_and_camel_frontend_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\nx-top: keep\ntasks:\n  - id: T1\n    title: Keep title\n    status: open\n    notes: Keep notes\n    custom: keep task\n  - id: T2\n    title: Other task\n    status: done\n",
+        );
+        update_task_metadata_in(
+            base,
+            "L.yaml",
+            "T1",
+            metadata_patch(
+                r#"{"priority":"high","due":"2026-10-13","tags":["a","b"],"reminderOffsetDays":1}"#,
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_lists_from(base).unwrap();
+        let task = &loaded.lists[0].tasks[0];
+        assert_eq!(task.reminder_offset_days, Some(1));
+        let frontend = serde_json::to_value(task).unwrap();
+        assert_eq!(frontend.get("reminderOffsetDays").and_then(serde_json::Value::as_i64), Some(1));
+        assert!(frontend.get("reminder_offset_days").is_none());
+        let disk_task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert_eq!(disk_task.get("reminder_offset_days").and_then(Value::as_i64), Some(1));
+        assert!(disk_task.get("reminderOffsetDays").is_none());
+
+        update_task_metadata_in(
+            base,
+            "L.yaml",
+            "T1",
+            metadata_patch(r#"{"due":"2026-10-13T09:30"}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            load_lists_from(base).unwrap().lists[0].tasks[0].due.as_deref(),
+            Some("2026-10-13T09:30")
+        );
+        update_task_metadata_in(
+            base,
+            "L.yaml",
+            "T1",
+            metadata_patch(r#"{"priority":null,"due":null,"tags":[],"reminderOffsetDays":null}"#),
+        )
+        .unwrap();
+        let value = read_value(&path);
+        let task = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
+        for field in ["priority", "due", "tags", "reminder_offset_days"] {
+            assert!(task.get(field).is_none());
+        }
+        assert_eq!(task.get("title").and_then(Value::as_str), Some("Keep title"));
+        assert_eq!(task.get("notes").and_then(Value::as_str), Some("Keep notes"));
+        assert_eq!(task.get("custom").and_then(Value::as_str), Some("keep task"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert_eq!(value.get("tasks").and_then(Value::as_sequence).unwrap()[1].get("title").and_then(Value::as_str), Some("Other task"));
+    }
+
+    #[test]
+    fn metadata_missing_fields_are_unchanged_and_invalid_patch_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "tasks:\n  - id: T1\n    title: T\n    priority: medium\n    due: '2026-10-13'\n    tags: [old]\n    reminder_offset_days: 1\n",
+        );
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch("{}")).unwrap();
+        update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(r#"{"due":null}"#)).unwrap();
+        let task = read_value(&path).get("tasks").and_then(Value::as_sequence).unwrap()[0].clone();
+        assert_eq!(task.get("priority").and_then(Value::as_str), Some("medium"));
+        assert!(task.get("reminder_offset_days").is_none());
+
+        for patch in [
+            r#"{"due":"2026-02-30"}"#,
+            r#"{"priority":"urgent"}"#,
+            r#"{"reminderOffsetDays":2}"#,
+        ] {
+            let before = fs::read(&path).unwrap();
+            assert!(update_task_metadata_in(base, "L.yaml", "T1", metadata_patch(patch)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]
@@ -2190,5 +2693,407 @@ tasks:
         let settings = load_settings_from(base).unwrap();
         assert_eq!(settings.theme, "light");
         assert_eq!(settings.app_bar_order, Some(vec!["refresh".to_string()]));
+    }
+
+    /// 读取某个清单文件 `tasks` 数组中的任务 id 序列。
+    fn task_ids(path: &Path) -> Vec<String> {
+        read_value(path)
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .map(|t| t.get("id").and_then(Value::as_str).unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn move_task_appends_to_target_end_and_removes_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let from = write_list(
+            base,
+            "A.yaml",
+            "schema: 1\nname: A\norder: 1\nx-top: keepA\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep1\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n  - id: T2\n    title: 二\n    status: open\n  - id: T3\n    title: 三\n    status: done\n    completed: 2026-10-01T09:00\n",
+        );
+        let to = write_list(
+            base,
+            "B.yaml",
+            "schema: 1\nname: B\norder: 2\nx-top: keepB\ntasks:\n  - id: T9\n    title: 九\n    status: open\n",
+        );
+
+        move_task_in(base, "A.yaml", "T1", "B.yaml").unwrap();
+
+        // 源：移除 T1，其余任务顺序不变，顶层未知字段保留
+        assert_eq!(task_ids(&from), vec!["T2", "T3"]);
+        assert_eq!(
+            read_value(&from).get("x-top").and_then(Value::as_str),
+            Some("keepA")
+        );
+
+        // 目标：原有任务在前，移入的任务追加到末尾
+        assert_eq!(task_ids(&to), vec!["T9", "T1"]);
+        let to_value = read_value(&to);
+        let moved = &to_value.get("tasks").and_then(Value::as_sequence).unwrap()[1];
+        assert_eq!(moved.get("id").and_then(Value::as_str), Some("T1"));
+        assert_eq!(moved.get("title").and_then(Value::as_str), Some("一"));
+        assert_eq!(moved.get("status").and_then(Value::as_str), Some("open"));
+        assert_eq!(moved.get("x-task").and_then(Value::as_str), Some("keep1"));
+        let subs = moved.get("subtasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].get("id").and_then(Value::as_str), Some("S1"));
+        assert_eq!(to_value.get("x-top").and_then(Value::as_str), Some("keepB"));
+    }
+
+    #[test]
+    fn move_task_rejects_missing_source_task_same_list_and_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let from = write_list(
+            base,
+            "A.yaml",
+            "schema: 1\nname: A\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+        let to = write_list(
+            base,
+            "B.yaml",
+            "schema: 1\nname: B\norder: 2\ntasks:\n  - id: T9\n    title: 九\n    status: open\n",
+        );
+        let from_before = fs::read(&from).unwrap();
+        let to_before = fs::read(&to).unwrap();
+
+        assert!(
+            move_task_in(base, "A.yaml", "NOPE", "B.yaml").is_err(),
+            "源清单无此 task 应报错"
+        );
+        assert!(
+            move_task_in(base, "A.yaml", "T1", "A.yaml").is_err(),
+            "源 = 目标应报错"
+        );
+        assert!(
+            move_task_in(base, "A.yaml", "T1", "missing.yaml").is_err(),
+            "目标文件不存在应报错"
+        );
+
+        // 失败均不写盘
+        assert_eq!(fs::read(&from).unwrap(), from_before);
+        assert_eq!(fs::read(&to).unwrap(), to_before);
+    }
+
+    #[test]
+    fn move_task_rejects_duplicate_id_in_target_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let from = write_list(
+            base,
+            "A.yaml",
+            "schema: 1\nname: A\norder: 1\ntasks:\n  - id: T1\n    title: 源一\n    status: open\n  - id: T2\n    title: 源二\n    status: open\n",
+        );
+        let to = write_list(
+            base,
+            "B.yaml",
+            "schema: 1\nname: B\norder: 2\ntasks:\n  - id: T1\n    title: 目标已有一\n    status: open\n",
+        );
+        let from_before = fs::read(&from).unwrap();
+        let to_before = fs::read(&to).unwrap();
+
+        assert!(
+            move_task_in(base, "A.yaml", "T1", "B.yaml").is_err(),
+            "目标已存在同 id 应报错"
+        );
+
+        // 两个文件都未被修改
+        assert_eq!(fs::read(&from).unwrap(), from_before);
+        assert_eq!(fs::read(&to).unwrap(), to_before);
+        assert_eq!(task_ids(&from), vec!["T1", "T2"]);
+        assert_eq!(task_ids(&to), vec!["T1"]);
+    }
+
+    #[test]
+    fn move_task_round_trip_preserves_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let from = write_list(
+            base,
+            "A.yaml",
+            "schema: 1\nname: A\norder: 1\nx-top: keepA\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep1\n    subtasks:\n      - id: S1\n        title: 甲\n        status: open\n  - id: T2\n    title: 二\n    status: open\n",
+        );
+        let to = write_list(
+            base,
+            "B.yaml",
+            "schema: 1\nname: B\norder: 2\ntasks:\n  - id: T9\n    title: 九\n    status: open\n",
+        );
+
+        // A → B
+        move_task_in(base, "A.yaml", "T1", "B.yaml").unwrap();
+        assert_eq!(task_ids(&from), vec!["T2"]);
+        assert_eq!(task_ids(&to), vec!["T9", "T1"]);
+
+        // B → A（移回）
+        move_task_in(base, "B.yaml", "T1", "A.yaml").unwrap();
+        assert_eq!(task_ids(&from), vec!["T2", "T1"], "移回后追加在源清单末尾");
+        assert_eq!(task_ids(&to), vec!["T9"], "目标恢复为原状");
+
+        // 内容完整：id、未知字段、子任务均保留
+        let value = read_value(&from);
+        let moved = value
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .find(|t| t.get("id").and_then(Value::as_str) == Some("T1"))
+            .unwrap()
+            .clone();
+        assert_eq!(moved.get("title").and_then(Value::as_str), Some("一"));
+        assert_eq!(moved.get("status").and_then(Value::as_str), Some("open"));
+        assert_eq!(moved.get("x-task").and_then(Value::as_str), Some("keep1"));
+        let subtask = &moved.get("subtasks").and_then(Value::as_sequence).unwrap()[0];
+        assert_eq!(subtask.get("id").and_then(Value::as_str), Some("S1"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keepA"));
+    }
+
+    #[test]
+    fn load_settings_defaults_include_no_completed_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert!(
+            settings.completed_collapsed.is_none(),
+            "缺失文件时 completed_collapsed 应为 None"
+        );
+        assert!(
+            !base.join(SETTINGS_FILE).exists(),
+            "读取不应创建 settings.yaml"
+        );
+    }
+
+    #[test]
+    fn load_settings_parses_completed_collapsed_deduped_unknown_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        fs::write(
+            base.join(SETTINGS_FILE),
+            "theme: dark\ncompleted:\n  collapsed: [工作.yaml, 工作.yaml, 家务.yaml, 工作.yaml]\n  x-keep: 1\n",
+        )
+        .unwrap();
+
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["工作.yaml".to_string(), "家务.yaml".to_string()]),
+            "去重取首次、保序"
+        );
+    }
+
+    #[test]
+    fn load_settings_completed_collapsed_fallbacks_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let cases = [
+            "theme: system\n",                                             // completed 缺失
+            "theme: system\ncompleted:\n  collapsed: []\n",                // 空数组
+            "theme: system\ncompleted: notamap\n",                         // completed 非对象
+            "theme: system\ncompleted:\n  collapsed: notaseq\n",           // collapsed 非数组
+            "theme: system\ncompleted:\n  collapsed: [工作.yaml, 42]\n",   // 含非字符串
+            "theme: system\ncompleted:\n  collapsed: [工作.yaml, '  ']\n", // 含空白
+        ];
+        for text in cases {
+            fs::write(base.join(SETTINGS_FILE), text).unwrap();
+            let settings = load_settings_from(base).unwrap();
+            assert_eq!(settings.theme, "system", "case: {text:?}");
+            assert!(
+                settings.completed_collapsed.is_none(),
+                "缺失 / 空 / 非法应回退 None：{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_completed_collapsed_writes_and_roundtrips_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: dark\nx-top: keep\ncompleted:\n  x-custom: keep2\n",
+        )
+        .unwrap();
+
+        let collapsed = vec!["工作.yaml".to_string(), "家务.yaml".to_string()];
+        save_completed_collapsed_in(base, Some(&collapsed)).unwrap();
+
+        // 读回
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.completed_collapsed, Some(collapsed.clone()));
+
+        // theme / completed 其它字段 / 顶层未知字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let completed = value.get("completed").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            completed.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(
+            completed
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn save_completed_collapsed_restore_default_removes_collapsed_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: light\nx-top: keep\ncompleted:\n  collapsed: [工作.yaml, 已删除.yaml]\n  x-custom: keep2\n",
+        )
+        .unwrap();
+
+        // 空数组 → 删除 collapsed（连同失效历史），保留 completed 其它字段
+        save_completed_collapsed_in(base, Some(&[])).unwrap();
+        let value = read_value(&path);
+        let completed = value.get("completed").and_then(Value::as_mapping).unwrap();
+        assert!(
+            completed.get("collapsed").is_none(),
+            "空数组应删除 collapsed"
+        );
+        assert_eq!(
+            completed.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("light"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert!(load_settings_from(base)
+            .unwrap()
+            .completed_collapsed
+            .is_none());
+
+        // None → 幂等
+        save_completed_collapsed_in(base, None).unwrap();
+        assert!(read_value(&path)
+            .get("completed")
+            .and_then(Value::as_mapping)
+            .unwrap()
+            .get("collapsed")
+            .is_none());
+    }
+
+    #[test]
+    fn save_completed_collapsed_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert!(!base.join(SETTINGS_FILE).exists());
+
+        save_completed_collapsed_in(base, Some(&["工作.yaml".to_string()])).unwrap();
+
+        assert!(base.join(SETTINGS_FILE).is_file(), "应创建 settings.yaml");
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["工作.yaml".to_string()])
+        );
+    }
+
+    #[test]
+    fn save_completed_collapsed_rejects_blank_file_name_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: dark\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            save_completed_collapsed_in(base, Some(&["工作.yaml".to_string(), "   ".to_string()]))
+                .is_err(),
+            "空白文件名应报错"
+        );
+        assert!(save_completed_collapsed_in(base, Some(&["".to_string()])).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "失败不应写盘");
+    }
+
+    #[test]
+    fn save_completed_collapsed_rejects_malformed_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: dark\ncompleted: 未知标量\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            save_completed_collapsed_in(base, Some(&["工作.yaml".to_string()])).is_err(),
+            "completed 非对象应报错"
+        );
+        assert!(
+            save_completed_collapsed_in(base, None).is_err(),
+            "恢复默认也不应覆盖未知标量"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "不应覆盖未知标量"
+        );
+    }
+
+    #[test]
+    fn save_completed_collapsed_errors_on_non_mapping_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "- not\n- a map\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(save_completed_collapsed_in(base, Some(&["工作.yaml".to_string()])).is_err());
+        assert!(save_completed_collapsed_in(base, None).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "保存失败不应写盘"
+        );
+    }
+
+    #[test]
+    fn theme_app_bar_and_completed_do_not_clobber_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // 写入折叠集合，再改主题 / 顺序 → 折叠集合保留
+        save_completed_collapsed_in(base, Some(&["工作.yaml".to_string()])).unwrap();
+        save_settings_in(base, "dark").unwrap();
+        save_app_bar_order_in(base, Some(&["pin".to_string()])).unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.app_bar_order, Some(vec!["pin".to_string()]));
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["工作.yaml".to_string()])
+        );
+
+        // 改主题 / 顺序后折叠集合仍在
+        save_settings_in(base, "light").unwrap();
+        save_app_bar_order_in(base, Some(&["refresh".to_string()])).unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "light");
+        assert_eq!(settings.app_bar_order, Some(vec!["refresh".to_string()]));
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["工作.yaml".to_string()])
+        );
+
+        // 清除折叠集合不影响 theme / app_bar
+        save_completed_collapsed_in(base, None).unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "light");
+        assert_eq!(settings.app_bar_order, Some(vec!["refresh".to_string()]));
+        assert!(settings.completed_collapsed.is_none());
     }
 }
