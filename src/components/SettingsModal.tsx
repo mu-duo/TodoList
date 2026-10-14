@@ -8,6 +8,9 @@ import type { ThemePref } from "../theme";
 type SettingsModalProps = {
   theme: ThemePref;
   onThemeChange: (theme: ThemePref) => void;
+  /** 「关闭时最小化到托盘」；null = 默认开启，false = 已关闭。 */
+  minimizeToTray: boolean | null;
+  onMinimizeToTrayChange: (next: boolean) => void;
   onClose: () => void;
   /** 应用功能栏入口（可见、按当前顺序）。 */
   appBarEntries: AppBarEntryMeta[];
@@ -40,6 +43,8 @@ const FOCUSABLE =
 export function SettingsModal({
   theme,
   onThemeChange,
+  minimizeToTray,
+  onMinimizeToTrayChange,
   onClose,
   appBarEntries,
   onAppBarReorder,
@@ -172,6 +177,23 @@ export function SettingsModal({
                 );
               })}
             </div>
+          </div>
+
+          <div className="settings-field">
+            <span className="field-label">关闭时最小化到托盘</span>
+            <label className="reminder-toggle">
+              <input
+                type="checkbox"
+                aria-label="关闭时最小化到托盘"
+                checked={minimizeToTray !== false}
+                onChange={(e) =>
+                  onMinimizeToTrayChange(e.currentTarget.checked)
+                }
+              />
+            </label>
+            <p className="settings-hint">
+              开启后，点击「关闭」将隐藏到托盘；可从托盘图标菜单显示或退出。
+            </p>
           </div>
 
           <div className="settings-field">

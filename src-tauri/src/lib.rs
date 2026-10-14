@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use agent::clock::SystemClock;
 use agent::commands::AgentRuntime;
-use tauri::{Emitter, Manager, State};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::{Action, ActionPerformed, ActionType, NotificationExt};
 
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
@@ -186,6 +188,116 @@ fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String
     storage::save_completed_collapsed_in(&base, collapsed.as_deref())
 }
 
+/// 固定托盘图标 id。
+const TRAY_ID: &str = "main";
+
+/// 按当前设置读取「关闭时最小化到托盘」开关；读取失败按默认开启（`true`）。
+fn minimize_to_tray_enabled() -> bool {
+    match storage::settings_dir() {
+        Ok(base) => match storage::load_settings_from(&base) {
+            Ok(settings) => settings.minimize_to_tray.unwrap_or(true),
+            Err(error) => {
+                eprintln!("读取设置失败，按默认开启「关闭时最小化到托盘」：{error}");
+                true
+            }
+        },
+        Err(error) => {
+            eprintln!("无法定位设置目录，按默认开启「关闭时最小化到托盘」：{error}");
+            true
+        }
+    }
+}
+
+/// 恢复并聚焦主窗口：`is_minimized` 时 `unminimize`、`!is_visible` 时 `show`，最后 `set_focus`。
+///
+/// 找不到窗口或任一步失败只记日志，绝不 panic。供托盘左键 / 菜单「显示主窗口」/ 单例唤醒共用。
+fn restore_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        eprintln!("无法恢复主窗口：未找到 main 窗口");
+        return;
+    };
+    if let Ok(true) = window.is_minimized() {
+        if let Err(error) = window.unminimize() {
+            eprintln!("取消最小化主窗口失败：{error}");
+        }
+    }
+    if let Ok(false) = window.is_visible() {
+        if let Err(error) = window.show() {
+            eprintln!("显示主窗口失败：{error}");
+        }
+    }
+    if let Err(error) = window.set_focus() {
+        eprintln!("聚焦主窗口失败：{error}");
+    }
+}
+
+/// 按需创建固定 id 的托盘图标（已存在则不改动）。
+///
+/// 图标为默认窗口图标；右键菜单「显示主窗口」「退出」；左键单击恢复主窗口。
+/// 失败只记日志，不影响调用方（启动 / 设置切换）。
+fn ensure_tray(app: &AppHandle) {
+    if app.tray_by_id(TRAY_ID).is_some() {
+        return;
+    }
+
+    let menu = match MenuBuilder::new(app)
+        .text("show", "显示主窗口")
+        .text("quit", "退出")
+        .build()
+    {
+        Ok(menu) => menu,
+        Err(error) => {
+            eprintln!("创建托盘菜单失败：{error}");
+            return;
+        }
+    };
+
+    // 兜底：仅当 `default_window_icon()` 返回 None 时用 1x1 全透明图（Image 未实现 Default）。
+    // 该分支在 Windows 上实际不可达——应用始终带默认窗口图标；`icon()` 仅在转换失败时丢弃，
+    // 一张合法的全透明图会被接受，结果是图标不可见。
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .unwrap_or_else(|| tauri::image::Image::new(&[0, 0, 0, 0], 1, 1));
+
+    // 注意：菜单事件处理器由 builder 级 `on_menu_event` 一次性注册（见 `run`），
+    // 此处**不得**再调 `TrayIconBuilder::on_menu_event`——它每次 build 都会向全局菜单
+    // 监听表追加闭包，而 `remove_tray_by_id` 不会移除，导致开关循环后重复触发。
+    let result = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon)
+        .tooltip("TodoList")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                restore_main_window(tray.app_handle());
+            }
+        })
+        .build(app);
+
+    if let Err(error) = result {
+        eprintln!("创建托盘图标失败：{error}");
+    }
+}
+
+/// 保存「关闭时最小化到托盘」设置并即时同步托盘：开启按需创建、关闭移除。
+#[tauri::command]
+fn save_minimize_to_tray(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_minimize_to_tray_in(&base, enabled)?;
+    if enabled {
+        ensure_tray(&app);
+    } else {
+        app.remove_tray_by_id(TRAY_ID);
+    }
+    Ok(())
+}
+
 /// 处理提醒通知上的动作：`remind-off`（不再提醒）与 `tap`（前置窗口）。
 ///
 /// 运行于插件的通知线程：只记日志、不向用户抛错；刷新提醒快照走
@@ -227,10 +339,7 @@ fn handle_reminder_action(app: &tauri::AppHandle, performed: &ActionPerformed) {
             }
         }
         "tap" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            restore_main_window(app);
         }
         _ => {}
     }
@@ -239,11 +348,9 @@ fn handle_reminder_action(app: &tauri::AppHandle, performed: &ActionPerformed) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // 单实例须最先注册：第二实例聚焦既有窗口，不唤醒 / 不托盘。
+        // 单实例须最先注册：第二实例恢复并前置既有实例（隐藏 / 最小化状态均唤醒）。
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-            }
+            restore_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -308,7 +415,33 @@ pub fn run() {
                 app.manage(runtime.clone());
                 runtime.spawn_worker(app.handle().clone());
             }
+            // 启动时按设置创建托盘（默认开启）；读取失败按默认开启，绝不阻断启动。
+            if minimize_to_tray_enabled() {
+                ensure_tray(app.handle());
+            }
             Ok(())
+        })
+        // 关闭拦截：设置开启时点「关闭」隐藏到托盘、进程保活；关闭时不拦截（现状退出）。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                // 托盘缺失时不隐藏（避免没有可用的恢复入口）；直接按现状退出。
+                if minimize_to_tray_enabled() && window.app_handle().tray_by_id(TRAY_ID).is_some() {
+                    api.prevent_close();
+                    if let Err(error) = window.hide() {
+                        eprintln!("隐藏主窗口到托盘失败：{error}");
+                    }
+                }
+            }
+        })
+        // 托盘菜单事件：一次性注册到全局菜单监听表（不随托盘重建重复注册）。
+        // 「显示主窗口」恢复并前置主窗口；「退出」真正退出进程。
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => restore_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             load_lists,
@@ -332,6 +465,7 @@ pub fn run() {
             save_settings,
             save_app_bar_order,
             save_completed_collapsed,
+            save_minimize_to_tray,
             agent::commands::agent_load_config,
             agent::commands::agent_save_config,
             agent::commands::agent_set_key,

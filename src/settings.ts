@@ -9,6 +9,8 @@ export type AppSettings = {
   appBarOrder: string[] | null;
   /** 「已完成」视图折叠的清单文件名集合；null = 默认全展开（字段缺失 / 为空 / 非法）。 */
   completedCollapsed: string[] | null;
+  /** 「关闭时最小化到托盘」；null = 默认开启（字段缺失 / 非法），false = 已关闭。 */
+  minimizeToTray: boolean | null;
 };
 
 /**
@@ -21,13 +23,24 @@ export async function loadSettings(): Promise<AppSettings> {
       theme?: unknown;
       app_bar_order?: unknown;
       completed_collapsed?: unknown;
+      minimize_to_tray?: unknown;
     }>("load_settings");
     return {
       theme: isThemePref(raw?.theme) ? raw.theme : "system",
       appBarOrder: sanitizeAppBarOrder(raw?.app_bar_order),
       completedCollapsed: sanitizeCompletedCollapsed(raw?.completed_collapsed),
+      // 仅接受真正的布尔；缺失 / 非法 → null（= 默认开启）
+      minimizeToTray:
+        typeof raw?.minimize_to_tray === "boolean"
+          ? raw.minimize_to_tray
+          : null,
     };
   } catch {
-    return { theme: "system", appBarOrder: null, completedCollapsed: null };
+    return {
+      theme: "system",
+      appBarOrder: null,
+      completedCollapsed: null,
+      minimizeToTray: null,
+    };
   }
 }

@@ -48,6 +48,9 @@ pub struct Settings {
     /// 「已完成」视图折叠的清单文件名集合（本机偏好）；缺失 / 空 / 非法 → `None`（默认全部展开）。
     #[serde(default)]
     pub completed_collapsed: Option<Vec<String>>,
+    /// 「关闭时最小化到托盘」（本机偏好）；缺失 / 非法 → `None`（默认开启）。
+    #[serde(default)]
+    pub minimize_to_tray: Option<bool>,
 }
 
 /// 加载结果：成功解析的清单 + 被跳过的文件告警。
@@ -204,6 +207,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         theme: DEFAULT_THEME.to_string(),
         app_bar_order: None,
         completed_collapsed: None,
+        minimize_to_tray: None,
     };
     let path = base.join(SETTINGS_FILE);
     if !path.is_file() {
@@ -226,6 +230,8 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         theme,
         app_bar_order: parse_app_bar_order(&value),
         completed_collapsed: parse_completed_collapsed(&value),
+        // 缺失 / 非布尔 → None（默认开启）；字面 false → Some(false)（已关闭）。
+        minimize_to_tray: value.get("minimize_to_tray").and_then(Value::as_bool),
     })
 }
 
@@ -411,6 +417,35 @@ pub fn save_completed_collapsed_in(
                 completed.remove("collapsed");
             }
         }
+    }
+
+    write_list(&path, &value)
+}
+
+/// 写入 / 清除 `minimize_to_tray`（`true` → 删除键以恢复默认：关闭时最小化到托盘）。
+///
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `minimize_to_tray`** → 原子写，
+/// 保留 `theme`、`app_bar`、`completed` 及所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// `false` → 写 `minimize_to_tray: false`（关闭）；`true` → 删除键（恢复默认开启）。
+pub fn save_minimize_to_tray_in(base: &Path, enabled: bool) -> Result<(), String> {
+    fs::create_dir_all(base).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let path = base.join(SETTINGS_FILE);
+
+    let mut value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("读取设置文件失败：{e}"))?;
+        yaml_serde::from_str(&text).map_err(|e| format!("解析设置文件失败：{e}"))?
+    } else {
+        Value::Mapping(Mapping::new())
+    };
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+
+    if enabled {
+        root.remove("minimize_to_tray");
+    } else {
+        root.insert(key("minimize_to_tray"), Value::Bool(false));
     }
 
     write_list(&path, &value)
@@ -3236,5 +3271,106 @@ tasks:
         assert_eq!(settings.theme, "light");
         assert_eq!(settings.app_bar_order, Some(vec!["refresh".to_string()]));
         assert!(settings.completed_collapsed.is_none());
+    }
+
+    #[test]
+    fn load_settings_default_minimize_to_tray_is_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let settings = load_settings_from(base).unwrap();
+        assert!(
+            settings.minimize_to_tray.is_none(),
+            "缺失文件时 minimize_to_tray 应为 None（默认开启）"
+        );
+        assert!(
+            !base.join(SETTINGS_FILE).exists(),
+            "读取不应创建 settings.yaml"
+        );
+
+        // 缺失键 / 非布尔值 → None
+        for text in ["theme: system\n", "theme: system\nminimize_to_tray: maybe\n"] {
+            fs::write(base.join(SETTINGS_FILE), text).unwrap();
+            assert!(
+                load_settings_from(base).unwrap().minimize_to_tray.is_none(),
+                "缺失 / 非法应回退 None：{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_minimize_to_tray_false_roundtrips_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: dark\nx-top: keep\napp_bar:\n  order: [pin]\n").unwrap();
+
+        save_minimize_to_tray_in(base, false).unwrap();
+
+        // 读回 false
+        assert_eq!(load_settings_from(base).unwrap().minimize_to_tray, Some(false));
+        let value = read_value(&path);
+        assert_eq!(
+            value.get("minimize_to_tray").and_then(Value::as_bool),
+            Some(false)
+        );
+        // 其它设置与未知字段保留
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert_eq!(
+            value
+                .get("app_bar")
+                .and_then(|app_bar| app_bar.get("order"))
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn save_minimize_to_tray_true_removes_key_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: light\nx-top: keep\nminimize_to_tray: false\ncompleted:\n  x-custom: keep2\n",
+        )
+        .unwrap();
+
+        save_minimize_to_tray_in(base, true).unwrap();
+
+        let value = read_value(&path);
+        assert!(
+            value.get("minimize_to_tray").is_none(),
+            "开启应删除键以恢复默认"
+        );
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("light"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert_eq!(
+            value
+                .get("completed")
+                .and_then(|completed| completed.get("x-custom"))
+                .and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert!(
+            load_settings_from(base).unwrap().minimize_to_tray.is_none(),
+            "删键后读回 None（默认开启）"
+        );
+    }
+
+    #[test]
+    fn save_minimize_to_tray_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert!(!base.join(SETTINGS_FILE).exists());
+
+        save_minimize_to_tray_in(base, false).unwrap();
+
+        assert!(base.join(SETTINGS_FILE).is_file(), "应创建 settings.yaml");
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert_eq!(settings.minimize_to_tray, Some(false));
     }
 }

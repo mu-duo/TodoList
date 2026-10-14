@@ -71,6 +71,7 @@ Get-FileHash .\TodoList_<版本>_x64-setup.exe -Algorithm SHA256
 - 安装器会进"维护页"：**默认选中「Uninstall before installing」**（先跑旧卸载器再装新版）；也可选「**Do not uninstall**」＝**原地覆盖**。两者都能升级成功，推荐后者（更快、少一次卸载）。
 - ⚠️ **旧卸载器那页有个「Delete the application data」勾选框**：勾了会 `RmDir /r` 掉 `%APPDATA%\com.lftan.todolist`，而**主题偏好**就存在那里 → 会丢（重设一次即可）。**任务数据在 `文档\TodoList`，不受影响。**
 - 安装时若应用**正在运行**，安装器会**自动检测并提示关闭**（Restart Manager），取消则中止安装——内置行为，无需配置。
+- ⚠️ **托盘态先退出**：「关闭时最小化到托盘」开启（默认）时，点窗口关闭只是**隐藏到托盘**、进程仍在运行。安装器提示应用未关闭时，请从**托盘图标菜单「退出」**真正退出（或先在设置中关闭该开关再关窗口），然后继续安装。
 - **不支持降级**（`bundle.windows.allowDowngrades: false`）：用旧版包覆盖已装的新版会被拦。
 - 跨版本务必保持 `identifier` / `productName` / `installMode` 不变，否则安装器检测不到旧安装，可能在机器上留下两份。
 

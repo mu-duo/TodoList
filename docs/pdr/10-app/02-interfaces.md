@@ -150,6 +150,31 @@ completed:
 - 该字段与 `theme`、`app_bar.order` **互不覆盖**（三者各自 Value 级补丁）。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
+### 5.2 「关闭时最小化到托盘」偏好（minimize_to_tray）
+
+> **状态（2026-10-14）：已实现（1.7.0，用户验收通过 2026-10-14）**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+> 功能定位见 [01-spec.md](01-spec.md) §5（FR-APP-14 **部分实现**）；窗口生命周期与托盘交互行为契约见下；验证见 [04-current.md](04-current.md)。
+
+「关闭时最小化到托盘」是**本机偏好**，存现有应用配置 `settings.yaml`（**不写清单、不进数据目录**）。实际字段：
+
+```yaml
+theme: system                 # 现有
+minimize_to_tray: false       # 可选；缺省＝开启（默认）；false＝关闭
+```
+
+**接口（Tauri 命令）**：
+
+- `load_settings()` 增 `minimize_to_tray: bool | null`，取自同名字段；缺失 / 非布尔 → `null`（= 默认开启）。
+- `save_minimize_to_tray({ enabled: bool })`：Value 级补丁**仅改 `minimize_to_tray`**（保留 `theme`、`app_bar`、`completed` 及全部未知字段，不做整份覆盖）；`enabled: false` → 写 `minimize_to_tray: false`；`enabled: true` → **删除该键**（恢复默认开启）。
+
+**行为契约（托盘逻辑全部 Rust 侧，不占前端能力面）**：
+
+- **关闭拦截**：仅主窗口；设置开启（缺省）且**托盘实际存在**时，`CloseRequested` → `prevent_close()` + 隐藏到托盘（任务栏同步消失、进程保活）；设置关闭或托盘缺失时不拦截（按现状退出）。**最小化不受影响**（始终回任务栏）。
+- **托盘**：启动时按设置创建（默认开启；失败只记日志）；`save_minimize_to_tray` 即时同步（开→按需创建，关→移除）。图标＝默认窗口图标，tooltip `TodoList`；左键单击＝恢复并聚焦主窗口（`unminimize → show → set_focus` 带守卫）；右键菜单＝「显示主窗口」「退出」（`app.exit(0)`，不经 `CloseRequested`，必为真退出）。
+- **单例唤醒**：第二实例回调＝同一恢复逻辑（隐藏 / 最小化状态均恢复并前置；单例插件代递 `AllowSetForegroundWindow`）。
+- **系统关机 / 注销不拦截**（tao 直接退出，不经本拦截）。
+- **已知边界**：安装器 Restart Manager 提示关闭时，托盘态需先从托盘菜单「退出」再继续（见 `docs/RELEASE.md`）。
+
 ## 6. Agent 协助（**已实现（Phase1+Phase2），待验证**）
 
 > **状态（2026-10-12）：已实现**（Phase 1 + Phase 2；后端 **117 个 Rust 测试**、前端纯逻辑断言、`pnpm build` 通过）——契约按 architecture.md（含父会话修正）落地；**已通过隔离集成复验（假 provider、零真实网络）并经用户验收通过；真实 DeepSeek 联网仍未实测**（见 §6.6）。

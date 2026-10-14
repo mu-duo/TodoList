@@ -138,6 +138,8 @@ function App() {
   // 设置面板（模态）与主题偏好
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>("system");
+  // 「关闭时最小化到托盘」；null = 默认开启
+  const [minimizeToTray, setMinimizeToTray] = useState<boolean | null>(null);
   // Agent 配置模态（Phase 1）
   const [agentConfigOpen, setAgentConfigOpen] = useState(false);
 
@@ -900,9 +902,11 @@ function App() {
         theme: pref,
         appBarOrder: order,
         completedCollapsed: collapsed,
+        minimizeToTray: trayPref,
       } = await loadSettings();
       if (cancelled) return;
       setTheme(pref);
+      setMinimizeToTray(trayPref);
       setAppBarSaved(order);
       setAppBarOrder(resolveAppBarOrder(order));
       const initialCollapsed = collapsed ?? [];
@@ -1386,6 +1390,19 @@ function App() {
       }
       try {
         await invoke("save_settings", { theme: next });
+      } catch (e) {
+        setActionError(String(e));
+      }
+    })();
+  }
+
+  // 切换「关闭时最小化到托盘」：乐观更新（开启＝null 恢复默认，关闭＝false）；失败记入 actionError（不回滚）
+  function changeMinimizeToTray(next: boolean) {
+    setMinimizeToTray(next ? null : false);
+    void (async () => {
+      setActionError(null);
+      try {
+        await invoke("save_minimize_to_tray", { enabled: next });
       } catch (e) {
         setActionError(String(e));
       }
@@ -2705,6 +2722,8 @@ function App() {
         <SettingsModal
           theme={theme}
           onThemeChange={changeTheme}
+          minimizeToTray={minimizeToTray}
+          onMinimizeToTrayChange={changeMinimizeToTray}
           onClose={() => setSettingsOpen(false)}
           appBarEntries={appBarEntries}
           onAppBarReorder={reorderAppBar}
