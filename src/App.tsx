@@ -250,6 +250,18 @@ function App() {
   const editingSubtaskIdRef = useRef<string | null>(null);
   editingSubtaskIdRef.current = editingSubtaskId;
 
+  // 任务内容行内编辑（双击 / 右键「编辑」）：正在编辑的任务 id、草稿、输入框、防双提交
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [taskEditDraft, setTaskEditDraft] = useState("");
+  const taskEditRef = useRef<HTMLInputElement>(null);
+  // 本轮编辑是否已被处理（Enter/Esc/失焦只认一次，避免错误二次提交）
+  const taskEditHandledRef = useRef(false);
+  // 最新编辑 id 的镜像：异步收尾时判断是否已切走
+  const editingTaskIdRef = useRef<string | null>(null);
+  editingTaskIdRef.current = editingTaskId;
+  // 行内编辑来源清单（提交时用；仅事件读写，不触发渲染）
+  const editingTaskListFileRef = useRef<string | null>(null);
+
   const [editingListFile, setEditingListFile] = useState<string | null>(null);
   const [editListName, setEditListName] = useState("");
 
@@ -362,6 +374,18 @@ function App() {
       }
     }
   }, [editingSubtaskId]);
+
+  // 任务行内编辑框出现即聚焦，光标置尾（不全选；与子任务的有意差异）
+  useEffect(() => {
+    if (editingTaskId) {
+      const el = taskEditRef.current;
+      if (el) {
+        el.focus();
+        const len = el.value.length;
+        el.setSelectionRange(len, len);
+      }
+    }
+  }, [editingTaskId]);
 
   const listIds = useMemo(() => lists.map((l) => l.file), [lists]);
   const taskIds = useMemo(() => viewTasks.map((e) => e.task.id), [viewTasks]);
@@ -834,6 +858,11 @@ function App() {
         key: "open",
         label: "打开详情",
         onSelect: () => openTask(task.id),
+      },
+      {
+        key: "edit",
+        label: "编辑",
+        onSelect: () => startEditTask(entry),
       },
       {
         key: "toggle-done",
@@ -1558,6 +1587,22 @@ function App() {
     );
   }
 
+  // 任务行内改名成功后就地更新列表里的对应 task（保持单一 state 源）
+  function applyTaskTitle(listFile: string, taskId: string, title: string) {
+    setLists((prev) =>
+      prev.map((list) =>
+        list.file === listFile
+          ? {
+              ...list,
+              tasks: list.tasks.map((t) =>
+                t.id === taskId ? { ...t, title } : t,
+              ),
+            }
+          : list,
+      ),
+    );
+  }
+
   // 子任务错误同样去重/节流，避免连点刷屏；与标题/备注通道互不干扰
   function reportSubtaskError(message: string) {
     if (lastSubtaskErrorRef.current === message) return;
@@ -1715,6 +1760,84 @@ function App() {
   // 取消改名（Esc）：还原、不调命令
   function cancelSubtaskEdit() {
     finishSubtaskEdit();
+  }
+
+  // ---- 任务内容行内编辑（双击内容区 / 右键「编辑」；即时写盘，无防抖）----
+
+  // 进入编辑态：预填原值；已在编辑同一任务 → 仅聚焦现有输入
+  function startEditTask(entry: ViewTask) {
+    const { task, listFile } = entry;
+    if (!task.id) return;
+    if (editingTaskIdRef.current === task.id) {
+      taskEditRef.current?.focus();
+      return;
+    }
+    taskEditHandledRef.current = false;
+    editingTaskListFileRef.current = listFile;
+    setEditingTaskId(task.id);
+    setTaskEditDraft(task.title ?? "");
+  }
+
+  // 退出编辑态（不改本地值）
+  function finishTaskEdit() {
+    taskEditHandledRef.current = true;
+    setEditingTaskId(null);
+    setTaskEditDraft("");
+    editingTaskListFileRef.current = null;
+  }
+
+  // 提交改名：空 / 未改动 → 视为取消；否则落盘后乐观更新本地
+  async function commitTaskEdit() {
+    if (taskEditHandledRef.current) return;
+    const id = editingTaskId;
+    const listFile = editingTaskListFileRef.current;
+    if (!id || !listFile) {
+      finishTaskEdit();
+      return;
+    }
+    const title = taskEditDraft.trim();
+    const task = lists
+      .find((l) => l.file === listFile)
+      ?.tasks.find((t) => t.id === id);
+    // 空标题 → 还原退出；与当前 title 一致 → 无操作退出（不调命令）
+    if (!task || !title || (task.title ?? "").trim() === title) {
+      if (editingTaskIdRef.current === id) finishTaskEdit();
+      return;
+    }
+    // 详情是否正显示同一任务（提交前捕获，成功后同步草稿，避免旧值回写）
+    const detailShowsSame =
+      selectedTaskIdRef.current === id && selectedTaskListFile === listFile;
+    taskEditHandledRef.current = true; // 先占位，避免失焦再次提交
+    try {
+      await invoke("update_task", {
+        listFile,
+        taskId: id,
+        title,
+        notes: task.notes ?? "",
+      });
+      applyTaskTitle(listFile, id, title);
+      if (detailShowsSame) {
+        // 应用时再核验：期间切走任务 / 用户已改详情草稿 → 不同步
+        if (
+          selectedTaskIdRef.current === id &&
+          editTitleRef.current.trim() === (task.title ?? "").trim()
+        ) {
+          editTitleRef.current = title;
+          setEditTitle(title);
+        }
+      }
+      lastSaveErrorRef.current = null;
+    } catch (e) {
+      reportSaveError(String(e)); // 失败：退出编辑态、保留原值
+    } finally {
+      // 若期间已切到别的任务编辑，别把对方的编辑态关掉
+      if (editingTaskIdRef.current === id) finishTaskEdit();
+    }
+  }
+
+  // 取消改名（Esc）：还原、不调命令；紧接的失焦不再提交（handled ref）
+  function cancelTaskEdit() {
+    finishTaskEdit();
   }
 
   // 详情激活时的 Esc：关闭详情（只在有选中任务时绑定，不劫持全局）
@@ -1935,29 +2058,60 @@ function App() {
           onPointerDown={(e) => e.stopPropagation()}
           onChange={(e) => toggle(entry.listFile, task, e.currentTarget.checked)}
         />
-        <button
-          type="button"
-          className="task-open"
-          ref={activatorRef}
-          onClick={(e) => openTask(task.id, e.detail === 0)}
-          disabled={!task.id}
-          title="查看详情"
-        >
-          <span className={`task-title${isDone ? " done" : ""}`}>
-            {task.title || "(无标题)"}
-          </span>
-          {(task.priority || task.due || showSource) && (
-            <span className="task-meta-row">
-              {showSource && <span className="meta">来自 {entry.listName}</span>}
-              {task.priority && (
-                <span className="meta">
-                  优先级 {PRIORITY_LABEL[task.priority] ?? task.priority}
-                </span>
-              )}
-              {task.due && <span className="meta">截止 {task.due}</span>}
+        {editingTaskId === task.id ? (
+          <input
+            ref={taskEditRef}
+            className="task-edit"
+            value={taskEditDraft}
+            placeholder="任务…"
+            aria-label="编辑任务"
+            onChange={(e) => setTaskEditDraft(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              // IME 组合态一律不触发
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)
+                return;
+              if (e.key === "Enter") {
+                e.preventDefault();
+                e.stopPropagation();
+                void commitTaskEdit();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                cancelTaskEdit();
+              }
+            }}
+            onBlur={() => void commitTaskEdit()}
+          />
+        ) : (
+          <button
+            type="button"
+            className="task-open"
+            ref={activatorRef}
+            onClick={(e) => openTask(task.id, e.detail === 0)}
+            onDoubleClick={() => {
+              if (!isNarrow && !suppressClickRef.current) startEditTask(entry);
+            }}
+            disabled={!task.id}
+            title="查看详情"
+          >
+            <span className={`task-title${isDone ? " done" : ""}`}>
+              {task.title || "(无标题)"}
             </span>
-          )}
-        </button>
+            {(task.priority || task.due || showSource) && (
+              <span className="task-meta-row">
+                {showSource && (
+                  <span className="meta">来自 {entry.listName}</span>
+                )}
+                {task.priority && (
+                  <span className="meta">
+                    优先级 {PRIORITY_LABEL[task.priority] ?? task.priority}
+                  </span>
+                )}
+                {task.due && <span className="meta">截止 {task.due}</span>}
+              </span>
+            )}
+          </button>
+        )}
         <div className="task-actions">
           {badgeState && (
             <button
@@ -2555,6 +2709,7 @@ function App() {
                       ids={taskIds}
                       axis="vertical"
                       rowClassName={(id) => taskRowClass(entryById.get(id)!)}
+                      itemDisabled={(id) => editingTaskId === id}
                       renderItem={(id, activatorRef) =>
                         renderTaskCard(entryById.get(id)!, activatorRef)
                       }

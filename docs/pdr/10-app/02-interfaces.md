@@ -77,6 +77,10 @@ tasks:
 - **容错**：单个清单文件损坏 / 解析失败不影响其它清单展示（跳过并在界面提示，需自行修复该文件）。根节点必须为 mapping，必需字段 `tasks` 必须为 sequence；非法任务项会产生 warning。目录迭代或单文件读取错误同样告警。任何 warning 都表示提醒快照不完整：提醒全局 fail closed 暂停，不更新 / 清理 status checkpoint，不发送；修复后完整 `load_lists` 刷新恢复。硬读取错误会先等待 worker 确认暂停，再向 UI 返回错误。
 - **备份**：v1 无内置备份；建议数据目录纳入 git / 网盘。
 
+### 任务保存命令（详情即时保存与任务行内编辑共用）
+
+- `update_task({ listFile, taskId, title, notes }) -> void`：`title` trim 后非空（空标题报「任务标题不能为空」，不写盘）；`notes` trim 后为空 → 删除 `notes` 键；保存为最新 YAML 上的目标字段 Value 级补丁并原子写（未知字段保留）。前端两条入口共用：详情面板（400ms 防抖 + 失焦 / Enter / Esc flush）与任务行内编辑（Enter / 失焦即时提交，Esc 取消，空 / 纯空白还原原值；2026-10-14，1.7.0 已验收）。
+
 ### 任务详情元数据命令
 
 - `update_task_metadata({ listFile, taskId, patch }) -> void`：patch 使用 camelCase 可选字段 `priority?: "high" | "medium" | "low" | null`、`due?: string | null`、`tags?: string[]`、`reminder?: false | null`。字段缺省不修改，显式 `null` 清除（`reminder: null` 删除开关键＝恢复默认提醒）；`reminder: false` 写入关闭（无 due 时报错不写）；空 tags 清除。`due` 只接受本地 `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`，无时区转换。保存为最新 YAML 上的目标字段 Value 级补丁并原子写。

@@ -640,6 +640,14 @@ button:focus-visible {
   outline: none;
 }
 
+/* 行内编辑输入框（双击内容区 / 右键「编辑」进入；编辑态下内容槽位只留输入框） */
+.task-edit {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  font-size: 0.9rem;
+}
+
 .task-title {
   display: block;
   line-height: 1.5;
