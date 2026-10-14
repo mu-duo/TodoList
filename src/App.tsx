@@ -228,8 +228,7 @@ function App() {
   // ---- 子任务编辑（独立即时写盘通道，无防抖）----
   // 本地镜像：增 / 删 / 勾选成功后按命令返回值就地更新，不做整表刷新
   const [subtasks, setSubtasks] = useState<Subtask[]>([]);
-  // 就地录入框的开启态与草稿（失焦保留、关详情丢弃）
-  const [subtaskDraftOpen, setSubtaskDraftOpen] = useState(false);
+  // 就地录入框常存的草稿（失焦保留、关详情 / 切任务丢弃）
   const [subtaskDraft, setSubtaskDraft] = useState("");
   // 正在等待落盘的子任务 id（禁用重复触发 + 视觉降透明度）
   const [subtaskBusyIds, setSubtaskBusyIds] = useState<Set<string>>(new Set());
@@ -339,7 +338,6 @@ function App() {
   const selectedSubtasksKey = JSON.stringify(selectedTask?.subtasks ?? null);
   // 切换任务：重置录入草稿与改名编辑态（仅在换任务时，避免本地改动子任务时误清空）
   useEffect(() => {
-    setSubtaskDraftOpen(false);
     setSubtaskDraft("");
     setEditingSubtaskId(null);
     setSubtaskEditDraft("");
@@ -351,11 +349,6 @@ function App() {
     setSubtasks(selectedTask?.subtasks ?? []);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTaskId, selectedSubtasksKey]);
-
-  // 录入框出现即聚焦（含连续录入时保持聚焦）
-  useEffect(() => {
-    if (subtaskDraftOpen) subtaskInputRef.current?.focus();
-  }, [subtaskDraftOpen]);
 
   // 改名框出现即聚焦并全选（双击进入编辑态）
   useEffect(() => {
@@ -1487,7 +1480,6 @@ function App() {
   function closeDetail() {
     flushPendingSave();
     if (editTitleRef.current.trim() === "") backfillFromDisk();
-    setSubtaskDraftOpen(false);
     setSubtaskDraft("");
     subtaskEditHandledRef.current = true;
     setEditingSubtaskId(null);
@@ -1563,22 +1555,9 @@ function App() {
     setSubtaskBusyIds(new Set(set));
   }
 
-  function openSubtaskDraft() {
-    setSubtaskDraftOpen(true);
-  }
-
-  // 关闭录入框并丢弃未提交草稿（空回车 / Esc / 关详情）
-  function discardSubtaskDraft() {
-    setSubtaskDraftOpen(false);
-    setSubtaskDraft("");
-  }
-
   async function addSubtask() {
     const title = subtaskDraft.trim();
-    if (!title) {
-      discardSubtaskDraft();
-      return;
-    }
+    if (!title) return;
     if (!selectedTask || !selectedTaskListFile) return;
     if (addSubtaskPendingRef.current) return;
     addSubtaskPendingRef.current = true;
@@ -2161,15 +2140,6 @@ function App() {
         <div className="subtask-block">
           <div className="subtask-head">
             <span className="field-label">子任务 · {subtasks.length}</span>
-            <button
-              type="button"
-              className="subtask-add"
-              onClick={openSubtaskDraft}
-              aria-label="添加子任务"
-              title="添加子任务"
-            >
-              +
-            </button>
           </div>
 
           {subtasks.length > 0 && (
@@ -2251,36 +2221,36 @@ function App() {
             </ul>
           )}
 
-          {subtaskDraftOpen && (
-            <input
-              ref={subtaskInputRef}
-              className="subtask-input"
-              value={subtaskDraft}
-              placeholder="子任务…"
-              onChange={(e) => setSubtaskDraft(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                // IME 组合态一律不触发
-                if (
-                  e.nativeEvent.isComposing ||
-                  e.nativeEvent.keyCode === 229
-                )
-                  return;
-                if (e.key === "Enter") {
-                  // 隔离：不得冒泡触发详情面板的全局行为
-                  e.preventDefault();
-                  e.stopPropagation();
-                  void addSubtask();
-                } else if (e.key === "Escape") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  discardSubtaskDraft();
-                }
-              }}
-              onBlur={() => {
-                /* 失焦不落盘、保留草稿 */
-              }}
-            />
-          )}
+          <input
+            ref={subtaskInputRef}
+            className="subtask-input"
+            value={subtaskDraft}
+            placeholder="新增子任务…"
+            aria-label="新增子任务"
+            onChange={(e) => setSubtaskDraft(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              // IME 组合态一律不触发
+              if (
+                e.nativeEvent.isComposing ||
+                e.nativeEvent.keyCode === 229
+              )
+                return;
+              if (e.key === "Enter") {
+                // 隔离：不得冒泡触发详情面板的全局行为
+                e.preventDefault();
+                e.stopPropagation();
+                void addSubtask();
+              } else if (e.key === "Escape") {
+                // 仅清空草稿，输入框常存且保持焦点，不关详情
+                e.preventDefault();
+                e.stopPropagation();
+                setSubtaskDraft("");
+              }
+            }}
+            onBlur={() => {
+              /* 失焦不落盘、保留草稿 */
+            }}
+          />
         </div>
 
         <label className="field">

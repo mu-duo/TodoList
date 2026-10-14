@@ -1101,28 +1101,6 @@ button:focus-visible {
   gap: 8px;
 }
 
-/* 板块内的「+」录入入口 */
-.subtask-add {
-  flex: none;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.05rem;
-  line-height: 1;
-  color: var(--accent);
-  background: transparent;
-  border-color: transparent;
-}
-
-.subtask-add:hover:not(:disabled) {
-  color: var(--accent-strong);
-  background: var(--accent-soft);
-  border-color: transparent;
-}
-
 .subtask-list {
   list-style: none;
   margin: 0;
