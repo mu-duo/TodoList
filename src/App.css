@@ -1491,17 +1491,24 @@ button:focus-visible {
   width: 120px;
 }
 
+/* 等宽字体输入（模型 id / 端点地址）；不改变字号与文字色 */
+.agent-input--mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+}
+
 .agent-key-row,
 .agent-path-row {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .agent-key-row .agent-input,
 .agent-path-row .agent-path {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  width: auto;
   min-width: 0;
 }
 
@@ -1616,6 +1623,262 @@ button:focus-visible {
   margin-bottom: 10px;
 }
 
+/* ------------------------- Agent 配置模态：多 Provider 配置区（细节切片） ---- */
+
+/* 字段标题行复用 `.agent-field-head`（见「Agent 任务 UI」段）：label + 右侧徽标 / 动作 */
+
+.agent-field-head .field-label {
+  flex: none;
+}
+
+.agent-field-spacer {
+  flex: 1 1 auto;
+}
+
+/* 能力 / 协议徽标：文字 + 边框，不靠颜色单独表意 */
+.agent-chip {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  line-height: 1.7;
+  color: var(--text-muted);
+  background: transparent;
+  white-space: nowrap;
+}
+
+.agent-chip--ok {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.agent-label-note {
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+/* 轻提示：非阻断的降级 / 风险说明（沿用既有 warning 的琥珀色系） */
+.agent-caution {
+  margin: 0;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: #8a5a00;
+  background: #fff8e6;
+  border: 1px solid #f3e2b8;
+  border-radius: var(--radius-control);
+}
+
+/* 统一 select 观感（此前为浏览器默认样式）；箭头用 CSS 绘制以适配主题 */
+.agent-select-wrap {
+  position: relative;
+}
+
+.agent-select-wrap::after {
+  content: "";
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -5px;
+  border-right: 1.5px solid var(--text-faint);
+  border-bottom: 1.5px solid var(--text-faint);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.agent-select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 30px 8px 11px;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: border-color var(--ease), box-shadow var(--ease);
+}
+
+.agent-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.agent-select:disabled {
+  color: var(--text-faint);
+  background: var(--surface-muted);
+  cursor: not-allowed;
+}
+
+.agent-select option {
+  color: var(--text);
+  background: var(--surface);
+}
+
+/* 自定义端点展开：轻微入场，避免突兀 */
+.agent-reveal {
+  animation: agent-reveal 160ms ease;
+}
+
+@keyframes agent-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 刷新按钮 + 图标 */
+.agent-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent-refresh-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.agent-refresh.is-busy .agent-refresh-icon {
+  animation: agent-spin 0.9s linear infinite;
+}
+
+@keyframes agent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 可编辑模型组合框（输入 + 候选下拉） */
+.combo {
+  position: relative;
+}
+
+.combo-control {
+  position: relative;
+}
+
+.combo-control .agent-input {
+  padding-right: 30px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+}
+
+.combo-caret {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -5px;
+  border-right: 1.5px solid var(--text-faint);
+  border-bottom: 1.5px solid var(--text-faint);
+  transform: rotate(45deg);
+  pointer-events: none;
+  transition: transform var(--ease);
+}
+
+.combo.is-open .combo-caret {
+  margin-top: -1px;
+  transform: rotate(-135deg);
+}
+
+.combo-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 5;
+  max-height: 208px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  box-shadow: var(--shadow-md);
+  animation: combo-in 120ms ease;
+}
+
+@keyframes combo-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.combo-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.combo-opt.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.combo-opt[aria-disabled="true"] {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.combo-opt[aria-disabled="true"].is-active {
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.combo-opt-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 0.82rem;
+}
+
+.combo-opt-proto {
+  flex: none;
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
+.combo-opt-tag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
+.combo-empty {
+  padding: 8px;
+  font-size: 0.82rem;
+  color: var(--text-faint);
+}
+
 /* ---------------------------------------------- Agent 任务 UI（Phase 2） ---- */
 
 /* 从别处跳转进 Agent 配置模态时的引导横幅 */
@@ -1701,6 +1964,7 @@ button:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .agent-path-list {
@@ -2194,6 +2458,12 @@ button:focus-visible {
   }
 
   .warning {
+    color: #f2c66d;
+    background: #33290f;
+    border-color: #57471c;
+  }
+
+  .agent-caution {
     color: #f2c66d;
     background: #33290f;
     border-color: #57471c;

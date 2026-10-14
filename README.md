@@ -45,7 +45,7 @@ pnpm tauri dev      # 首次编译较慢
 - 子任务：在详情面板内增 / 删 / 勾选 / 双击改名（一层，独立完成状态）；任务行尾显示 `已完成/总数`，悬停换成删除按钮
 - 设置：齿轮按钮 → 主题（亮 / 暗 / 跟随系统）与应用功能栏顺序（拖拽 / 上移 / 下移 / 恢复默认），偏好本地持久化
 - 应用功能栏：宽屏为最左图标竖栏、窄屏为顶部图标横排；图标悬浮显示名称（无常驻文字），可直接拖动排序（鼠标拖动 / 触屏长按），窄屏放不下时收进「更多」菜单
-- Agent 协助（可选）：功能栏 Agent 配置入口 + 任务右键「Agent ▶」子菜单；只读关联材料、按夜窗自动执行、结果落本地目录（需自备 DeepSeek Key，详见下文）
+- Agent 协助（可选）：功能栏 Agent 配置入口 + 任务右键「Agent ▶」子菜单；只读关联材料、按夜窗自动执行、结果落本地目录（需自备所选 Provider 的 Key；内置 9 预设 + 自定义端点，详见下文）
 - 读取容错：单个清单文件损坏时跳过并提示，不影响其它清单
 - 写回安全：原子写（临时文件 + rename）；未知字段原样保留
 - 手动刷新：外部修改文件后点功能栏的「刷新」图标即可看到变化（不覆盖正在编辑的详情草稿）
@@ -62,18 +62,19 @@ pnpm tauri dev      # 首次编译较慢
 6. 任务行按**回车** = 打开详情；详情内子任务可增 / 删 / 勾选，**双击**子任务文字可改名
 7. 功能栏图标可拖动排序（宽屏竖栏与窄屏顶部共用同一顺序）；也可在「设置」内拖拽 / 上移 / 下移，或点「恢复默认」
 
-## Agent 协助（可选，需自备 DeepSeek Key）
+## Agent 协助（可选，需自备所选 Provider 的 Key）
 
 Agent 协助让应用读取任务关联的本地材料、联网研究并生成报告。**默认不启用、不自动调用。**
 
-- **配置**：功能栏 Agent 配置入口（或在设置内）填写 DeepSeek API Key（**本机系统保护存储、掩罩显示、不可回显**）、可选结果输出目录；首次启用需**显式同意**联网。
+- **配置**：功能栏 Agent 配置入口（或在设置内）选择 **Provider**（内置 9 预设：OpenAI / DeepSeek / Anthropic / OpenCode Go / OpenRouter / Gemini / Qwen / Zhipu / Kimi，或**自定义端点**），填写 API Key（**本机系统保护存储、按 provider 分槽、掩罩显示、不可回显**）、可选结果输出目录；模型可从**动态拉取的模型列表**中选择，或自由输入（拉取失败 / 不支持时回退输入）；首次启用需**显式同意**联网。
+- **自定义端点**：可选协议（Anthropic 兼容 / OpenAI 兼容）、自填 base URL、Key 可空（本地 / 自建端点可不带认证头）；非 https 端点且带 Key 时 UI 轻提示（不阻断）。
 - **关联材料**：任务右键「Agent ▶」→ 添加关联文件 / 目录（可为任意文件或目录；**关联不等于授权**，Agent 只读、自行选择读取，不执行命令、不改源文件）。
 - **启用**：同菜单「启用协助」；启用后任务行尾显示机器人徽标。
 - **手动执行**：菜单「立即执行 / 重新执行」（**绕过夜间时间窗**）；「停止」后**本夜不再自动重跑**，需手动重新执行。
 - **夜间自动**：仅应用运行期间，本地 00:00–09:00 自动尝试；每夜每任务最多 3 次尝试（含首次）；并发 1；单次运行最长 30 分钟。
 - **查看结果**：详情 Agent 区可看状态与运行历史；菜单「查看结果」打开结果目录（`report.md` + `sources.json`）。
 
-**联网与费用**：Agent 联网走 DeepSeek 原生端点，**发送的内容与产生的费用由用户自行承担**；应用**默认不自动联网、不自动付费**。Agent 功能**已实现并经本地验收**（隔离复验：假 provider、零真实网络）；**真实 DeepSeek 联网仍未实测**，请谨慎使用。
+**联网与费用**：Agent 联网走**所选 Provider** 的官方预设端点或用户**自定义端点**，**发送的内容与产生的费用由用户自行承担**；应用**默认不自动联网、不自动付费**。**搜索能力按 Provider 声明降级**（仅声明支持者启用联网搜索，其余 UI 标注）。Agent 功能**已实现并通过隔离复验（假 provider、零真实网络）**；**真实联网仍未实测**，请谨慎使用。
 
 ## 输出产物
 
@@ -92,7 +93,7 @@ tasks:
 
 完整字段契约见 [`docs/pdr/10-app/02-interfaces.md`](docs/pdr/10-app/02-interfaces.md)。
 
-**设置** —— `%APPDATA%\com.lftan.todolist\settings.yaml`（主题偏好、功能栏顺序 `app_bar.order` 与 Agent 配置 `agent`；与任务数据分家，见 [ADR-0006](docs/adr/0006-设置存储-应用配置目录.md)）。Agent 的 API Key 单独存 `%APPDATA%\com.lftan.todolist\agent.credentials`（**DPAPI 加密、不回界面**）；**运行记录 / 锁**在 `%APPDATA%\com.lftan.todolist\agent\`；**结果**写入 Agent 配置里指定的**结果主目录**（`{result_root}\{task_id}\{时间戳}_{run_id}\` 下 `report.md` + `sources.json`）。
+**设置** —— `%APPDATA%\com.lftan.todolist\settings.yaml`（主题偏好、功能栏顺序 `app_bar.order` 与 Agent 配置 `agent`；与任务数据分家，见 [ADR-0006](docs/adr/0006-设置存储-应用配置目录.md)）。Agent 的 API Key 单独存 `%APPDATA%\com.lftan.todolist\agent.credentials`（**DPAPI 加密、按 provider 分槽、不回界面**；旧单槽自动迁移）；**运行记录 / 锁**在 `%APPDATA%\com.lftan.todolist\agent\`；**结果**写入 Agent 配置里指定的**结果主目录**（`{result_root}\{task_id}\{时间戳}_{run_id}\` 下 `report.md` + `sources.json`）。
 
 **构建产物** —— 前端 `dist/`；Rust `src-tauri/target/`；发布打包用 `pnpm tauri build`。
 

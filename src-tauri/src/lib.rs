@@ -467,6 +467,8 @@ pub fn run() {
             save_completed_collapsed,
             save_minimize_to_tray,
             agent::commands::agent_load_config,
+            agent::commands::agent_list_providers,
+            agent::commands::agent_list_models,
             agent::commands::agent_save_config,
             agent::commands::agent_set_key,
             agent::commands::agent_clear_key,

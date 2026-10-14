@@ -651,7 +651,7 @@ mod tests {
         )
     }
 
-    fn event<'a>(plan: &'a ReminderPlan, event_type: ReminderEventType) -> &'a ReminderEvent {
+    fn event(plan: &ReminderPlan, event_type: ReminderEventType) -> &ReminderEvent {
         plan.future_events
             .iter()
             .find(|event| event.key.event_type == event_type)

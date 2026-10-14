@@ -4,28 +4,95 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 /**
  * Agent 配置前端接入层（Phase 1）。
  *
- * 契约冻结于 docs/pdr/10-app/02-interfaces.md §6 与 ADR-0008。
+ * 契约冻结于 docs/pdr/10-app/02-interfaces.md §6 与 ADR-0008；多 Provider（预设端点 /
+ * 凭据分槽）经 **ADR-0009** 修订 ADR-0008 的 provider 限定条款（其余安全边界不变）。
+ * 细节切片冻结：`agent_list_providers` 增 `protocol` / `is_custom`，新增 `agent_list_models`，
+ * settings 增 `agent.custom:{protocol, base_url}` 与 `agent.model_by_provider`。
  * - 命令参数用 camelCase（Tauri 约定）；返回值字段为 **snake_case**（后端 serde）。
  * - `agent_save_config` 的 `config` 为**已知字段补丁**，内部字段名与后端一致（snake_case）。
  * - 本模块**只在被调用时**发起 invoke；导入/渲染/保存配置均**不联网**。
- * - 密钥值只在 `agent_set_key` 请求体中出现，绝不回显 / 记录。
+ * - 密钥值只在 `agent_set_key` 请求体中出现，绝不回显 / 记录；预设清单来自后端（避免双源）。
  */
+
+/** 协议族（预设 `protocol` / 自定义端点 `protocol`）。 */
+export type AgentProtocol = "anthropic" | "openai";
+
+/**
+ * 归一化协议标识：统一为 `"anthropic"` / `"openai"`（后端 `Protocol::as_str` 口径）；
+ * 容错 `anthropic_compat` / `AnthropicCompat` / `openai_compat` 等旧式写法；
+ * 未知 / 空按 Anthropic 兼容处理（与后端默认一致）。
+ */
+export function normalizeProtocol(raw: unknown): AgentProtocol {
+  const s = String(raw ?? "").toLowerCase();
+  return s.includes("openai") ? "openai" : "anthropic";
+}
+
+/** 协议的中文展示名。 */
+export function protocolLabel(protocol: string): string {
+  return normalizeProtocol(protocol) === "openai"
+    ? "OpenAI 兼容"
+    : "Anthropic 兼容";
+}
+
+/** Provider 预设（= `agent_list_providers` 元素；**不含**密钥）。 */
+export type ProviderPreset = {
+  id: string;
+  label: string;
+  /** 协议族（后端 `"anthropic"` / `"openai"`；用 `normalizeProtocol` 归一化）。 */
+  protocol: string;
+  default_model: string;
+  search_support: boolean;
+  /** 是否为「自定义端点」条目（由后端标记，前端不硬编码）。 */
+  is_custom?: boolean;
+};
+
+/** 自定义端点（settings `agent.custom`）。 */
+export type AgentCustomEndpoint = {
+  protocol: string;
+  base_url: string;
+};
 
 /** 本机全局 Agent 配置（= `agent_load_config` 返回）。 */
 export type AgentConfig = {
+  provider: string;
   model: string;
   result_root: string | null;
   execution_enabled: boolean;
   max_uses: number;
   key_present: boolean;
+  /** 自定义端点；后端未返回时为 undefined（前端按空处理）。 */
+  custom?: AgentCustomEndpoint | null;
+  /** 各 provider 上次使用的模型（provider id → model）。 */
+  model_by_provider?: Record<string, string> | null;
 };
 
 /** 保存补丁：仅已知字段，字段名与后端 `agent` 段一致（snake_case）。 */
 export type AgentConfigPatch = {
+  provider?: string;
   model?: string;
   result_root?: string | null;
   execution_enabled?: boolean;
   max_uses?: number;
+  /** 自定义端点（仅 provider=自定义时写入；其余情况保留后端旧值）。 */
+  custom?: AgentCustomEndpoint;
+  /** provider id → 上次模型（保存时把当前 provider 的模型并入）。 */
+  model_by_provider?: Record<string, string>;
+};
+
+/** 模型条目（= `agent_list_models.models` 元素）。 */
+export type AgentModelInfo = {
+  id: string;
+  /** 该模型实际使用的协议（混合网关按模型映射）。 */
+  protocol: string;
+  /** 当前协议族下是否受支持（false = 列表标注不可用，如 responses 模型）。 */
+  supported: boolean;
+};
+
+/** 模型列表结果（= `agent_list_models` 返回）。 */
+export type AgentModelList = {
+  /** remote = 来自端点；none = 端点无列表（前端回退自由输入）。 */
+  source: "remote" | "none";
+  models: AgentModelInfo[];
 };
 
 export type AgentValidateResult = {
@@ -40,11 +107,36 @@ export type AgentProbeResult = {
 };
 
 export const DEFAULT_AGENT_MODEL = "deepseek-flash";
+export const DEFAULT_AGENT_PROVIDER = "deepseek";
 export const DEFAULT_AGENT_MAX_USES = 5;
 
 /** 读取本机配置（纯本地，无网络）。 */
 export function loadAgentConfig(): Promise<AgentConfig> {
   return invoke<AgentConfig>("agent_load_config");
+}
+
+/** 内置 provider 预设清单（纯本地，无网络）；预设为后端单一事实源。 */
+export function listAgentProviders(): Promise<ProviderPreset[]> {
+  return invoke<ProviderPreset[]>("agent_list_providers");
+}
+
+/**
+ * 拉取某 provider 的模型列表（**会联网**：向端点请求模型清单）。
+ * - 预设：只传 `provider`（后端按预设解析端点）。
+ * - 自定义端点：另传 `protocol` 与 `baseUrl`。
+ * - `source:"none"` = 端点未提供列表；调用失败由调用方捕获并回退自由输入。
+ * - 结果**不做持久化缓存**（仅当前会话内存持有）。
+ */
+export function listAgentModels(params: {
+  provider: string;
+  protocol?: string | null;
+  baseUrl?: string | null;
+}): Promise<AgentModelList> {
+  return invoke<AgentModelList>("agent_list_models", {
+    provider: params.provider,
+    protocol: params.protocol ?? null,
+    baseUrl: params.baseUrl ?? null,
+  });
 }
 
 /**
@@ -58,19 +150,22 @@ export function saveAgentConfig(
   return invoke<void>("agent_save_config", { config, consentCloud });
 }
 
-/** 设置 / 替换密钥（值只在请求体出现，成功由 UI 立即清空输入）。 */
-export function setAgentKey(key: string): Promise<void> {
-  return invoke<void>("agent_set_key", { key });
+/**
+ * 设置 / 替换密钥（值只在请求体出现，成功由 UI 立即清空输入）。
+ * `provider` 省略 = 后端当前 provider；显式传入以读写指定槽。
+ */
+export function setAgentKey(key: string, provider?: string): Promise<void> {
+  return invoke<void>("agent_set_key", { key, provider: provider ?? null });
 }
 
-/** 清除密钥。 */
-export function clearAgentKey(): Promise<void> {
-  return invoke<void>("agent_clear_key");
+/** 清除密钥（`provider` 省略 = 后端当前 provider）。 */
+export function clearAgentKey(provider?: string): Promise<void> {
+  return invoke<void>("agent_clear_key", { provider: provider ?? null });
 }
 
-/** 是否已配置密钥（仅布尔，不含值）。 */
-export function isAgentKeyPresent(): Promise<boolean> {
-  return invoke<boolean>("agent_key_present");
+/** 是否已配置密钥（仅布尔，不含值；`provider` 省略 = 后端当前 provider）。 */
+export function isAgentKeyPresent(provider?: string): Promise<boolean> {
+  return invoke<boolean>("agent_key_present", { provider: provider ?? null });
 }
 
 /** 校验结果根目录（本机校验，无网络）。 */

@@ -83,7 +83,7 @@ export function AgentTaskPanel({
       {!enabled && (
         <p className="agent-hint">
           启用后，Agent 会在本机执行时按需读取下方关联材料（只读），并把任务内容发送到
-          DeepSeek 云端。
+          所选 Provider 云端。
         </p>
       )}
 

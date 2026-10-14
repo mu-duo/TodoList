@@ -36,7 +36,7 @@ export function agentStateMeta(state: string | null | undefined): AgentStateMeta
 
 /**
  * `error_class` 中文标签。取值与后端实现一致：
- * provider.rs `CLASS_*`（MissingCredential/HttpAuth/HttpStatus/Transport/Redirect/Parse/NoResultBlock/ProviderError/Aborted）
+ * provider.rs `CLASS_*`（MissingCredential/HttpAuth/HttpStatus/Transport/Redirect/Parse/NoResultBlock/ProviderError/Config/Aborted）
  * 与 runner.rs（UnsafePath/ResultRoot/StepLimit/timeout）。
  * **未知值原样返回**（兜底，绝不吞掉）。
  */
@@ -62,6 +62,8 @@ export function agentErrorClassLabel(errorClass: string | null | undefined): str
       return "未返回搜索结果";
     case "ProviderError":
       return "上游返回错误";
+    case "Config":
+      return "配置错误";
     case "Aborted":
       return "已中止";
     case "UnsafePath":

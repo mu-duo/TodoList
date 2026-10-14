@@ -196,12 +196,18 @@ fn normalize_theme(theme: &str) -> String {
     }
 }
 
+/// 剥离前导 UTF-8 BOM（`\u{FEFF}`）；避免解析器误判文档边界（误导性「多文档」错误）。
+/// 供 settings 与 agent 配置读取共用。
+pub(crate) fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}').unwrap_or(text)
+}
+
 /// 读取设置目录（`%APPDATA%\com.lftan.todolist`）下的 `settings.yaml`。
 ///
 /// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
 /// 且**不会**创建文件、不会 panic。`app_bar.order` 缺失 / 空 / 非法时 `app_bar_order` 为
 /// `None`；合法字符串 id 去重（首次保留）并保留未知 id 原顺序，不自动补已知 id。
-/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析。
+/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析。读取前剥离前导 BOM。
 pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     let fallback = || Settings {
         theme: DEFAULT_THEME.to_string(),
@@ -217,7 +223,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         Ok(text) => text,
         Err(_) => return Ok(fallback()),
     };
-    let value: Value = match yaml_serde::from_str(&text) {
+    let value: Value = match yaml_serde::from_str(strip_bom(&text)) {
         Ok(value) => value,
         Err(_) => return Ok(fallback()),
     };
@@ -2384,6 +2390,24 @@ tasks:
         // 缺 theme 键 → 默认
         fs::write(base.join(SETTINGS_FILE), "x: 1\n").unwrap();
         assert_eq!(load_settings_from(base).unwrap().theme, "system");
+    }
+
+    #[test]
+    fn load_settings_strips_leading_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // 带前导 BOM：theme / app_bar 应正常解析（不被误判为多文档 / 非对象）
+        fs::write(
+            base.join(SETTINGS_FILE),
+            "\u{FEFF}theme: dark\napp_bar:\n  order: [refresh, settings]\n",
+        )
+        .unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(
+            settings.app_bar_order,
+            Some(vec!["refresh".to_string(), "settings".to_string()])
+        );
     }
 
     /// 取某任务下子任务的 `(id, title, status)` 列表。

@@ -179,9 +179,9 @@ minimize_to_tray: false       # 可选；缺省＝开启（默认）；false＝�
 - **系统关机 / 注销不拦截**（tao 直接退出，不经本拦截）。
 - **已知边界**：安装器 Restart Manager 提示关闭时，托盘态需先从托盘菜单「退出」再继续（见 `docs/RELEASE.md`）。
 
-## 6. Agent 协助（**已实现（Phase1+Phase2），待验证**）
+## 6. Agent 协助（多 Provider，**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**）
 
-> **状态（2026-10-12）：已实现**（Phase 1 + Phase 2；后端 **117 个 Rust 测试**、前端纯逻辑断言、`pnpm build` 通过）——契约按 architecture.md（含父会话修正）落地；**已通过隔离集成复验（假 provider、零真实网络）并经用户验收通过；真实 DeepSeek 联网仍未实测**（见 §6.6）。
+> **状态（2026-10-14）：多 Provider 已实现**（9 内置预设 + 自定义端点、双协议 Anthropic Messages / OpenAI Chat Completions、动态模型列表、搜索按 provider 声明降级；依据 **ADR-0009** 修订 ADR-0005/0008 的 provider 限定）。**已通过隔离集成复验（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**（见 §6.6）。
 
 ### 6.1 任务 YAML `agent` 形状（冻结）
 
@@ -201,28 +201,39 @@ tasks:
 
 ```yaml
 agent:
+  provider: deepseek         # 当前 provider（缺失 / 空 = deepseek；未知 = 明确报错 fail closed）
   model: deepseek-flash      # 默认；可改，**不自动回退**
   result_root: null          # 或绝对路径（结果根目录）
   execution_enabled: false   # 本机执行 opt-in，**默认 false**
   max_uses: 5                # 单请求内服务端搜索上限，**非运行总帽**
+  custom:                    # 自定义端点（仅 provider=custom 时生效；其余 provider 下惰性保留）
+    protocol: openai         # "anthropic" | "openai"
+    base_url: https://...     # http(s) URL
+  model_by_provider:         # provider id → 上次模型（对象；值须非空字符串）
+    openai: gpt-5.6-sol
 ```
 
 - 仅补丁 `agent` 下**已知字段**，保留 `agent` 其它 / 未知字段与 `theme`、`app_bar` 等。
 - `execution_enabled` 由 false → true 必须经**显式云端同意**（见 §6.4）；默认 false。
+- `custom` 仅 provider=`custom` 时生效（此时须有有效 `protocol` + http(s) `base_url`）；其他 provider 下**惰性保留、不报错**；未知 provider **fail closed**。
 
-### 6.3 凭据（**独立本机，绝不回 JS**）
+### 6.3 凭据（**分槽本机，绝不回 JS**）
 
 - 密钥经 **Windows DPAPI**（`CryptProtectData` / `CryptUnprotectData`）加密，落 `%APPDATA%\com.lftan.todolist\agent.credentials`（**独立本机文件**）；仅内存解密、HTTP 全在 Rust；**绝不回传 JS / 写日志 / 错误串**。
-- presence = 可解密且非空（仅返回布尔）。
+- **分槽**：文件内明文为 `{providerId: secret}`（DPAPI + base64 文件形态不变），**每 provider 一槽**。
+- **旧单槽自动迁移**：读取到旧单值格式时自动归入 `deepseek` 槽（幂等、原子写回；写回失败**不丢**旧 key）。
+- presence = 可解密且非空（仅返回布尔）；自定义端点可无密钥（keyless，见 §6.6）。
 
-### 6.4 Phase 1 命令契约（冻结；**不编造未列命令**）
+### 6.4 Agent 命令契约（**不编造未列命令**）
 
-- `agent_load_config() -> { model: string, result_root: string|null, execution_enabled: bool, max_uses: number, key_present: bool }`
-- `agent_save_config({ config: { model?, result_root?, execution_enabled?, max_uses? }, consentCloud: bool }) -> void`：Value 级补丁仅改 `agent` 已知字段、保留未知；**`execution_enabled` false→true 当且仅当 `consentCloud === true`**，否则报错不写。
-- `agent_set_key({ key: string }) -> void` ／ `agent_clear_key() -> void` ／ `agent_key_present() -> bool`：**密钥值永不回 JS**。
+- `agent_load_config() -> { provider, model, result_root, execution_enabled, max_uses, key_present, custom: { protocol, base_url } | null, model_by_provider: Record<string, string> }`
+- `agent_list_providers() -> [{ id, label, protocol: "anthropic" | "openai", default_model, search_support, is_custom }]`：内置 9 预设 + 末尾**合成** `custom` 条目（`protocol=""`、`is_custom=true`）。
+- `agent_list_models({ provider?, protocol?, base_url? }) -> { source: "remote" | "none", models: [{ id, protocol, supported }] }`：**会联网**（短 deadline）；**任何网络 / 解析失败一律** `{ source: "none", models: [] }`；`provider` 未知 → 报错；custom 分支**仅在入参 `protocol` / `base_url` 与已保存 `agent.custom` 归一化一致时**才附加密钥（不一致 → 不带认证头请求）。
+- `agent_save_config({ config: { provider?, model?, result_root?, execution_enabled?, max_uses?, custom?, model_by_provider? }, consentCloud: bool }) -> void`：Value 级补丁仅改 `agent` 已知字段、保留未知；**`execution_enabled` false→true 当且仅当 `consentCloud === true`**，否则报错不写；`custom` 值校验（`protocol ∈ {anthropic,openai}`、`base_url` http(s)）仅在其生效（provider=`custom`）时进行。
+- `agent_set_key({ key: string, provider?: string }) -> void` ／ `agent_clear_key({ provider?: string }) -> void` ／ `agent_key_present({ provider?: string }) -> bool`：`provider` 缺省 = 当前 provider；**密钥值永不回 JS**。
 - `agent_validate_result_root({ path: string }) -> { ok: bool, message: string }`
-- `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。**不提供自动 / 保存流 / 测试流**，**不做任何真实付费调用**。
-- `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`
+- `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：对当前 provider / model 的**最小 chat 请求**（`max_tokens=16`、单条 user 消息、无工具）；**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。keyless 自定义端点亦可测。**不提供自动 / 保存流 / 测试流**，**不做任何自动付费调用**。
+- `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`：`enabled: true` 需执行授权 /（key_required 时的）密钥 / 结果根齐备；keyless custom 不硬校验密钥。
 - `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
 - `load_lists` 的 `TaskView` 另暴露 `reminder: false | null`（YAML 键 `reminder`；缺省开启 → `null`）。
 - 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
@@ -249,13 +260,19 @@ agent:
 
 ### 6.6 联网与运行约束（规范；**未实测**）
 
-- 端点 `POST https://api.deepseek.com/anthropic/v1/messages`；默认 `model=deepseek-flash`（可改，**不自动回退到其它模型**，不支持的模型明确报错）；HTTP **禁跟随重定向**（3xx＝失败）。
-- 主循环仅用**客户端只读 fs 工具**；联网仅走**独立辅助 native search 请求**（`tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]`），**不与客户端文件工具混在同一请求**；`max_uses` 是**单请求内**上限、**非运行总帽**。
+- **端点由预设 / 配置提供**（ADR-0009）：内置 **9 预设**（openai / deepseek / anthropic / opencode-go / openrouter / gemini / qwen / zhipu / kimi）+ **自定义端点**；协议为 Anthropic Messages 兼容 / OpenAI Chat Completions 兼容。
+  - **自定义端点路径约定**：openai → `base + /chat/completions`；anthropic → base 以 `/v1` 结尾则 `base + /messages`，否则 `base + /v1/messages`（比较大小写不敏感）。
+  - **认证**：Anthropic 原生 / DeepSeek（chat）用 `x-api-key`；Qwen / Zhipu 等兼容端点与 OpenAI 系用 Bearer；自定义 Anthropic 用 `x-api-key`、自定义 OpenAI 用 Bearer。
+  - **keyless 自定义端点**：无密钥时**不带认证头**发请求（不报 `MissingCredential`）；预设仍要求密钥。
+  - **混合协议（opencode-go）**：按模型映射协议（chat 组 → OpenAI、messages 组 → Anthropic、responses 组 → 构造报错 fail closed；未知 / 官方未列 → OpenAI 默认）。
+- 默认 `model` 可改，**不自动回退到其它模型**，不支持的模型明确报错；HTTP **禁跟随重定向**（3xx＝失败）。
+- 主循环仅用**客户端只读 fs 工具**；联网仅走**独立辅助 native search 请求**（`tools: [{ type: "web_search_20250305", name: "web_search", max_uses }]`），**不与客户端文件工具混在同一请求**；`max_uses` 是**单请求内**上限、**非运行总帽**。
+- **搜索按 provider 声明门控**：仅 `search_support=true`（anthropic / deepseek / qwen）构建搜索请求并下发 `native_search` 工具；不支持者**不下发**该工具、其处理路径安全跳过。Qwen 搜索请求注入 system 内容块 `x-anthropic-billing-header: cc_entrypoint=cli;`。
 - 2xx 但**无 `web_search_tool_result` 块＝失败**，**不得判为联网成功**；检索结果 / 引用为**不可信外部内容**，仅作数据、绝不执行。
 - 运行**无全局模型 / 搜索调用次数帽**；保留 **30 分钟 deadline / 取消 / 读取限制**（ADR-0007：单次文本 ≤256KiB、运行累计 ≤5MiB、分页不可绕）。
 - **步数护栏**：每 run 主循环步数上限 **40**（`MAX_STEPS`）——**防失控护栏，不是调用次数帽、不计入预算 / 次数统计口径**；达上限 → `failed(StepLimit)` **不重试**；实际步数记入运行记录 `stats.steps`。
-- **交付 / 判据警告**：**不得**用 `--features agent-test-provider`（或 `--all-features`）构建的产物**交付**，**也不得**据此判断联网可用——该构建返回**离线假来源**（`example.test`），**仅供测试**。
-- **联网未经真实调用验证**（仅 DeepSeek 原生 Anthropic 兼容端点有官方一方源码，字段存在未决项），**不声称可用或已验收**。
+- **交付 / 判据警告**：**不得**用 `--features agent-test-provider`（或 `--all-features`）构建的产物**交付**，**也不得**据此判断联网可用——该构建返回**离线假来源**（`example.test`）与固定假模型列表，**仅供测试**。
+- **联网未经真实调用验证**（预设与部分第三方兼容端点仅有第三方文档依据，字段存在未决项），**不声称可用或已验收**。
 
 ## 7. 提醒运行时与发送尝试账本（1.6.0 已实现并本地验证）
 
@@ -281,3 +298,4 @@ agent:
 - 2026-10-12 **用户验收通过**：§6 状态改「**已实现、隔离集成复验通过、用户验收通过；真实联网未实测**」；随 **1.4.0** 发布（构建与提交由父会话执行）。
 - 2026-10-13 新增 §5.1「已完成」视图分组折叠偏好（FR-APP-18）：`load_settings` 增 `completed_collapsed: string[] | null`、新增 `save_completed_collapsed({ collapsed })`——Value 级补丁**仅改 `completed.collapsed`**，`null` / 空数组删除该字段恢复默认（全部展开），保留 `theme` / `app_bar` / 未知字段，空白文件名 / `completed` 非对象报中文错误不写盘；键 = 清单文件名、失效键由 UI 静默忽略。同批记 **`move_task(list_file, task_id, to_list_file)`**（FR-APP-04 任务跨清单转移）为**命令级移动**、**不新增字段 / 文件**；双文件写序为「先向目标追加、再自源移除 + 失败回滚」。**未改数据目录 schema**。
 - 2026-10-13 **提醒改造（1.6.0）**：字段 `reminder_offset_days: 1`（提前 1 天 opt-in）改为 `reminder: false`（默认四档 opt-out）；`update_task_metadata` patch 改 `reminder?: false | null`（`false` 写入、`null` 删键）；`TaskView.reminder: false | null`。四档事件 `advance7/advance1/advance1h/due`（旧 `advance` 兼容读取）；ledger 增 `observed`（首帧标记），`last_status` 语义保持（done→open 抑制全部已过档）；首帧静默 claim 已过提前档、首帧到期档补一条；合并 catch-up 文案按 due 是否已过。通知注册 `due-reminder`/`remind-off` 动作 + `reminder-disabled` 事件；点击仅在通知停留屏幕时被接收（Tier 1）。**未改数据目录 schema**。
+- 2026-10-14 **多 Provider（细节 part 1+2 + 收口修复）**：§6 契约更新为多 Provider——settings 增 `agent.provider` / `agent.custom{protocol,base_url}` / `agent.model_by_provider`；`agent_list_providers` 增 `protocol("anthropic"/"openai")` / `is_custom` 并含末尾合成 `custom` 条目；新增 `agent_list_models`（`{source:"remote"|"none", models:[{id,protocol,supported}]}`，任何失败一律 none，custom **仅在入参与已保存配置归一化一致时**才带密钥）；key 命令 `provider?` 可选（缺省=当前 provider）；`agent_probe` 改**最小 chat 请求**（`max_tokens=16`、单条 user 消息）；搜索按 `search_support` 门控（`native_search` 不下发）；自定义端点路径约定（openai `/chat/completions`；anthropic base 以 `/v1` 结尾 → `/messages`，否则 `/v1/messages`）+ **keyless**（无认证头）；凭据**分槽** + 旧单槽自动迁移（ADR-0009 修订 ADR-0005/0008 的 provider 限定）。**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**。
