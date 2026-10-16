@@ -3,6 +3,7 @@ pub mod reminder;
 mod reminder_runtime;
 mod storage;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent::clock::SystemClock;
@@ -10,6 +11,7 @@ use agent::commands::AgentRuntime;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_notification::{Action, ActionPerformed, ActionType, NotificationExt};
 
 /// 读取数据目录中的全部清单（不存在时自动创建并生成示例清单）。
@@ -231,6 +233,17 @@ fn restore_main_window(app: &AppHandle) {
     }
 }
 
+/// 统计当前打开的便签窗口数量（label 以 `note-` 开头）。
+fn note_window_count(app: &AppHandle) -> usize {
+    app.webview_windows()
+        .keys()
+        .filter(|label| label.starts_with("note-"))
+        .count()
+}
+
+/// 托盘「退出」确认对话框的防连点开关：对话框打开期间再次点「退出」不重复弹。
+static EXIT_CONFIRM_OPEN: AtomicBool = AtomicBool::new(false);
+
 /// 按需创建固定 id 的托盘图标（已存在则不改动）。
 ///
 /// 图标为默认窗口图标；右键菜单「显示主窗口」「退出」；左键单击恢复主窗口。
@@ -296,6 +309,12 @@ fn save_minimize_to_tray(app: AppHandle, enabled: bool) -> Result<(), String> {
         app.remove_tray_by_id(TRAY_ID);
     }
     Ok(())
+}
+
+/// 退出应用：由前端在「有便签的退出确认」通过后调用。
+#[tauri::command]
+fn exit_app(app: AppHandle) {
+    app.exit(0);
 }
 
 /// 处理提醒通知上的动作：`remind-off`（不再提醒）与 `tap`（前置窗口）。
@@ -421,26 +440,67 @@ pub fn run() {
             }
             Ok(())
         })
-        // 关闭拦截：设置开启时点「关闭」隐藏到托盘、进程保活；关闭时不拦截（现状退出）。
+        // 关闭拦截：托盘设置开启且托盘可用时点「关闭」隐藏到托盘、进程保活；
+        // 否则若存在便签 → 拦截关闭并请求前端确认；否则不拦截（现状退出）。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() != "main" {
                     return;
                 }
-                // 托盘缺失时不隐藏（避免没有可用的恢复入口）；直接按现状退出。
+                // 托盘缺失时不隐藏（避免没有可用的恢复入口）；直接走下方便签 / 退出分支。
                 if minimize_to_tray_enabled() && window.app_handle().tray_by_id(TRAY_ID).is_some() {
                     api.prevent_close();
                     if let Err(error) = window.hide() {
                         eprintln!("隐藏主窗口到托盘失败：{error}");
                     }
+                    return;
                 }
+                // 关闭应用路径：存在便签则拦截关闭，请求前端确认（确认→exit_app；取消→一切保持）。
+                let count = note_window_count(window.app_handle());
+                if count > 0 {
+                    api.prevent_close();
+                    if let Err(error) = window.app_handle().emit(
+                        "exit-requested-with-notes",
+                        serde_json::json!({ "noteCount": count }),
+                    ) {
+                        eprintln!("广播退出确认事件失败：{error}");
+                    }
+                }
+                // 无便签：不拦截，窗口关闭 → 进程随之退出（现状）。
             }
         })
         // 托盘菜单事件：一次性注册到全局菜单监听表（不随托盘重建重复注册）。
-        // 「显示主窗口」恢复并前置主窗口；「退出」真正退出进程。
+        // 「显示主窗口」恢复并前置主窗口；「退出」有便签时弹系统原生确认对话框（不恢复主窗、不广播事件）。
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => restore_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                let count = note_window_count(app);
+                if count == 0 {
+                    app.exit(0);
+                } else if EXIT_CONFIRM_OPEN
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // 非阻塞系统原生对话框；**不**绑定父窗口（主窗可能已隐藏到托盘）。
+                    // 确认 → 退出应用；取消 → 无操作。两种结果都复位防连点开关。
+                    let handle = app.clone();
+                    app.dialog()
+                        .message(format!(
+                            "当前有 {count} 张便签未关闭；退出应用将一并关闭它们，便签内容不会保存。"
+                        ))
+                        .title("TodoList")
+                        .buttons(MessageDialogButtons::OkCancelCustom(
+                            "退出".to_string(),
+                            "取消".to_string(),
+                        ))
+                        .show(move |confirmed| {
+                            EXIT_CONFIRM_OPEN.store(false, Ordering::SeqCst);
+                            if confirmed {
+                                handle.exit(0);
+                            }
+                        });
+                }
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -482,7 +542,8 @@ pub fn run() {
             agent::commands::agent_stop_task,
             agent::commands::agent_get_status,
             agent::commands::agent_list_runs,
-            agent::commands::agent_open_result_dir
+            agent::commands::agent_open_result_dir,
+            exit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -19,6 +19,7 @@ export type AppBarEntryMeta = {
 export const APP_BAR_ENTRIES: AppBarEntryMeta[] = [
   { id: "refresh", label: "刷新", kind: "action" },
   { id: "pin", label: "置顶", kind: "action" },
+  { id: "note", label: "便签", kind: "action" },
   { id: "settings", label: "设置", kind: "config" },
   { id: "agent", label: "Agent", kind: "config" },
 ];

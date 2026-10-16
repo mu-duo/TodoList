@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { DragMoveEvent } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
@@ -13,6 +13,7 @@ import { AppBar } from "./components/AppBar";
 import { AgentConfigModal } from "./components/AgentConfigModal";
 import { AgentTaskPanel } from "./components/AgentTaskPanel";
 import { applyThemePref, type ThemePref } from "./theme";
+import { openNoteWindow } from "./noteWindow";
 import { loadSettings } from "./settings";
 import {
   getAgentStatus,
@@ -147,6 +148,9 @@ function App() {
   const [pendingDeleteList, setPendingDeleteList] = useState<TaskList | null>(
     null,
   );
+
+  // 有便签时的退出确认（便签数；null = 模态关闭）
+  const [exitNoteCount, setExitNoteCount] = useState<number | null>(null);
 
   // 应用功能栏（App Bar）：顺序（含未知槽位）、最后成功顺序、保存态与错误
   const [appBarOrder, setAppBarOrder] = useState<string[]>(() => [
@@ -559,6 +563,27 @@ function App() {
       })
       .catch(() => {
         // 订阅失败：静默降级（手动刷新仍可用）
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 订阅 exit-requested-with-notes（有便签时主窗关闭 / 托盘「退出」）→ 打开退出确认模态
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ noteCount: number }>("exit-requested-with-notes", (event) => {
+      setExitNoteCount(event.payload.noteCount);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // 订阅失败：静默降级
       });
     return () => {
       cancelled = true;
@@ -1309,6 +1334,8 @@ function App() {
   function activateAppBar(id: string) {
     if (id === "refresh") void manualRefresh();
     else if (id === "pin") togglePin();
+    else if (id === "note")
+      void openNoteWindow(theme).catch((e) => setActionError(String(e)));
     else if (id === "settings") setSettingsOpen(true);
     else if (id === "agent") setAgentConfigOpen(true);
   }
@@ -1414,6 +1441,12 @@ function App() {
       setActionError(null);
       try {
         await applyThemePref(next);
+        // 尽力广播给便签窗口；失败静默，绝不影响主题切换与保存逻辑。
+        try {
+          await emit("theme-pref-changed", next);
+        } catch {
+          // 忽略广播失败
+        }
       } catch (e) {
         setActionError(String(e));
       }
@@ -2906,6 +2939,16 @@ function App() {
           confirmLabel="删除"
           onConfirm={confirmRemoveList}
           onCancel={() => setPendingDeleteList(null)}
+        />
+      )}
+
+      {exitNoteCount !== null && (
+        <ConfirmModal
+          title="退出将关闭全部便签"
+          message={`当前有 ${exitNoteCount} 张便签未关闭；退出应用将一并关闭它们，便签内容不会保存。`}
+          confirmLabel="退出"
+          onConfirm={() => void invoke("exit_app")}
+          onCancel={() => setExitNoteCount(null)}
         />
       )}
     </main>

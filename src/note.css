@@ -1,0 +1,337 @@
+/* ---------------------------------------------------------------------------
+   便签窗口（NoteApp）样式
+   - 仅由 src/NoteApp.tsx 引入。卡片刻意做成整窗铺满（position: fixed; inset: 0），
+     因此**不写 html / body 级规则**：即便本文件被主窗口的 bundle 带上，也不影响主界面。
+   - 颜色：--note-bg / --note-border / --note-text 由 NoteApp 以内联变量注入
+     （NOTE_COLORS[scheme][tone]：亮色 = 彩色系浅底深字，暗色 = 灰→灰白、t4 起深字）；
+     其余浓淡一律从便签文字色按 alpha 派生，因此**方向自动跟随文字色**：
+     浅底深字时 wash/选区/滚动条变暗，深底浅字时变亮，翻转档位无需特殊分支
+     （color-mix 需要 Chromium 111+，即 Tauri 的 WebView2）。
+   - 顶部受光按「底色的明暗方向」取值：亮色系六档全是浅底（方向一致）→ 白色高光；
+     暗色系跨了 t4 翻转点（t1..t3 深底 / t4..t6 浅底）→ 改用与文字同向的墨色渐变，
+     深底档自动提亮、浅底档自动压暗，一条规则覆盖 6 档。
+   - 纸颗粒（--note-grain）亮暗同一系数：两套方案各含一张接近纯白的卡片
+     （light t2 / dark t6），「浅底不显脏」这条全局约束决定了两套的上限一致。
+   - 拖动：`data-tauri-drag-region`（裸值 = 只有直接点在该元素上才拖动）。
+     Tauri 的 drag.js 会先向上找可交互元素（button / textarea / input…），
+     未带该属性的按钮与文本区天然阻断拖动，故文本选择、按钮点击都不受影响。
+   - 缩放（2026-10-16 新增）：8 个绝对定位热区贴在窗口边缘，几何约定如下，
+     改布局时请一并复核——
+       · 四边 6px、四角 12px，边缘热区两端各让开 12px 给角，彼此不重叠；
+       · 顶部条 padding-top 6px → 按钮顶边恰在顶边热区之下，热区不压按钮；
+         顶部条 padding-right 14px → close 右边距角热区 2px（留抗舍入余量）；
+       · 文本区 margin 0 6px 6px（左/右/下各内缩 6px）→ 边热区与滚动条互不重叠；
+         文本区 z-index 高于热区 → 滚动条永远优先（角热区与滚动条仅剩 6×6 重叠，
+         该处归滚动条；四角实际可抓区是贴窗边的 L 形，仍是最大最顺手的部分）。
+       · 文本区 padding 8px + 内缩 6px = 文字距窗口边 14px（无滚动条时四边等距）。
+--------------------------------------------------------------------------- */
+
+.note-root {
+  /* 由便签文字色按 alpha 派生的深浅令牌（落在便签底色上）。
+     实测（12 组）：图标 3.1–5.3:1、滚动条 1.95–3.0:1、选区上文字 4.4–8.2:1、
+     hover ΔL* 5.3–8.6、按下 ΔL* 9.8–15.1 —— 两组主题、全部 6 档都成立。 */
+  --note-ink-soft: color-mix(in srgb, var(--note-text) 60%, transparent);
+  --note-ink-faint: color-mix(in srgb, var(--note-text) 34%, transparent);
+  --note-wash: color-mix(in srgb, var(--note-text) 10%, transparent);
+  --note-wash-strong: color-mix(in srgb, var(--note-text) 18%, transparent);
+  --note-hover-solid: color-mix(in srgb, var(--note-text) 86%, var(--note-bg));
+  /* 滚动条比初版略提（30→38）：浅底档的 3px 细滑块靠它才看得出是滚动条 */
+  --note-line: color-mix(in srgb, var(--note-text) 38%, transparent);
+  --note-selection: color-mix(in srgb, var(--note-text) 20%, transparent);
+  --note-ring: color-mix(in srgb, var(--note-text) 60%, transparent);
+  /* 极细纸颗粒（灰度噪声，低 alpha；见下方 background-image）。
+     浅底最容易被颗粒显「脏」，故以最浅的卡片为上限取值：
+     白档上基本无感，彩色底只留一点纸感，中灰/暗档保持哑光不灰败。 */
+  --note-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncA type='linear' slope='0.06'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23g)'/%3E%3C/svg%3E");
+
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  margin: 0;
+  color: var(--note-text);
+  background-color: var(--note-bg);
+  /* 顶部一丝受光 + 纸颗粒（都在内容之下），给整块「纸」一点厚度。
+     亮色系六档都是浅底深字，方向一致 → 用白色高光（白档上自然不可见，无副作用） */
+  background-image: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.13),
+      rgba(255, 255, 255, 0) 58px
+    ),
+    var(--note-grain);
+  box-shadow: inset 0 0 0 1px var(--note-border);
+  font-family: var(--font-sans, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 本文件不依赖 App.css 的全局 box-sizing */
+.note-root,
+.note-root *,
+.note-root *::before,
+.note-root *::after {
+  box-sizing: border-box;
+}
+
+/* 暗色便签：跨 t4 翻转点（t1..t3 深底浅字 / t4..t6 浅底深字），
+   高光改由便签墨色派生 —— 深底档自动提亮（≈ΔL* 4），浅底档自动压暗成一条极淡的顶部带 */
+@media (prefers-color-scheme: dark) {
+  .note-root {
+    background-image: linear-gradient(
+        180deg,
+        color-mix(in srgb, var(--note-text) 5%, transparent),
+        color-mix(in srgb, var(--note-text) 0%, transparent) 58px
+      ),
+      var(--note-grain);
+  }
+}
+
+/* ----------------------------------------------------- 顶部条：唯一的 chrome ---- */
+
+/* padding-top 6px：按钮顶边让开顶边缩放热区；padding-right 14px：让开右上角热区 */
+.note-root .note-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px 5px 6px;
+}
+
+/* 拖动把手：2×3 点阵。纯装饰（pointer-events: none）——
+   mousedown 落在顶部条上，由顶部条的 drag region 接管拖动。 */
+.note-root .note-grip {
+  flex: none;
+  width: 10px;
+  height: 16px;
+  margin: 0 auto 0 3px; /* 右侧 auto：把两个按钮挤到最右 */
+  color: var(--note-ink-faint);
+  background-image: radial-gradient(currentColor 1.15px, transparent 1.3px);
+  background-size: 5px 5px;
+  background-position: 0 0.5px;
+  pointer-events: none;
+  transition: color 140ms ease;
+}
+
+.note-root .note-bar:hover .note-grip {
+  color: color-mix(in srgb, var(--note-text) 50%, transparent);
+}
+
+/* --------------------------------------------------------------- 图标按钮 ---- */
+
+.note-root .note-btn {
+  flex: none;
+  position: relative;
+  z-index: 1; /* 兜底：任何情况下按钮都压过缩放热区 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--note-ink-soft);
+  background-color: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.note-root .note-btn:hover {
+  color: var(--note-text);
+  background-color: var(--note-wash);
+}
+
+.note-root .note-btn:active {
+  background-color: var(--note-wash-strong);
+}
+
+.note-root .note-btn:focus-visible {
+  outline: 2px solid var(--note-ring);
+  outline-offset: 1px;
+}
+
+/* pin 激活 = 实心强调（便签墨色底 + 便签底色图标），与描边态一眼可分。
+   灰阶下这是画面里唯一的实心深色块，辨识度更高。 */
+.note-root .note-btn[aria-pressed="true"] {
+  color: var(--note-bg);
+  background-color: var(--note-text);
+}
+
+.note-root .note-btn[aria-pressed="true"]:hover {
+  color: var(--note-bg);
+  background-color: var(--note-hover-solid);
+}
+
+.note-root .note-icon {
+  display: block;
+  width: 15px;
+  height: 15px;
+}
+
+/* ------------------------------------------------------------- 文本区 ---- */
+
+.note-root .note-text {
+  flex: 1;
+  min-height: 0;
+  /* 左/右/下各内缩 6px：让出三边缩放热区（滚动条因此不贴窗缘，避开右缘热区）；
+     再 +8px padding = 文字距窗口左/右/下均为 14px（有滚动条时右侧再加滚动条宽度） */
+  margin: 0 6px 6px;
+  padding: 4px 8px 8px;
+  position: relative;
+  z-index: 1; /* 高于缩放热区：文本点选 / 滚动条拖拽永远优先 */
+  color: var(--note-text);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  caret-color: var(--note-text);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.62;
+  resize: none;
+  outline: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* 长串（URL / 无空格中英混排）不撑出横向滚动 */
+  overflow-wrap: anywhere;
+  user-select: text;
+  /* Firefox 系滚动条（WebView2 走下面的 ::-webkit-*） */
+  scrollbar-width: thin;
+  scrollbar-color: var(--note-line) transparent;
+}
+
+/* 无边框、无 focus 环：整个窗口就是输入面 */
+.note-root .note-text:focus,
+.note-root .note-text:focus-visible {
+  outline: none;
+  border: 0;
+  box-shadow: none;
+}
+
+/* 细滚动条：9px 槽内一根 3px 圆头滑块 */
+.note-root .note-text::-webkit-scrollbar {
+  width: 9px;
+}
+
+.note-root .note-text::-webkit-scrollbar-track,
+.note-root .note-text::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.note-root .note-text::-webkit-scrollbar-thumb {
+  background-color: var(--note-line);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+.note-root .note-text::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--note-text) 55%, transparent);
+  background-clip: padding-box;
+}
+
+/* 选区：便签墨色的淡色块，两套主题下都够清楚 */
+.note-root::selection,
+.note-root ::selection {
+  background-color: var(--note-selection);
+}
+
+/* --------------------------------------------------- 8 向缩放热区（窗口边缘） ---- */
+
+/* 覆盖层本身不接触指针，只有 8 个热区接管；文案/按钮不在此层 */
+.note-root .note-resize {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.note-root .note-resize-zone {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+}
+
+/* 四边 6px；两端各让开 12px 交给四角，热区之间不重叠 */
+.note-root .note-resize-n,
+.note-root .note-resize-s {
+  left: 12px;
+  right: 12px;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.note-root .note-resize-n {
+  top: 0;
+}
+
+.note-root .note-resize-s {
+  bottom: 0;
+}
+
+.note-root .note-resize-w,
+.note-root .note-resize-e {
+  top: 12px;
+  bottom: 12px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.note-root .note-resize-w {
+  left: 0;
+}
+
+.note-root .note-resize-e {
+  right: 0;
+}
+
+/* 四角 12px */
+.note-root .note-resize-nw,
+.note-root .note-resize-ne,
+.note-root .note-resize-sw,
+.note-root .note-resize-se {
+  width: 12px;
+  height: 12px;
+}
+
+.note-root .note-resize-nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.note-root .note-resize-ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.note-root .note-resize-sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.note-root .note-resize-se {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
+}
+
+/* 右下握把：三条低 alpha 墨色斜纹（与顶部把手同风格）。
+   命中交给所在热区（本身 pointer-events: none），悬停时轻微提亮提示可抓。 */
+.note-root .note-resize-grip {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  color: var(--note-ink-faint);
+  pointer-events: none;
+  transition: color 140ms ease;
+}
+
+.note-root .note-resize-se:hover .note-resize-grip {
+  color: color-mix(in srgb, var(--note-text) 54%, transparent);
+}

@@ -206,6 +206,25 @@ function AppBarIcon({ id }: { id: string }) {
       </svg>
     );
   }
+  if (id === "note") {
+    return (
+      <svg
+        className={className}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M6.5 4h11A2.5 2.5 0 0 1 20 6.5v8l-5.5 5.5h-8A2.5 2.5 0 0 1 4 17.5v-11A2.5 2.5 0 0 1 6.5 4Z" />
+        <path d="M20 14.5h-5.5v5.5" />
+        <path d="M8 9.5h7" />
+        <path d="M8 13h4" />
+      </svg>
+    );
+  }
   if (id === "settings") {
     return (
       <svg

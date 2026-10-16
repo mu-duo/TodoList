@@ -116,7 +116,7 @@ app_bar:
 
 - `app_bar.order`（string[]，可选）：入口稳定 id 的**有序**列表；宽屏竖栏与窄屏顶部**共用**同一顺序。
 - **已知 id**：`refresh`、`pin`、`settings`（本轮）；`agent` 预留（本轮不实现、不占位）。
-- **默认顺序**（字段缺失 / 为空）：`[refresh, pin, settings]`；未来新增入口在默认顺序末尾追加。
+- **默认顺序**（字段缺失 / 为空）：`[refresh, pin, note, settings, agent]`（Agent 于 1.7.0 追加、便签于 1.8.0 加入）；新增入口对已保存顺序仍默认追加到末尾。
 - **重复 id**：取第一次出现，忽略后续。
 - **未知 id**：不渲染（隐藏），但**保留其在数组中的原始槽位**；仅允许重排可见入口。
 - **新增未配置入口**：默认追加到用户顺序末尾；用户重排后写回。
@@ -286,6 +286,13 @@ agent:
 - **平台限制**：Windows toast best effort；permission API 不能探测 Windows 设置 / 专注助手屏蔽；`show` 返回成功不代表系统实际展示或用户已送达。当前无 UI 状态面板；账本只表示发送尝试，不是送达回执。
 - **离线状态限制**：无 watcher / 事件日志时，应用关闭期间完整发生的 open→done→open 不可识别；按产品确认，启动以最终 open 状态作普通 catch-up，不推断曾完成。
 
+## 8. 便签窗口（FR-APP-35，1.8.0 已实现；用户验收通过 2026-10-16）
+
+- **窗口**：主窗经 `WebviewWindow` 创建，标签 `note-<n>`；URL `/?note=<index>&theme=<pref>`（`index` 取模归一到 6 档；`theme ∈ system|light|dark`，非法回退 `system`）；无边框、无任务栏项、默认 280×320（最小 200×160）、不可最大化、创建即带 `theme`。**不新增持久化字段、不写数据目录。**
+- **颜色契约**：`src/noteColors.ts`（`NOTE_TONES` / `NOTE_COLOR_COUNT` / `NOTE_COLORS`）为窗口创建与视觉层共用；两套 6 档调色板——亮色 = 浅色系 黄 / 白 / 绿 / 蓝 / 青 / 紫；暗色 = 灰 → 灰白 6 度（t4 起文字翻转为深色）；按开窗顺序轮换、相邻不同档。
+- **事件**：`theme-pref-changed`（payload `ThemePref`）——主窗主题变更时广播，便签窗口监听并重新钉主题（颜色按档位实时重映射）；`exit-requested-with-notes`（payload `{ noteCount }`）——关窗路径存在便签时由 Rust 广播，前端弹应用内确认框。
+- **命令**：`exit_app() -> void`——退出确认通过后由前端调用（`app.exit(0)`，随进程关闭全部便签）。托盘菜单「退出」存在便签时不走事件：Rust 直接弹系统原生非阻塞对话框（`OkCancelCustom("退出","取消")`、不恢复主窗、`AtomicBool` 防连点），确认 → `app.exit(0)`。
+
 ## Log
 
 - 2026-10-10 子任务**定形**（FR-APP-03）：`subtasks` 元素固定为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；**一层、元素不可嵌套**（深度恒为 1）；数组顺序 = 显示顺序；增 / 删 / 勾选 / **改名**经**按 id 的原子命令**写入（避免整数组覆盖冲掉外部并发改动）。schema 形状本身未变（与 §2 示例一致）。
@@ -299,3 +306,4 @@ agent:
 - 2026-10-13 新增 §5.1「已完成」视图分组折叠偏好（FR-APP-18）：`load_settings` 增 `completed_collapsed: string[] | null`、新增 `save_completed_collapsed({ collapsed })`——Value 级补丁**仅改 `completed.collapsed`**，`null` / 空数组删除该字段恢复默认（全部展开），保留 `theme` / `app_bar` / 未知字段，空白文件名 / `completed` 非对象报中文错误不写盘；键 = 清单文件名、失效键由 UI 静默忽略。同批记 **`move_task(list_file, task_id, to_list_file)`**（FR-APP-04 任务跨清单转移）为**命令级移动**、**不新增字段 / 文件**；双文件写序为「先向目标追加、再自源移除 + 失败回滚」。**未改数据目录 schema**。
 - 2026-10-13 **提醒改造（1.6.0）**：字段 `reminder_offset_days: 1`（提前 1 天 opt-in）改为 `reminder: false`（默认四档 opt-out）；`update_task_metadata` patch 改 `reminder?: false | null`（`false` 写入、`null` 删键）；`TaskView.reminder: false | null`。四档事件 `advance7/advance1/advance1h/due`（旧 `advance` 兼容读取）；ledger 增 `observed`（首帧标记），`last_status` 语义保持（done→open 抑制全部已过档）；首帧静默 claim 已过提前档、首帧到期档补一条；合并 catch-up 文案按 due 是否已过。通知注册 `due-reminder`/`remind-off` 动作 + `reminder-disabled` 事件；点击仅在通知停留屏幕时被接收（Tier 1）。**未改数据目录 schema**。
 - 2026-10-14 **多 Provider（细节 part 1+2 + 收口修复）**：§6 契约更新为多 Provider——settings 增 `agent.provider` / `agent.custom{protocol,base_url}` / `agent.model_by_provider`；`agent_list_providers` 增 `protocol("anthropic"/"openai")` / `is_custom` 并含末尾合成 `custom` 条目；新增 `agent_list_models`（`{source:"remote"|"none", models:[{id,protocol,supported}]}`，任何失败一律 none，custom **仅在入参与已保存配置归一化一致时**才带密钥）；key 命令 `provider?` 可选（缺省=当前 provider）；`agent_probe` 改**最小 chat 请求**（`max_tokens=16`、单条 user 消息）；搜索按 `search_support` 门控（`native_search` 不下发）；自定义端点路径约定（openai `/chat/completions`；anthropic base 以 `/v1` 结尾 → `/messages`，否则 `/v1/messages`）+ **keyless**（无认证头）；凭据**分槽** + 旧单槽自动迁移（ADR-0009 修订 ADR-0005/0008 的 provider 限定）。**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**。
+- 2026-10-16 新增 §8「便签窗口」（FR-APP-35，1.8.0）：窗口 / 主题 / 退出联动契约与两套 6 档调色板；新增事件 `theme-pref-changed`、`exit-requested-with-notes` 与命令 `exit_app`；§5 默认顺序更新为 `[refresh, pin, note, settings, agent]`。**未改数据目录 schema、不新增持久化字段**。
