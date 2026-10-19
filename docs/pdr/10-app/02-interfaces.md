@@ -288,7 +288,7 @@ agent:
 
 ## 8. 便签窗口（FR-APP-35，1.8.0 已实现；用户验收通过 2026-10-16）
 
-- **窗口**：主窗经 `WebviewWindow` 创建，标签 `note-<n>`；URL `/?note=<index>&theme=<pref>`（`index` 取模归一到 6 档；`theme ∈ system|light|dark`，非法回退 `system`）；无边框、无任务栏项、默认 280×320（最小 200×160）、不可最大化、创建即带 `theme`。**不新增持久化字段、不写数据目录。**
+- **窗口**：主窗经 `WebviewWindow` 创建，标签 `note-<n>`；URL `/?note=<index>&theme=<pref>`（`index` 取模归一到 6 档；`theme ∈ system|light|dark`，非法回退 `system`）；无边框、进入任务栏分组（`skipTaskbar: false`，悬浮缩略图可见）、默认 280×320（最小 200×160）、不可最大化、创建即带 `theme`。**不新增持久化字段、不写数据目录。**
 - **颜色契约**：`src/noteColors.ts`（`NOTE_TONES` / `NOTE_COLOR_COUNT` / `NOTE_COLORS`）为窗口创建与视觉层共用；两套 6 档调色板——亮色 = 浅色系 黄 / 白 / 绿 / 蓝 / 青 / 紫；暗色 = 灰 → 灰白 6 度（t4 起文字翻转为深色）；按开窗顺序轮换、相邻不同档。
 - **事件**：`theme-pref-changed`（payload `ThemePref`）——主窗主题变更时广播，便签窗口监听并重新钉主题（颜色按档位实时重映射）；`exit-requested-with-notes`（payload `{ noteCount }`）——关窗路径存在便签时由 Rust 广播，前端弹应用内确认框。
 - **命令**：`exit_app() -> void`——退出确认通过后由前端调用（`app.exit(0)`，随进程关闭全部便签）。托盘菜单「退出」存在便签时不走事件：Rust 直接弹系统原生非阻塞对话框（`OkCancelCustom("退出","取消")`、不恢复主窗、`AtomicBool` 防连点），确认 → `app.exit(0)`。
@@ -307,3 +307,4 @@ agent:
 - 2026-10-13 **提醒改造（1.6.0）**：字段 `reminder_offset_days: 1`（提前 1 天 opt-in）改为 `reminder: false`（默认四档 opt-out）；`update_task_metadata` patch 改 `reminder?: false | null`（`false` 写入、`null` 删键）；`TaskView.reminder: false | null`。四档事件 `advance7/advance1/advance1h/due`（旧 `advance` 兼容读取）；ledger 增 `observed`（首帧标记），`last_status` 语义保持（done→open 抑制全部已过档）；首帧静默 claim 已过提前档、首帧到期档补一条；合并 catch-up 文案按 due 是否已过。通知注册 `due-reminder`/`remind-off` 动作 + `reminder-disabled` 事件；点击仅在通知停留屏幕时被接收（Tier 1）。**未改数据目录 schema**。
 - 2026-10-14 **多 Provider（细节 part 1+2 + 收口修复）**：§6 契约更新为多 Provider——settings 增 `agent.provider` / `agent.custom{protocol,base_url}` / `agent.model_by_provider`；`agent_list_providers` 增 `protocol("anthropic"/"openai")` / `is_custom` 并含末尾合成 `custom` 条目；新增 `agent_list_models`（`{source:"remote"|"none", models:[{id,protocol,supported}]}`，任何失败一律 none，custom **仅在入参与已保存配置归一化一致时**才带密钥）；key 命令 `provider?` 可选（缺省=当前 provider）；`agent_probe` 改**最小 chat 请求**（`max_tokens=16`、单条 user 消息）；搜索按 `search_support` 门控（`native_search` 不下发）；自定义端点路径约定（openai `/chat/completions`；anthropic base 以 `/v1` 结尾 → `/messages`，否则 `/v1/messages`）+ **keyless**（无认证头）；凭据**分槽** + 旧单槽自动迁移（ADR-0009 修订 ADR-0005/0008 的 provider 限定）。**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**。
 - 2026-10-16 新增 §8「便签窗口」（FR-APP-35，1.8.0）：窗口 / 主题 / 退出联动契约与两套 6 档调色板；新增事件 `theme-pref-changed`、`exit-requested-with-notes` 与命令 `exit_app`；§5 默认顺序更新为 `[refresh, pin, note, settings, agent]`。**未改数据目录 schema、不新增持久化字段**。
+- 2026-10-19 便签进入任务栏分组（FR-APP-35 调整）：取消 `skipTaskbar`，任务栏悬浮缩略图 / 窗口列表可见；缩略图 X 与任务栏「关闭窗口」走默认关闭（丢弃、无提示）；从缩略图激活自动聚焦文本区；托盘开启且便签存在时任务栏图标不消失（方案 A）。**未改 schema、无新增权限。**

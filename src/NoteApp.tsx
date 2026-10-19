@@ -122,6 +122,26 @@ export default function NoteApp({ colorIndex, themePref }: NoteAppProps) {
     textRef.current?.focus();
   }, []);
 
+  // 从任务栏缩略图 / 其他窗口切回时（窗口获得系统焦点）自动聚焦文本区。
+  // 只响应「系统焦点获取」事件，不会抢按钮的点击焦点。
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let disposed = false;
+    getCurrentWindow()
+      .onFocusChanged(({ payload }) => {
+        if (payload) textRef.current?.focus();
+      })
+      .then((off) => {
+        if (disposed) off();
+        else unlisten = off;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   async function togglePin() {
     if (pinBusy.current) return;
     pinBusy.current = true;

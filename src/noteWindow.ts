@@ -92,7 +92,6 @@ async function createNoteWindow(themePref: ThemePref): Promise<void> {
     minWidth: 200,
     minHeight: 160,
     maximizable: false,
-    skipTaskbar: true,
     shadow: true,
     alwaysOnTop: false,
   });
