@@ -11,6 +11,7 @@ import {
   type DragEndEvent,
   type DragMoveEvent,
   type DragStartEvent,
+  type DropAnimation,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -20,11 +21,36 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { usePrefersReducedMotion } from "../hooks";
 import { Z_LAYER } from "../layers";
 
 type Axis = "vertical" | "horizontal";
+
+/**
+ * 收缩态落下：仅 100ms 淡出，关键帧位移保持原地，绝不飞回源行。
+ * dnd-kit 在 dragEnd 时会同步卸载浮层，`dropAnimation={null}` 会瞬间消失、
+ * 留不出淡出时间，故用零位移关键帧实现「原地消失」。
+ */
+const COLLAPSED_DROP_ANIMATION: DropAnimation = {
+  duration: 100,
+  easing: "ease-out",
+  sideEffects: null,
+  keyframes: ({ transform }) => {
+    const at = CSS.Transform.toString(transform.initial);
+    return [
+      { opacity: 1, transform: at },
+      { opacity: 0, transform: at },
+    ];
+  },
+};
 
 type SortableListProps = {
   /** 可排序项的 id（顺序即展示顺序）。 */
@@ -50,11 +76,18 @@ type SortableListProps = {
   /** 固定尾项（如「已完成」），不可拖拽。 */
   footer?: ReactNode;
   onReorder?: (activeId: string, overId: string) => void;
-  onDragStart?: () => void;
+  onDragStart?: (event: DragStartEvent) => void;
   /** 拖拽结束 / 取消回调：入参为被拖拽项的 id（取消时为 null）。 */
   onDragEnd?: (activeId: string | null) => void;
   /** 拖拽过程中的回调（用于指针命中测试等，如「拖到清单条」）。 */
   onDragMove?: (event: DragMoveEvent) => void;
+  /**
+   * 浮层是否处于「收缩为图标」状态（仅任务列表使用）。
+   * 收缩态落下时不做飞回动画，改为 100ms 原地淡出。
+   */
+  overlayCollapsed?: boolean;
+  /** 浮层内层容器的行内样式（承载抓取点 / 收缩比例等 CSS 变量）。 */
+  overlayStyle?: CSSProperties;
   /** 整行右键回调（用于清单操作菜单）。 */
   onItemContextMenu?: (id: string, event: MouseEvent) => void;
   /** 单项禁用拖拽。 */
@@ -94,6 +127,8 @@ export function SortableList({
   onDragStart,
   onDragEnd,
   onDragMove,
+  overlayCollapsed = false,
+  overlayStyle,
   onItemContextMenu,
   itemDisabled,
   rowDataAttributes,
@@ -102,6 +137,13 @@ export function SortableList({
 }: SortableListProps) {
   const reduced = usePrefersReducedMotion();
   const [activeId, setActiveId] = useState<string | null>(null);
+  // 当前是否处于收缩态：落下时据此选择「原地淡出」而非默认飞回。
+  // 必须随 overlayCollapsed 回落为 false，否则先经过清单、再拖回空白/源清单
+  // 落下时仍会错误地走收缩淡出。
+  const collapsedDropRef = useRef(false);
+  useEffect(() => {
+    collapsedDropRef.current = overlayCollapsed;
+  }, [overlayCollapsed]);
   // 无条件建立各传感器描述符，按 interaction 选择注册，保持 hooks 调用顺序稳定。
   const pointerSensor = useSensor(PointerSensor, {
     activationConstraint: { distance: 6 },
@@ -156,12 +198,16 @@ export function SortableList({
   }
 
   function handleDragStart(event: DragStartEvent) {
+    collapsedDropRef.current = false;
+    // 浮层 pointer-events:none 后，拖拽光标由 body 统一兜住（任务 / 清单 / AppBar 共用）
+    document.body.classList.add("is-dragging");
     setActiveId(String(event.active.id));
-    onDragStart?.();
+    onDragStart?.(event);
   }
 
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
+    document.body.classList.remove("is-dragging");
     setActiveId(null);
     onDragEnd?.(String(active.id));
     if (over && active.id !== over.id) {
@@ -177,6 +223,7 @@ export function SortableList({
       onDragMove={onDragMove}
       onDragEnd={handleDragEnd}
       onDragCancel={() => {
+        document.body.classList.remove("is-dragging");
         setActiveId(null);
         onDragEnd?.(null);
       }}
@@ -201,10 +248,22 @@ export function SortableList({
       </SortableContext>
       <DragOverlay
         zIndex={Z_LAYER.drag}
-        dropAnimation={reduced ? null : undefined}
+        style={{ pointerEvents: "none" }}
+        dropAnimation={
+          reduced
+            ? null
+            : collapsedDropRef.current
+              ? COLLAPSED_DROP_ANIMATION
+              : undefined
+        }
       >
         {activeId && renderOverlay ? (
-          <div className="drag-overlay">{renderOverlay(activeId)}</div>
+          <div
+            className={`drag-overlay${overlayCollapsed ? " is-over-list" : ""}`}
+            style={overlayStyle}
+          >
+            {renderOverlay(activeId)}
+          </div>
         ) : null}
       </DragOverlay>
     </DndContext>

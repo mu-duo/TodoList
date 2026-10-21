@@ -1,9 +1,10 @@
 /**
  * 任务跨清单转移的前端纯逻辑（无 React / DOM 依赖，便于独立断言验证）。
  *
- * 覆盖两处判定：
+ * 覆盖：
  * - 右键「移动到清单」子菜单的目标清单计算；
- * - 拖拽任务时对清单条项做指针命中测试，解析出有效落点。
+ * - 拖拽任务时对清单条项做指针命中测试，解析出有效落点；
+ * - 源任务滚动区 / 「已完成」落点等矩形命中判定（含边界与容差）。
  */
 
 /** 侧栏清单的最小引用（顺序即展示顺序）。 */
@@ -22,6 +23,24 @@ export type RectLike = {
 
 /** 指针坐标（视口坐标系）。 */
 export type PointerPos = { x: number; y: number };
+
+/**
+ * 指针是否落在矩形内（含边界）；`margin` 向外扩张容差（px）。
+ * 无指针（键盘拖拽）→ false。
+ */
+export function isPointInRect(
+  pointer: PointerPos | null,
+  rect: RectLike,
+  margin = 0,
+): boolean {
+  if (!pointer) return false;
+  return (
+    pointer.x >= rect.left - margin &&
+    pointer.x <= rect.right + margin &&
+    pointer.y >= rect.top - margin &&
+    pointer.y <= rect.bottom + margin
+  );
+}
 
 /**
  * 右键子菜单的目标清单：除任务所在清单外的全部真实清单，保持侧栏顺序。
@@ -45,12 +64,7 @@ export function hitTestListFile(
   rects: ReadonlyArray<RectLike & { file: string }>,
 ): string | null {
   for (const rect of rects) {
-    if (
-      pointer.x >= rect.left &&
-      pointer.x <= rect.right &&
-      pointer.y >= rect.top &&
-      pointer.y <= rect.bottom
-    ) {
+    if (isPointInRect(pointer, rect)) {
       return rect.file;
     }
   }

@@ -1,12 +1,17 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { DragMoveEvent } from "@dnd-kit/core";
+import type { DragMoveEvent, DragStartEvent } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
 import { SortableList } from "./components/SortableList";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
-import { moveTargetLists, resolveDropTarget, type RectLike } from "./taskMove";
+import {
+  isPointInRect,
+  moveTargetLists,
+  resolveDropTarget,
+  type RectLike,
+} from "./taskMove";
 import { SettingsModal } from "./components/SettingsModal";
 import { ConfirmModal } from "./components/ConfirmModal";
 import { AppBar } from "./components/AppBar";
@@ -92,6 +97,21 @@ type LoadResult = {
 
 /** 视图中的一条任务（含其来源清单）。 */
 type ViewTask = { task: Task; listFile: string; listName?: string };
+
+/** 任务浮层收缩几何：抓取点相对源行左上角，以及源行实际宽高。 */
+type DragMetrics = {
+  grabX: number;
+  grabY: number;
+  width: number;
+  height: number;
+};
+
+/** 激活事件里可能携带的指针坐标（鼠标 / 触摸）。 */
+type ActivatorPointerEvent = {
+  clientX?: number;
+  clientY?: number;
+  touches?: ArrayLike<{ clientX: number; clientY: number }>;
+};
 
 const PRIORITY_LABEL: Record<string, string> = {
   high: "高",
@@ -280,7 +300,18 @@ function App() {
   // 高亮的目标清单文件（null = 无有效目标）；state 驱动行类名，ref 供事件回调同步读取
   const [dragDropTarget, setDragDropTarget] = useState<string | null>(null);
   const dragDropTargetRef = useRef<string | null>(null);
-  // 本次拖拽是否已按「跨清单转移」处理（用于压掉随后的同清单排序回调）
+  // 指针是否已离开源任务滚动区：浮层据此收缩为图标，露出清单名与高亮
+  const [dragOutsideSource, setDragOutsideSource] = useState(false);
+  const dragOutsideSourceRef = useRef(false);
+  // 指针是否落在「已完成」固定项上：松手等同勾选完成
+  const [dragOverCompleted, setDragOverCompleted] = useState(false);
+  const dragOverCompletedRef = useRef(false);
+  // 源任务滚动区 / 「已完成」固定项（拖拽命中测试）
+  const taskScrollRef = useRef<HTMLDivElement | null>(null);
+  const completedFooterRef = useRef<HTMLLIElement | null>(null);
+  // 本次任务拖拽的抓取点 / 源行实际宽高（收缩动画的 transform-origin 与非等比比例）
+  const [dragMetrics, setDragMetrics] = useState<DragMetrics | null>(null);
+  // 本次拖拽是否已按「跨清单转移 / 勾选完成」处理（用于压掉随后的同清单排序回调）
   const dragMoveHandledRef = useRef(false);
 
   // 详情由键盘打开（click.detail===0）→ 关闭时保留焦点；指针打开 → 清焦点环
@@ -1120,7 +1151,7 @@ function App() {
     }, 0);
   }
 
-  // ---- 跨清单转移（右键子菜单 + 拖到清单条） ----
+  // ---- 跨清单转移（右键子菜单 + 拖到清单条） / 拖到「已完成」勾选完成 ----
 
   // 统一入口：移到目标清单末尾；成功后刷新；失败沿用现有错误提示。
   // 关闭正打开在详情面板的该任务，避免残留指向源清单的编辑（先落盘待写改动）。
@@ -1172,24 +1203,26 @@ function App() {
     return rects;
   }
 
+  // 由激活事件取出按下时的视口坐标（鼠标 / 触屏）；键盘拖拽无坐标 → null
+  function pointerFromActivator(
+    src: ActivatorPointerEvent,
+  ): { x: number; y: number } | null {
+    if (typeof src.clientX === "number" && typeof src.clientY === "number") {
+      return { x: src.clientX, y: src.clientY };
+    }
+    if (src.touches && src.touches.length > 0) {
+      return { x: src.touches[0].clientX, y: src.touches[0].clientY };
+    }
+    return null;
+  }
+
   // 由拖拽起点事件 + 累计位移推算当前指针视口坐标；键盘拖拽无坐标 → null
   function dragPointer(event: DragMoveEvent): { x: number; y: number } | null {
-    const src = event.activatorEvent as {
-      clientX?: number;
-      clientY?: number;
-      touches?: ArrayLike<{ clientX: number; clientY: number }>;
-    };
-    let x: number | undefined;
-    let y: number | undefined;
-    if (typeof src.clientX === "number" && typeof src.clientY === "number") {
-      x = src.clientX;
-      y = src.clientY;
-    } else if (src.touches && src.touches.length > 0) {
-      x = src.touches[0].clientX;
-      y = src.touches[0].clientY;
-    }
-    if (x === undefined || y === undefined) return null;
-    return { x: x + event.delta.x, y: y + event.delta.y };
+    const start = pointerFromActivator(
+      event.activatorEvent as ActivatorPointerEvent,
+    );
+    if (!start) return null;
+    return { x: start.x + event.delta.x, y: start.y + event.delta.y };
   }
 
   function applyDragDropTarget(file: string | null) {
@@ -1198,24 +1231,85 @@ function App() {
     setDragDropTarget(file);
   }
 
-  // 拖拽过程中：对清单条项做指针命中测试（仅普通清单视图）
+  function applyDragOutsideSource(next: boolean) {
+    if (dragOutsideSourceRef.current === next) return;
+    dragOutsideSourceRef.current = next;
+    setDragOutsideSource(next);
+  }
+
+  function applyDragOverCompleted(next: boolean) {
+    if (dragOverCompletedRef.current === next) return;
+    dragOverCompletedRef.current = next;
+    setDragOverCompleted(next);
+  }
+
+  // 拖拽过程中：清单条命中 → 高亮目标；离开源任务滚动区 → 浮层收缩；
+  // 命中「已完成」固定项 → 高亮并作为勾选完成落点（仅普通清单视图）
   function handleTaskDragMove(event: DragMoveEvent) {
     if (isCompletedView || !selectedListFile) return;
-    applyDragDropTarget(
-      resolveDropTarget(dragPointer(event), listNavRects(), selectedListFile),
+    const pointer = dragPointer(event);
+    const rects = listNavRects();
+    applyDragDropTarget(resolveDropTarget(pointer, rects, selectedListFile));
+    const scrollRect = taskScrollRef.current?.getBoundingClientRect();
+    applyDragOutsideSource(
+      pointer !== null &&
+        scrollRect != null &&
+        !isPointInRect(pointer, scrollRect, 4),
+    );
+    const footerRect = completedFooterRef.current?.getBoundingClientRect();
+    applyDragOverCompleted(
+      pointer !== null &&
+        footerRect != null &&
+        isPointInRect(pointer, footerRect),
     );
   }
 
-  function handleTaskDragStart() {
+  function handleTaskDragStart(event: DragStartEvent) {
     markDragStart();
     dragMoveHandledRef.current = false;
+    applyDragOutsideSource(false);
+    applyDragOverCompleted(false);
+    // 不读 event.active.rect.current.initial：dnd-kit 在 onStart 里先派发该事件、
+    // 之后才写入初始矩形，同步读取会拿到上一轮（或 null）。直接量当前行更稳。
+    const target = event.activatorEvent.target;
+    const card =
+      target instanceof Element
+        ? target.closest<HTMLElement>(".task-card")
+        : null;
+    const rect = card?.getBoundingClientRect();
+    if (!rect) {
+      setDragMetrics(null);
+      return;
+    }
+    const start = pointerFromActivator(
+      event.activatorEvent as ActivatorPointerEvent,
+    );
+    setDragMetrics({
+      grabX: start ? start.x - rect.left : rect.width / 2,
+      grabY: start ? start.y - rect.top : rect.height / 2,
+      width: rect.width,
+      height: rect.height,
+    });
   }
 
-  // 拖拽结束：落点为有效清单项 → 转移；否则保持既有同清单排序
+  // 拖拽结束：左侧「已完成」→ 勾选完成；清单条 → 跨清单移动；否则保持既有同清单排序
   function handleTaskDragEnd(activeId: string | null) {
     markDragEnd();
     const target = dragDropTargetRef.current;
+    const completed = dragOverCompletedRef.current;
     applyDragDropTarget(null);
+    applyDragOutsideSource(false);
+    applyDragOverCompleted(false);
+    setDragMetrics(null);
+    if (completed && activeId && selectedListFile && !isCompletedView) {
+      // 落点已被本次拖拽消费，压掉随后的同清单排序
+      dragMoveHandledRef.current = true;
+      const entry = entryById.get(activeId);
+      if (entry && entry.task.status !== "done") {
+        toggle(entry.listFile, entry.task, true);
+      }
+      return;
+    }
     if (
       target &&
       activeId &&
@@ -2224,12 +2318,23 @@ function App() {
     const entry = entryById.get(id);
     if (!entry) return null;
     const isDone = entry.task.status === "done";
+    const initial =
+      Array.from((entry.task.title || "").trim())[0] ?? "·";
     return (
-      <div className="drag-card task-drag">
-        <span className={`task-title${isDone ? " done" : ""}`}>
-          {entry.task.title || "(无标题)"}
+      <>
+        <div className="drag-card task-drag">
+          <span className={`task-title${isDone ? " done" : ""}`}>
+            {entry.task.title || "(无标题)"}
+          </span>
+        </div>
+        {/* 拖到非源清单时卡片收缩，露出这枚首字图标 */}
+        <span
+          className={`drag-icon${isDone ? " is-done" : ""}`}
+          aria-hidden="true"
+        >
+          {initial}
         </span>
-      </div>
+      </>
     );
   }
 
@@ -2548,16 +2653,23 @@ function App() {
     ? buildTaskMenuItems(taskMenuEntry)
     : [];
 
-  // 「已完成」固定项（非真实清单，不可拖拽 / 右键）
+  // 「已完成」固定项（非真实清单，不可拖拽 / 右键；任务拖拽到此＝勾选完成）
   const completedFooter = (
     <li
-      className={`list-nav-item is-fixed${isCompletedView ? " is-active" : ""}`}
+      ref={completedFooterRef}
+      className={`list-nav-item is-fixed${isCompletedView ? " is-active" : ""}${
+        dragOverCompleted ? " is-drop-target" : ""
+      }`}
       onContextMenu={(e) => e.preventDefault()}
     >
       <button
         type="button"
         className="list-nav-select"
-        onClick={() => selectList(COMPLETED_ID)}
+        onClick={() => {
+          // 拖拽落到此处时不要顺带切换视图
+          if (suppressClickRef.current) return;
+          selectList(COMPLETED_ID);
+        }}
         title="已完成"
       >
         <span className="list-nav-name">
@@ -2570,6 +2682,20 @@ function App() {
       </button>
     </li>
   );
+
+  // 收缩态浮层的几何变量：以抓取点为原点，按源行实际宽高换算非等比比例
+  const dragOverlayStyle: CSSProperties | undefined = dragMetrics
+    ? ({
+        "--drag-grab-x": `${dragMetrics.grabX}px`,
+        "--drag-grab-y": `${dragMetrics.grabY}px`,
+        "--drag-scale-x": String(
+          dragMetrics.width > 0 ? 32 / dragMetrics.width : 1,
+        ),
+        "--drag-scale-y": String(
+          dragMetrics.height > 0 ? 32 / dragMetrics.height : 1,
+        ),
+      } as CSSProperties)
+    : undefined;
 
   if (loading) {
     // 主题确定前不画亮色内容，避免深色用户闪白
@@ -2733,7 +2859,7 @@ function App() {
                   <h2>{selectedList.name}</h2>
                   <span className="pane-count">{viewTasks.length} 项</span>
                 </div>
-                <div className="task-scroll">
+                <div className="task-scroll" ref={taskScrollRef}>
                   {viewTasks.length === 0 ? (
                     <p className="hint">暂无任务。</p>
                   ) : (
@@ -2747,6 +2873,8 @@ function App() {
                         renderTaskCard(entryById.get(id)!, activatorRef)
                       }
                       renderOverlay={renderOverlayTask}
+                      overlayCollapsed={dragOutsideSource}
+                      overlayStyle={dragOverlayStyle}
                       onReorder={handleTaskReorder}
                       onDragStart={handleTaskDragStart}
                       onDragMove={handleTaskDragMove}

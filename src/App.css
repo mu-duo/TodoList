@@ -965,7 +965,7 @@ button:focus-visible {
   border-top: 1px solid var(--border);
 }
 
-/* 拖拽任务到清单条：目标清单高亮（源清单 / 固定项不会命中） */
+/* 拖拽任务到清单条：目标清单高亮（源清单不会命中；固定项仅「已完成」可命中） */
 .list-nav-item.is-drop-target {
   background: var(--accent-soft);
   box-shadow: inset 0 0 0 2px var(--accent);
@@ -985,6 +985,11 @@ button:focus-visible {
 }
 
 .list-nav-item.is-fixed.is-active .list-nav-select {
+  color: var(--accent-strong);
+}
+
+/* 任务拖到「已完成」：覆盖固定项的弱化文字色 */
+.list-nav-item.is-fixed.is-drop-target .list-nav-select {
   color: var(--accent-strong);
 }
 
@@ -1225,6 +1230,12 @@ button:focus-visible {
 
 /* -------------------------------------------------------------- 拖拽 ---- */
 
+/* 浮层本身不接收指针（见 .drag-overlay），拖拽光标由 body 统一兜住 */
+body.is-dragging,
+body.is-dragging * {
+  cursor: grabbing !important;
+}
+
 /* 拖拽中的源行：半透明（浮层由 DragOverlay 抬升显示） */
 .task-card.is-dragging,
 .list-nav-item.is-dragging {
@@ -1232,8 +1243,16 @@ button:focus-visible {
 }
 
 .drag-overlay {
+  position: relative;
   cursor: grabbing;
+  /* 浮层只做视觉，不拦截指针 / 清单条 hover（传感器监听在 document 上） */
+  pointer-events: none;
   filter: drop-shadow(0 10px 24px rgba(16, 24, 40, 0.18));
+}
+
+/* 收缩态：大阴影会留出宽残影，交给图标自带的小阴影 */
+.drag-overlay.is-over-list {
+  filter: none;
 }
 
 .drag-card {
@@ -1245,6 +1264,50 @@ button:focus-visible {
 
 .drag-card.task-drag {
   opacity: 0.95;
+  /* 以抓取点为原点，非等比收缩到 32×32（比例由行内 CSS 变量按实际宽高给出） */
+  transform-origin: var(--drag-grab-x, 50%) var(--drag-grab-y, 50%);
+  transition: transform 140ms ease-out, opacity 140ms ease-out;
+}
+
+.drag-overlay.is-over-list .drag-card.task-drag {
+  transform: scaleX(var(--drag-scale-x, 1)) scaleY(var(--drag-scale-y, 1));
+  opacity: 0;
+  transition-duration: 160ms;
+}
+
+/* 收缩后的首字图标：挂在抓取点上，随卡片淡出交叉淡入 */
+.drag-icon {
+  position: absolute;
+  left: var(--drag-grab-x, 50%);
+  top: var(--drag-grab-y, 50%);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid var(--accent-ring);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  box-shadow: var(--shadow-md);
+  font-weight: 700;
+  font-size: 0.95rem;
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.8);
+  transition: transform 140ms ease-out, opacity 140ms ease-out;
+}
+
+.drag-overlay.is-over-list .drag-icon {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+  transition-duration: 160ms;
+}
+
+.drag-overlay.is-over-list .drag-icon.is-done {
+  opacity: 0.55;
 }
 
 .drag-card.list-drag {

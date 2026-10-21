@@ -3,7 +3,7 @@
  *
  * 运行：`node src/taskMove.verify.cjs`（在仓库根或任意目录均可，路径基于 __dirname）。
  * 覆盖：右键目标清单计算（排除源清单 / 保序 / 无目标）、指针命中测试（边界 / 越界）、
- *       拖拽落点解析（源清单不有效 / 空指针放行既有排序）。
+ *       拖拽落点解析（源清单不有效 / 空指针放行既有排序）、矩形命中（边界 / 容差 / 空指针）。
  * 说明：本文件不是构建产物的一部分（未被任何模块 import；tsc 不包含 .cjs）。
  */
 const path = require("path");
@@ -91,5 +91,38 @@ ok("resolveDropTarget：未命中清单项 → 无效（保持既有排序）", 
   ));
 ok("resolveDropTarget：键盘拖拽（指针为空）→ 无效", () =>
   assert.strictEqual(m.resolveDropTarget(null, RECTS, "a.md"), null));
+
+// 4. 矩形命中：含边界与容差（源任务滚动区 / 「已完成」落点共用）
+const BOX = { left: 10, top: 20, right: 110, bottom: 60 };
+ok("isPointInRect：内部 → true", () =>
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 40 }, BOX), true));
+ok("isPointInRect：四角边界含端点 → true", () => {
+  assert.strictEqual(m.isPointInRect({ x: 10, y: 20 }, BOX), true);
+  assert.strictEqual(m.isPointInRect({ x: 110, y: 60 }, BOX), true);
+  assert.strictEqual(m.isPointInRect({ x: 10, y: 60 }, BOX), true);
+  assert.strictEqual(m.isPointInRect({ x: 110, y: 20 }, BOX), true);
+});
+ok("isPointInRect：外侧 1px → false", () => {
+  assert.strictEqual(m.isPointInRect({ x: 9, y: 40 }, BOX), false);
+  assert.strictEqual(m.isPointInRect({ x: 111, y: 40 }, BOX), false);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 19 }, BOX), false);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 61 }, BOX), false);
+});
+ok("isPointInRect：4px 容差内（含边界）→ true", () => {
+  assert.strictEqual(m.isPointInRect({ x: 6, y: 40 }, BOX, 4), true);
+  assert.strictEqual(m.isPointInRect({ x: 114, y: 40 }, BOX, 4), true);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 16 }, BOX, 4), true);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 64 }, BOX, 4), true);
+});
+ok("isPointInRect：容差外 1px → false", () => {
+  assert.strictEqual(m.isPointInRect({ x: 5, y: 40 }, BOX, 4), false);
+  assert.strictEqual(m.isPointInRect({ x: 115, y: 40 }, BOX, 4), false);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 15 }, BOX, 4), false);
+  assert.strictEqual(m.isPointInRect({ x: 50, y: 65 }, BOX, 4), false);
+});
+ok("isPointInRect：负容差向内收缩 → false", () =>
+  assert.strictEqual(m.isPointInRect({ x: 10, y: 20 }, BOX, -1), false));
+ok("isPointInRect：指针为空（键盘拖拽）→ false", () =>
+  assert.strictEqual(m.isPointInRect(null, BOX, 4), false));
 
 console.log("\n" + pass + " assertions passed");
