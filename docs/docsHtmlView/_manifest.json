@@ -1,0 +1,16 @@
+{
+  "generated_by": "docs-html-view gen_prd.py",
+  "documents": [
+    "adr/README.md",
+    "current/00-README.md",
+    "current/app.md",
+    "docsHtmlView/glossary.md",
+    "product/00-README.md",
+    "product/01-requirements.md",
+    "product/02-architecture.md",
+    "product/10-app/00-README.md",
+    "product/10-app/01-spec.md",
+    "product/10-app/02-interfaces.md",
+    "product/10-app/03-nfr.md"
+  ]
+}

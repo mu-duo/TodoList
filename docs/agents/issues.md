@@ -1,4 +1,4 @@
-> 模板来源：project-docs-workflow v2（模板演进后可重跑幂等 init 对齐；本文件可按项目实际修改）
+> 模板来源：project-docs-workflow v5（模板演进后可重跑幂等 init 对齐；本文件可按项目实际修改）
 
 # Issue 体系（仓库内工作跟踪）
 
@@ -11,13 +11,14 @@ docs/issues/
 ├── bug/{human,agent}/        # 缺陷修复
 ├── feature/{human,agent}/    # 新功能
 ├── chore/{human,agent}/      # 维护 / 重构 / 杂务
-├── suggestion/{human,agent}/ # 改进建议（无 history、无状态；归宿 adr / pdr）
+├── suggestion/{human,agent}/ # 改进建议（无 history、无状态；归宿 adr / prd）
 └── <bug|feature|chore>/history/   # 归档：文件名尾部带 -done（完成）/ -drop（放弃）
 ```
 
 - `human/` 与 `agent/` = 当前责任方；责任移交时把文件 `git mv` 到对方目录。
 - 仅保留近期待办（约一周窗口）；完成或放弃的条目由完成者随手归档，人定期巡检。
-- `suggestion` 特殊：处理完成后——采纳 → 结论落 adr（或更新 pdr），随后删除本条目；不采纳 → 仅当 human 明确要求时才落否决 ADR，否则直接删除；本质是 bug / feature / chore 的 → 挪到对应目录。
+- `-drop` 是工作状态归档，不是否定决策。默认「不记被拒备选方案」的规则不删除、不改写已放弃条目；issue 的 Log 仍可记录放弃原因。
+- `suggestion` 特殊：处理完成后——采纳 → 结论落 ADR（或更新 PRD），随后删除本条目；不采纳 → 仅当 human 明确要求时才落否决 ADR，否则直接删除；本质是 bug / feature / chore 的 → 挪到对应目录。
 
 ## 条目格式
 
@@ -48,15 +49,16 @@ docs/issues/
 
 （若本机安装了 project-docs-workflow：条目骨架 ~/.agents/skills/project-docs-workflow/assets/templates/entries/issue-entry.md；未安装则按本文格式创建。）
 
-- `Status` 就地更新；`## Log` 追加式记录，不改历史行。
-- 涉及 adr / pdr 的改动，须同步更新对应文档。
-- 推进流程见 `workflow.md`（推荐五步：规划 / 骨架 / 细节 / 异常 / 回顾）；步骤状态就地更新，变更记 Log。
+- `Status` 就地更新；`## Log` 追加式记录，不改历史行，仅记关键事件（范围变化 / 阻塞 / 交接 / 放弃），不需要逐步机械追加。
+- 涉及 ADR / PRD 的改动，须同步更新对应文档。
+- issue 可引用 FR / 文档；收尾更新 Current 事实时，不插入指向本 issue 的自链接或任务历史。
+- 推进流程见 `workflow.md`（推荐五步：规划 / 骨架 / 细节 / 异常 / 回顾）；步骤状态就地更新，关键事件记 Log。
 
 ## 与开发流程的衔接
 
-- 开工前与用户对齐本次范围与粒度（差距候选来自 PDR 目标与现状）。
-- 步骤按 `docs/agents/workflow.md` 推荐流程推进，状态就地更新，变更记 Log。
-- 收尾回顾时更新受影响模块的 `04-current.md`。
+- 开工前与用户对齐本次范围与粒度（差距候选来自 PRD 目标与 Current 现状）。
+- 步骤按 `docs/agents/workflow.md` 推荐流程推进，状态就地更新，关键事件记 Log。
+- 收尾回顾时对照变更检查 `docs/current/` 对应文件是否有需更新（只改事实，不插入指向 issue 的自链接或任务历史）。
 
 ## 相关
 

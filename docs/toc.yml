@@ -1,0 +1,51 @@
+# 模板来源：project-docs-workflow v5（模板演进后可重跑幂等 init 对齐；本文件可按项目实际修改）
+#
+# docs/toc.yml 是发布的唯一来源：docs-html-view 只构建这里列出的文档。
+# 章节 id 固定为 overview / requirements / architecture / appendix；附录 id 固定为
+# glossary / spec / current / adr。路径相对项目根目录，且必须落在 docs/product、
+# docs/current、docs/adr 或根 CONTEXT.md 之内。
+
+title: TodoList
+version: v1.8.1
+date: 2026-10-21
+abstract: 面向 Windows 桌面的本地优先待办工具：任务数据以人类可读、外部可写、可版本化的 YAML 纯文本为唯一事实源，同时服务使用者与外部 agent。
+
+sections:
+  - id: overview
+    title: 项目说明与典型应用场景
+    documents: [docs/product/00-README.md]
+
+  - id: requirements
+    title: 产品需求
+    documents: [docs/product/01-requirements.md]
+
+  - id: architecture
+    title: 架构设计与模块划分
+    documents: [docs/product/02-architecture.md]
+    modules: auto
+    exclude: []
+
+  - id: appendix
+    title: 附录
+    sections:
+      - id: glossary
+        title: 术语表
+        # 根 CONTEXT.md 在构建时复制为 docs/docsHtmlView/glossary.md。
+        documents: [CONTEXT.md]
+
+      - id: spec
+        title: SPEC（技术规格）
+        # 支持 * 与 ** glob；design/ 默认不发布。
+        documents:
+          - docs/product/*/01-spec.md
+          - docs/product/*/02-interfaces.md
+          - docs/product/*/03-nfr.md
+
+      - id: current
+        title: 项目现状
+        documents: [docs/current/00-README.md, docs/current/**/*.md]
+
+      - id: adr
+        title: 架构决策
+        # 只列要发布的 ADR；README.md 是目录，具体条目按需追加。
+        documents: [docs/adr/README.md]

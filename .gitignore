@@ -21,6 +21,11 @@ release/
 # Agent workflow state (not application data)
 .slim/deepwork/
 
+# Docs HTML render
+.venv-docs/
+docs/docsHtmlView/build/
+docs/docsHtmlView/__pycache__/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -1,0 +1,8 @@
+{
+  "generated_by": "docs-html-view gen_prd.py",
+  "title": "TodoList",
+  "version": "v1.8.1",
+  "date": "2026-10-21",
+  "abstract": "面向 Windows 桌面的本地优先待办工具：任务数据以人类可读、外部可写、可版本化的 YAML 纯文本为唯一事实源，同时服务使用者与外部 agent。",
+  "author": ""
+}

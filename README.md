@@ -50,7 +50,7 @@ pnpm tauri dev      # 首次编译较慢
 - 写回安全：原子写（临时文件 + rename）；未知字段原样保留
 - 手动刷新：外部修改文件后点功能栏的「刷新」图标即可看到变化（不覆盖正在编辑的详情草稿）
 
-规划中（未实现）：外部变更自动重载（watch）、搜索 / 过滤、拖拽排序与跨清单移动、优先级 / 截止 / 标签、提醒 / 重复任务、托盘 / 全局快捷键 / 自启。详见 [`docs/pdr/10-app/04-current.md`](docs/pdr/10-app/04-current.md)。
+规划中（未实现）：外部变更自动重载（watch）、搜索 / 过滤 / 排序视图、标签、重复任务、逾期高亮、全局快捷键、开机自启、托盘快速查看 / 添加。详见 [`docs/current/app.md`](docs/current/app.md)。
 
 ## 使用
 
@@ -91,7 +91,7 @@ tasks:
     created: 2026-10-08T14:06
 ```
 
-完整字段契约见 [`docs/pdr/10-app/02-interfaces.md`](docs/pdr/10-app/02-interfaces.md)。
+完整字段契约见 [`docs/product/10-app/02-interfaces.md`](docs/product/10-app/02-interfaces.md)。
 
 **设置** —— `%APPDATA%\com.lftan.todolist\settings.yaml`（主题偏好、功能栏顺序 `app_bar.order` 与 Agent 配置 `agent`；与任务数据分家，见 [ADR-0006](docs/adr/0006-设置存储-应用配置目录.md)）。Agent 的 API Key 单独存 `%APPDATA%\com.lftan.todolist\agent.credentials`（**DPAPI 加密、按 provider 分槽、不回界面**；旧单槽自动迁移）；**运行记录 / 锁**在 `%APPDATA%\com.lftan.todolist\agent\`；**结果**写入 Agent 配置里指定的**结果主目录**（`{result_root}\{task_id}\{时间戳}_{run_id}\` 下 `report.md` + `sources.json`）。
 
@@ -114,7 +114,7 @@ pnpm install
 pnpm tauri dev            # 开发运行
 pnpm build                # 前端构建（tsc + vite）
 cd src-tauri
-cargo test                # 测试（117 个）
+cargo test                # 测试（234 个）
 cargo clippy --all-targets
 cargo check
 ```
@@ -123,7 +123,8 @@ cargo check
 
 ## 文档地图
 
-- [`docs/pdr/10-app/`](docs/pdr/10-app/) — PDR：规格与文件契约（先读 `01-spec` / `02-interfaces`）
+- [`docs/product/10-app/`](docs/product/10-app/) — PRD：规格与文件契约（先读 `01-spec` / `02-interfaces`）
+- [`docs/current/app.md`](docs/current/app.md) — 现状：实际能力、限制与验证口径
 - [`docs/adr/`](docs/adr/) — 关键决策记录（本地优先 / 存储格式 / 写入安全 / 技术栈 / 边界）
 - [`docs/issues/`](docs/issues/) — 工作条目（完成项归档于 `history/`）
 - [`CONTEXT.md`](CONTEXT.md) — 术语表；[`AGENTS.md`](AGENTS.md) — 协作约定
@@ -131,4 +132,4 @@ cargo check
 ## 已知限制
 
 - 同一任务被双方（应用 / 外部）同时修改时，以磁盘后写为准（不做字段级合并，见 [ADR-0003](docs/adr/0003-外部写入与写入安全.md)）。
-- 无撤销；删除仅确认一次；清单排序会重写目录内全部清单文件（YAML 排版会被规范化）。
+- 无撤销；任务 / 子任务删除无确认，清单删除仅确认一次；清单排序会重写目录内全部清单文件（YAML 排版会被规范化）。
