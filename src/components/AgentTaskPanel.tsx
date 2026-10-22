@@ -4,7 +4,6 @@ import { agentErrorClassLabel, agentStateMeta, agentStateTitle, agentStepsText, 
 
 type AgentTaskPanelProps = {
   enabled: boolean;
-  paths: string[];
   /** 当前已知的运行态（事件 / 状态轮询）；无则 null。 */
   liveState?: string | null;
   liveErrorClass?: string | null;
@@ -18,8 +17,6 @@ type AgentTaskPanelProps = {
   runsHasMore: boolean;
   sectionRef: RefObject<HTMLElement | null>;
   onToggleEnabled: (enabled: boolean) => void;
-  onAddPaths: (directories: boolean) => void;
-  onRemovePath: (path: string) => void;
   onStart: () => void;
   onStop: () => void;
   onOpenResult: (runId: string) => void;
@@ -27,12 +24,11 @@ type AgentTaskPanelProps = {
 };
 
 /**
- * 详情内的 Agent 区：状态、关联材料（可增删）、运行历史、打开结果目录。
- * 只读展示 + 经命令写入；不做聊天面板。
+ * 详情内的 Agent 区：启用开关、运行状态、运行历史与打开结果目录。
+ * 关联材料已独立为详情「关联材料」板块（见 `MaterialsPanel`），此处不再管理。
  */
 export function AgentTaskPanel({
   enabled,
-  paths,
   liveState,
   liveErrorClass,
   liveStopReason,
@@ -43,8 +39,6 @@ export function AgentTaskPanel({
   runsHasMore,
   sectionRef,
   onToggleEnabled,
-  onAddPaths,
-  onRemovePath,
   onStart,
   onStop,
   onOpenResult,
@@ -82,54 +76,10 @@ export function AgentTaskPanel({
       </label>
       {!enabled && (
         <p className="agent-hint">
-          启用后，Agent 会在本机执行时按需读取下方关联材料（只读），并把任务内容发送到
-          所选 Provider 云端。
+          启用后，Agent 会在本机执行时只读关联材料（本地路径与链接，链接需能联网抓取），
+          并把任务内容发送到所选 Provider 云端；无写入、无命令执行。
         </p>
       )}
-
-      <div className="agent-field">
-        <div className="agent-field-head">
-          <span className="field-label">关联材料</span>
-          <div className="agent-actions">
-            <button
-              type="button"
-              className="row-action"
-              onClick={() => onAddPaths(false)}
-            >
-              添加文件
-            </button>
-            <button
-              type="button"
-              className="row-action"
-              onClick={() => onAddPaths(true)}
-            >
-              添加目录
-            </button>
-          </div>
-        </div>
-        {paths.length === 0 ? (
-          <p className="agent-hint">暂无关联材料。</p>
-        ) : (
-          <ul className="agent-path-list">
-            {paths.map((p) => (
-              <li key={p} className="agent-path-item">
-                <span className="agent-path-text" title={p}>
-                  {p}
-                </span>
-                <button
-                  type="button"
-                  className="agent-path-remove"
-                  onClick={() => onRemovePath(p)}
-                  aria-label={`移除 ${p}`}
-                  title="移除"
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
 
       <div className="agent-actions">
         <button

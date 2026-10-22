@@ -1,8 +1,9 @@
 /* ---------------------------------------------------------------------------
    TodoList · 简约风样式
    固定视口高度：页头固定 → 内容区（两侧各自内部滚动）→ 底部通栏「新增 todo」。
-   宽屏（> 760px）：主区（任务列表内部滚动）+ 右列（上：清单条 / 下：任务详情）；
-   窄屏（≤ 760px）：单列（横向清单条 → 任务列表）+ 右侧详情抽屉。
+   宽屏（> 760px）：左列（清单条 → 任务列表，任务列表内部滚动）+ 右列（任务详情）；
+   窄屏（≤ 760px）：单列（横向清单条 → 任务列表）+ 右侧详情抽屉；
+   清单条宽窄两态渲染一致（横向 chip 行 + 新建清单行，无标题栏）。
    单强调色（--accent）+ 语义危险色（--danger），浅色底 + 白色卡片，过渡统一 150ms。
 --------------------------------------------------------------------------- */
 
@@ -382,7 +383,7 @@ button:focus-visible {
   overflow-y: auto;
 }
 
-/* ------------------------------------------- 两栏：主区 + 右列（边上） ---- */
+/* ------------------------------- 两栏：左列（清单条 + 任务列表）+ 右列（详情） ---- */
 
 .layout {
   flex: 1;
@@ -393,7 +394,17 @@ button:focus-visible {
   align-items: stretch;
 }
 
+/* 左列：清单条在上、任务列表填满剩余高度 */
+.main-col {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .main-pane {
+  flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -835,7 +846,7 @@ button:focus-visible {
 
 /* 清单条底部「新增清单」行（同款） */
 .lists-block > .add-row {
-  margin-top: 8px;
+  margin-top: 0;
 }
 
 /* -------------------------------------------------------------- 边栏块 ---- */
@@ -874,30 +885,33 @@ button:focus-visible {
   padding: 1px 9px;
 }
 
-/* -------------------------------------------------------------- 清单条 ---- */
+/* -------------------------------------------- 清单条（宽窄两态一致） ---- */
 
 .lists-block {
   flex: none;
-  max-height: 45vh;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  padding: 8px;
 }
 
 .list-nav {
   list-style: none;
   margin: 0;
-  padding: 0;
+  padding: 0 0 2px;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  flex: 0 1 auto;
-  min-height: 0;
-  overflow-y: auto;
+  flex-direction: row;
+  gap: 6px;
+  flex: none;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .list-nav-item {
   position: relative;
   flex: none;
+  max-width: 200px;
   border-radius: var(--radius-control);
   transition: background-color var(--ease), box-shadow var(--ease),
     transform var(--ease);
@@ -959,10 +973,10 @@ button:focus-visible {
   color: var(--accent-strong);
 }
 
-/* 「已完成」固定项：与普通清单视觉区隔、不可拖拽 / 右键 */
+/* 「已完成」固定项：与普通清单视觉区隔（左竖线）、不可拖拽 / 右键 */
 .list-nav-item.is-fixed {
-  margin-top: 4px;
-  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  padding-left: 6px;
 }
 
 /* 拖拽任务到清单条：目标清单高亮（源清单不会命中；固定项仅「已完成」可命中） */
@@ -1046,6 +1060,125 @@ button:focus-visible {
   gap: 12px;
 }
 
+/* 详情子板块：统一「标题行 + content」两段式，全部可折叠 */
+.detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* h3 只承载大纲语义：视觉上是一条轻量折叠行 */
+.detail-section-head {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.detail-section-head button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0 0 6px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  font: inherit;
+  font-weight: inherit;
+  text-align: left;
+}
+
+.detail-section-head button:hover:not(:disabled) {
+  color: var(--text);
+  background: transparent;
+  border-color: transparent;
+}
+
+/* 折叠行不参与全局「按下位移」，避免点击标题时整行抖动 */
+.detail-section-head button:active:not(:disabled) {
+  transform: none;
+}
+
+.detail-section-head button:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+}
+
+/* chevron：展开朝下，折叠旋 -90°；过渡在 reduced-motion 下被全局关闭 */
+.detail-section-chevron {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  transition: transform var(--ease);
+}
+
+.detail-section-chevron svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+}
+
+.detail-section-head button[aria-expanded="false"] .detail-section-chevron {
+  transform: rotate(-90deg);
+}
+
+.detail-section-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-section-hint {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.detail-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 复杂板块的 content 用边框收束；底色比面板略沉一档，避免与面板同色 */
+.detail-section-body.is-boxed {
+  gap: 10px;
+  padding: 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+
+/* Agent 面板自带顶部分隔线，放进边框盒后去掉，避免双层分隔 */
+.detail-section-body.is-boxed .agent-section {
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Agent 板块标题已在折叠行上，面板内不再重复一次 */
+.detail-section-body.is-boxed .agent-section-head .field-label {
+  display: none;
+}
+
+/* 任务属性的多字段网格（承接原 .metadata-editor 的排版职责） */
+.detail-attr-grid {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -1069,8 +1202,6 @@ button:focus-visible {
   display: flex;
   flex-direction: column;
   margin: 0;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
 }
 
 .detail-row {
@@ -1099,20 +1230,7 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
-/* ---------------------------------------- 子任务（标题 ↔ 备注之间的独立板块） ---- */
-
-.subtask-block {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.subtask-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
+/* ---------------------------------------- 子任务（详情内的独立板块） ---- */
 
 .subtask-list {
   list-style: none;
@@ -1120,14 +1238,18 @@ button:focus-visible {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
 }
 
+/* 每条子任务自带边框：与「其他信息」等板块的行区分开，便于逐条扫读 */
 .subtask {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface);
 }
 
 /* 等待落盘：降透明度，抑制连点 */
@@ -1183,6 +1305,13 @@ button:focus-visible {
   min-width: 0;
   padding: 5px 9px;
   font-size: 0.9rem;
+}
+
+/* 编辑态：输入框自带边框，行边框让位，避免双层描边 */
+.subtask.editing {
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
 }
 
 /* 条尾删除：默认悬停显示，键盘聚焦亦可及 */
@@ -2030,37 +2159,52 @@ body.is-dragging * {
   flex-wrap: wrap;
 }
 
-.agent-path-list {
+/* 「关联材料」：本地路径与链接共用一种行；整行文字即打开按钮 */
+.material-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 
-.agent-path-item {
+/* 与 `.subtask` 同构：每条自带 1px 边框，便于逐条扫读 */
+.material-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 4px 3px 8px;
-  background: var(--surface-muted);
+  padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
+  background: var(--surface);
 }
 
-.agent-path-text {
+/* 行主体：占满剩余宽度、左对齐、长路径省略；hover / focus 给出可点反馈 */
+.material-open {
+  display: block;
   flex: 1;
   min-width: 0;
+  padding: 0;
+  text-align: left;
   font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
-  font-size: 0.76rem;
+  font-size: 0.78rem;
   color: var(--text-muted);
+  background: transparent;
+  border-color: transparent;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.agent-path-remove {
+.material-open:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: transparent;
+  border-color: transparent;
+}
+
+/* 条尾移除：默认透明，悬停 / 聚焦可见（与 `.subtask-remove` 同策略） */
+.material-remove {
   flex: none;
   width: 22px;
   height: 22px;
@@ -2073,12 +2217,57 @@ body.is-dragging * {
   color: var(--text-faint);
   background: transparent;
   border-color: transparent;
+  opacity: 0;
+  transition: opacity var(--ease), color var(--ease),
+    background-color var(--ease);
 }
 
-.agent-path-remove:hover:not(:disabled) {
+.material-item:hover .material-remove,
+.material-item:focus-within .material-remove {
+  opacity: 1;
+}
+
+.material-remove:hover:not(:disabled) {
   color: var(--danger);
   background: var(--danger-soft);
   border-color: transparent;
+}
+
+/* 触屏无 hover：移除按钮常显 */
+@media (hover: none) {
+  .material-remove {
+    opacity: 1;
+  }
+}
+
+/* 添加入口（文件 / 目录 / 链接） */
+.material-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+/* 链接就地录入：按钮行下方单行输入 */
+.material-link-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.material-link-input {
+  width: 100%;
+  padding: 6px 9px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 0.78rem;
+}
+
+.material-link-error {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--danger);
 }
 
 .agent-run-list {
@@ -2328,56 +2517,16 @@ body.is-dragging * {
     padding: 16px 16px 12px;
   }
 
-  /* 单列顺序：清单条（auto）→ 任务列表（填满剩余） */
+  /* 单列：清单条 → 任务列表（填满剩余）；清单条样式与宽屏一致 */
   .layout {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
     gap: 12px;
   }
 
+  /* 侧栏只剩 fixed 抽屉，不占网格行 */
   .sidebar {
-    order: 1;
-  }
-
-  .main-pane {
-    order: 2;
-  }
-
-  /* 清单条改为横向可滑动；新增行换到条下方（常驻输入框 + 按钮） */
-  .lists-block {
-    max-height: none;
-    gap: 8px;
-    padding: 8px;
-  }
-
-  .lists-block .side-head {
-    display: none;
-  }
-
-  .list-nav {
-    flex: none;
-    flex-direction: row;
-    max-height: none;
-    overflow-x: auto;
-    overflow-y: hidden;
-    gap: 6px;
-    padding-bottom: 2px;
-  }
-
-  .list-nav-item {
-    flex: none;
-    max-width: 200px;
-  }
-
-  .list-nav-item.is-fixed {
-    margin-top: 0;
-    border-top: none;
-    border-left: 1px solid var(--border);
-    padding-left: 6px;
-  }
-
-  .lists-block > .add-row {
-    margin-top: 0;
+    display: contents;
   }
 
   /* 任务详情改为右侧抽屉（层叠见 :root 的 --z-* 层级） */
@@ -2558,11 +2707,11 @@ body.is-dragging * {
     background: rgba(0, 0, 0, 0.6);
   }
 }
-.metadata-editor { margin: 4px 0 16px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: linear-gradient(135deg, var(--surface-muted), var(--surface)); display: grid; gap: 12px; }
-.metadata-heading { display:flex; justify-content:space-between; align-items:baseline; color:var(--text); font-weight:650; font-size:13px; }
-.metadata-heading small { color:var(--text-faint); font-size:11px; font-weight:400; }
-.metadata-editor select,.metadata-editor input:not([type=checkbox]) { box-sizing:border-box; min-width:0; width:100%; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface); color:var(--text); padding:8px 10px; font:inherit; }
-.metadata-editor select:focus,.metadata-editor input:focus { outline:2px solid var(--accent-ring); border-color:var(--accent); }
+/* 任务属性板块内的字段控件（作用域限定在 .detail-attr-grid，避免误伤 Agent 面板） */
+.detail-attr-grid select,
+.detail-attr-grid input:not([type=checkbox]) { box-sizing:border-box; min-width:0; width:100%; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface); color:var(--text); padding:8px 10px; font:inherit; }
+.detail-attr-grid select:focus,
+.detail-attr-grid input:focus { outline:2px solid var(--accent-ring); border-color:var(--accent); }
 .due-controls { display:flex; gap:7px; align-items:center; }
 .due-controls input[type=date] { flex:1; }
 .due-controls input[type=time] { width:120px!important; }

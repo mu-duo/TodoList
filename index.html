@@ -5,6 +5,14 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TodoList</title>
+    <!-- 首帧兜底：dev 首次依赖优化期间脚本尚未执行，用系统色铺底，
+         避免浅/深色下出现纯白或纯黑的空窗（React 挂载后由 App.css 接管）。 -->
+    <style>
+      html {
+        color-scheme: light dark;
+        background: Canvas;
+      }
+    </style>
   </head>
 
   <body>

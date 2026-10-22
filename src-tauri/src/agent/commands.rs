@@ -474,12 +474,14 @@ fn enable_preconditions(
 }
 
 /// 按 id 设置任务 Agent 意图；`enabled: true` 需本机执行授权 / 密钥 / 结果根齐备。
+/// `links` 缺省视为空数组；只做形状校验，不参与沙箱。
 #[tauri::command]
 pub fn agent_set_task_intent(
     list_file: String,
     task_id: String,
     enabled: bool,
     paths: Vec<String>,
+    links: Option<Vec<String>>,
 ) -> Result<(), String> {
     let base = storage::data_dir()?;
     if enabled {
@@ -490,7 +492,14 @@ pub fn agent_set_task_intent(
         let root = enable_preconditions(&cfg, spec.key_required, key_present)?;
         sandbox::validate_result_root_in(&settings, &root)?;
     }
-    intent::set_task_intent_in(&base, &list_file, &task_id, enabled, &paths)
+    intent::set_task_intent_in(
+        &base,
+        &list_file,
+        &task_id,
+        enabled,
+        &paths,
+        links.as_deref().unwrap_or(&[]),
+    )
 }
 
 /// 原生目录选择：返回路径字符串（不授予读取其中全部内容的权限）。
@@ -1182,6 +1191,78 @@ pub fn agent_open_result_dir(app: AppHandle, run_id: String) -> Result<(), Strin
         .map_err(|e| format!("打开结果目录失败：{e}"))
 }
 
+/// 外部打开目标分类（纯函数，便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenTarget {
+    Url(String),
+    Dir(PathBuf),
+    File(PathBuf),
+}
+
+/// 是否带 `<scheme>:` 前缀（Windows 盘符 `C:\...` 不算 scheme）。
+fn has_scheme(s: &str) -> bool {
+    let Some(idx) = s.find(':') else {
+        return false;
+    };
+    if idx == 1 && s.as_bytes()[0].is_ascii_alphabetic() {
+        return false; // Windows 盘符
+    }
+    let scheme = &s[..idx];
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// 分派打开目标：URL → 浏览器；目录 → 打开；文件 → 资源管理器中定位并选中（不执行）。
+///
+/// 仅接受 `http://` / `https://` / `file://`（大小写不敏感）；其余带 scheme 的目标
+/// （如 `javascript:`、`ms-settings:`）一概拒绝。路径不存在 → 中文错误。
+pub fn classify_target(target: &str) -> Result<OpenTarget, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("打开目标不能为空".to_string());
+    }
+    let lower = target.to_ascii_lowercase();
+    if ["http://", "https://", "file://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return Ok(OpenTarget::Url(target.to_string()));
+    }
+    if has_scheme(target) {
+        return Err(format!("不支持的打开目标：{target}"));
+    }
+    let path = PathBuf::from(target);
+    if path.is_dir() {
+        Ok(OpenTarget::Dir(path))
+    } else if path.is_file() {
+        Ok(OpenTarget::File(path))
+    } else {
+        Err(format!("路径不存在：{target}"))
+    }
+}
+
+/// 打开任务「链接」：URL → 默认浏览器；目录 → 资源管理器；文件 → 资源管理器中定位并选中。
+/// 只响应用户点击，不授予 Agent 任何读取能力。
+#[tauri::command]
+pub fn agent_open_external(app: AppHandle, target: String) -> Result<(), String> {
+    match classify_target(&target)? {
+        OpenTarget::Url(url) => app
+            .opener()
+            .open_url(url, None::<String>)
+            .map_err(|e| format!("打开链接失败：{e}")),
+        OpenTarget::Dir(path) => app
+            .opener()
+            .open_path(path.to_string_lossy().to_string(), None::<String>)
+            .map_err(|e| format!("打开目录失败：{e}")),
+        // 插件内部走 Windows Shell API（SHOpenFolderAndSelectItems），无 shell 拼接。
+        OpenTarget::File(path) => app
+            .opener()
+            .reveal_item_in_dir(&path)
+            .map_err(|e| format!("定位文件失败：{e}")),
+    }
+}
+
 #[cfg(test)]
 mod p2_tests {
     use super::*;
@@ -1219,6 +1300,7 @@ mod p2_tests {
         Some(TaskAgent {
             enabled: true,
             paths,
+            links: Vec::new(),
         })
     }
 
@@ -1246,9 +1328,11 @@ mod p2_tests {
                 title: "t".into(),
                 notes: String::new(),
                 paths: vec![],
+                links: vec![],
             },
             result_dir: String::new(),
             partial: false,
+            web_reads: vec![],
         }
     }
 
@@ -1322,6 +1406,7 @@ mod p2_tests {
                 Some(TaskAgent {
                     enabled: false,
                     paths: vec![],
+                    links: vec![],
                 }),
             )],
         )];
@@ -1415,6 +1500,62 @@ mod p2_tests {
             record::find_record_in(&cfg, &running.run_id).unwrap().state,
             RunState::Interrupted.as_str()
         );
+    }
+
+    #[test]
+    fn classify_target_routes_urls_dirs_files_and_rejects_others() {
+        // URL 三种协议（含大小写）
+        assert_eq!(
+            classify_target("https://example.com/a?b=1").unwrap(),
+            OpenTarget::Url("https://example.com/a?b=1".to_string())
+        );
+        assert_eq!(
+            classify_target("HTTP://Example.COM").unwrap(),
+            OpenTarget::Url("HTTP://Example.COM".to_string())
+        );
+        assert_eq!(
+            classify_target("file:///D:/docs/a.txt").unwrap(),
+            OpenTarget::Url("file:///D:/docs/a.txt".to_string())
+        );
+        // 前导 / 尾部空白被 trim
+        assert_eq!(
+            classify_target("  https://a.example  ").unwrap(),
+            OpenTarget::Url("https://a.example".to_string())
+        );
+
+        // 目录 / 文件（真实文件系统）
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, "x").unwrap();
+        assert_eq!(
+            classify_target(&dir_path.to_string_lossy()).unwrap(),
+            OpenTarget::Dir(dir_path.clone())
+        );
+        assert_eq!(
+            classify_target(&file_path.to_string_lossy()).unwrap(),
+            OpenTarget::File(file_path.clone())
+        );
+
+        // 不存在 / 相对路径 / 空
+        let missing = dir.path().join("nope.txt");
+        assert_eq!(
+            classify_target(&missing.to_string_lossy()).unwrap_err(),
+            format!("路径不存在：{}", missing.to_string_lossy())
+        );
+        assert!(classify_target("sub\\a.txt").unwrap_err().starts_with("路径不存在："));
+        assert_eq!(classify_target("   ").unwrap_err(), "打开目标不能为空");
+
+        // 其它 scheme 一律拒绝
+        for bad in ["javascript:alert(1)", "ms-settings:", "mailto:a@b.c", "ftp://x"] {
+            assert_eq!(
+                classify_target(bad).unwrap_err(),
+                format!("不支持的打开目标：{bad}")
+            );
+        }
+        // 含引号路径：Windows 文件名不允许引号 → 不存在（不会被当成 URL / scheme）
+        let quoted = format!("\"{}\"", file_path.to_string_lossy());
+        assert!(classify_target(&quoted).unwrap_err().starts_with("路径不存在："));
     }
 }
 

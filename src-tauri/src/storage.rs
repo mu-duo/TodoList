@@ -48,6 +48,10 @@ pub struct Settings {
     /// 「已完成」视图折叠的清单文件名集合（本机偏好）；缺失 / 空 / 非法 → `None`（默认全部展开）。
     #[serde(default)]
     pub completed_collapsed: Option<Vec<String>>,
+    /// 任务详情折叠的子板块 key 集合（本机偏好）；缺失 / 非法 → `None`（默认仅 `metadata` 收起）。
+    /// 与 `completed_collapsed` 不同，显式空数组是有效值（全部展开）。
+    #[serde(default)]
+    pub detail_collapsed: Option<Vec<String>>,
     /// 「关闭时最小化到托盘」（本机偏好）；缺失 / 非法 → `None`（默认开启）。
     #[serde(default)]
     pub minimize_to_tray: Option<bool>,
@@ -88,7 +92,8 @@ pub struct TaskView {
     pub tags: Option<Vec<String>>,
     pub notes: Option<String>,
     pub subtasks: Option<Vec<SubtaskView>>,
-    /// Agent 任务意图（`agent: { enabled, paths }`）；缺失 / 非法 → `None`。
+    /// Agent 任务意图（`agent: { enabled, paths, links }`）；缺失 / 非法 → `None`。
+    /// `links` 仅供 UI 点击打开，不参与沙箱、不传给模型。
     pub agent: Option<crate::agent::TaskAgent>,
 }
 
@@ -207,12 +212,14 @@ pub(crate) fn strip_bom(text: &str) -> &str {
 /// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
 /// 且**不会**创建文件、不会 panic。`app_bar.order` 缺失 / 空 / 非法时 `app_bar_order` 为
 /// `None`；合法字符串 id 去重（首次保留）并保留未知 id 原顺序，不自动补已知 id。
-/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析。读取前剥离前导 BOM。
+/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析；`detail.collapsed` 由
+/// [`parse_detail_collapsed`] 解析（显式空数组合法）。读取前剥离前导 BOM。
 pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     let fallback = || Settings {
         theme: DEFAULT_THEME.to_string(),
         app_bar_order: None,
         completed_collapsed: None,
+        detail_collapsed: None,
         minimize_to_tray: None,
     };
     let path = base.join(SETTINGS_FILE);
@@ -236,6 +243,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         theme,
         app_bar_order: parse_app_bar_order(&value),
         completed_collapsed: parse_completed_collapsed(&value),
+        detail_collapsed: parse_detail_collapsed(&value),
         // 缺失 / 非布尔 → None（默认开启）；字面 false → Some(false)（已关闭）。
         minimize_to_tray: value.get("minimize_to_tray").and_then(Value::as_bool),
     })
@@ -281,6 +289,24 @@ fn parse_completed_collapsed(value: &Value) -> Option<Vec<String>> {
     } else {
         Some(collapsed)
     }
+}
+
+/// 从设置 Value 解析 `detail.collapsed`：缺失 / 非对象 / 非数组 / 含非字符串或空白元素 → `None`；
+/// 否则按首次出现去重并保留原始顺序。**与 `completed.collapsed` 不同：显式空数组是有效值**
+/// （`Some(vec![])` = 全部展开），不会被折叠成 `None`。
+fn parse_detail_collapsed(value: &Value) -> Option<Vec<String>> {
+    let seq = value.get("detail")?.get("collapsed")?.as_sequence()?;
+    let mut collapsed: Vec<String> = Vec::with_capacity(seq.len());
+    for item in seq {
+        let section = item.as_str()?;
+        if section.trim().is_empty() {
+            return None;
+        }
+        if !collapsed.iter().any(|existing| existing == section) {
+            collapsed.push(section.to_string());
+        }
+    }
+    Some(collapsed)
 }
 
 /// 写入 `theme` 到设置目录（`%APPDATA%\com.lftan.todolist`）下的 `settings.yaml`。
@@ -421,6 +447,76 @@ pub fn save_completed_collapsed_in(
                     .as_mapping_mut()
                     .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?;
                 completed.remove("collapsed");
+            }
+        }
+    }
+
+    write_list(&path, &value)
+}
+
+/// 写入 / 清除 `detail.collapsed`（`None` → 删除该字段；**空数组会写盘**，表示全部展开）。
+///
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `detail.collapsed`** → 原子写，
+/// 保留 `theme`、`app_bar`、`completed`、`detail` 其它字段及所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// 与 [`save_completed_collapsed_in`] 的语义差异：`Some(&[])` 写入空序列并保留 key（不删 key），
+/// 以便前端区分「显式全部展开」与「默认（仅 `metadata` 收起）」。
+/// 空白 key → 中文错误；已有 `detail` 若非对象 → 中文错误（不覆盖未知标量）。
+pub fn save_detail_collapsed_in(
+    base: &Path,
+    collapsed: Option<&[String]>,
+) -> Result<(), String> {
+    if let Some(collapsed) = collapsed {
+        for section in collapsed {
+            if section.trim().is_empty() {
+                return Err("任务详情折叠键不能为空".to_string());
+            }
+        }
+    }
+
+    fs::create_dir_all(base).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let path = base.join(SETTINGS_FILE);
+
+    let mut value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("读取设置文件失败：{e}"))?;
+        yaml_serde::from_str(&text).map_err(|e| format!("解析设置文件失败：{e}"))?
+    } else {
+        Value::Mapping(Mapping::new())
+    };
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+
+    match collapsed {
+        Some(collapsed) => {
+            let detail = match root.get_mut("detail") {
+                Some(existing) => existing
+                    .as_mapping_mut()
+                    .ok_or_else(|| "设置文件中的 detail 不是对象，无法写入".to_string())?,
+                None => {
+                    root.insert(key("detail"), Value::Mapping(Mapping::new()));
+                    root.get_mut("detail")
+                        .and_then(Value::as_mapping_mut)
+                        .expect("刚插入的 detail 应为对象")
+                }
+            };
+            let seq = collapsed
+                .iter()
+                .map(|section| Value::String(section.clone()))
+                .collect();
+            detail.insert(key("collapsed"), Value::Sequence(seq));
+        }
+        None => {
+            let mut remove_detail = false;
+            if let Some(existing) = root.get_mut("detail") {
+                let detail = existing
+                    .as_mapping_mut()
+                    .ok_or_else(|| "设置文件中的 detail 不是对象，无法写入".to_string())?;
+                detail.remove("collapsed");
+                remove_detail = detail.is_empty();
+            }
+            if remove_detail {
+                root.remove("detail");
             }
         }
     }
@@ -3295,6 +3391,193 @@ tasks:
         assert_eq!(settings.theme, "light");
         assert_eq!(settings.app_bar_order, Some(vec!["refresh".to_string()]));
         assert!(settings.completed_collapsed.is_none());
+    }
+
+    #[test]
+    fn load_settings_parses_detail_collapsed_and_distinguishes_empty_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+
+        // 缺 key / 非法 → None
+        let invalid = [
+            "theme: system\n",
+            "theme: system\ndetail: notamap\n",
+            "theme: system\ndetail:\n  collapsed: notaseq\n",
+            "theme: system\ndetail:\n  collapsed: [metadata, 42]\n",
+            "theme: system\ndetail:\n  collapsed: [metadata, '  ']\n",
+        ];
+        for text in invalid {
+            fs::write(&path, text).unwrap();
+            assert!(
+                load_settings_from(base).unwrap().detail_collapsed.is_none(),
+                "缺失 / 非法应回退 None：{text:?}"
+            );
+        }
+
+        // 去重取首次、保序
+        fs::write(
+            &path,
+            "theme: system\ndetail:\n  collapsed: [metadata, metadata, notes]\n  x-keep: 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings_from(base).unwrap().detail_collapsed,
+            Some(vec!["metadata".to_string(), "notes".to_string()])
+        );
+
+        // 显式空数组是有效值，不能折叠成 None
+        fs::write(&path, "theme: system\ndetail:\n  collapsed: []\n").unwrap();
+        assert_eq!(
+            load_settings_from(base).unwrap().detail_collapsed,
+            Some(Vec::new()),
+            "显式空数组应读回 Some(vec![])"
+        );
+    }
+
+    #[test]
+    fn save_detail_collapsed_writes_and_roundtrips_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: dark\nx-top: keep\ncompleted:\n  collapsed: [工作.yaml]\n  x-custom: keep2\ndetail:\n  x-detail: keep3\n",
+        )
+        .unwrap();
+
+        let collapsed = vec!["metadata".to_string(), "notes".to_string()];
+        save_detail_collapsed_in(base, Some(&collapsed)).unwrap();
+
+        // 读回
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.detail_collapsed, Some(collapsed.clone()));
+
+        // theme / completed / detail 其它字段 / 顶层未知字段保留
+        let value = read_value(&path);
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let completed = value.get("completed").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            completed.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(
+            completed
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.len()),
+            Some(1),
+            "completed.collapsed 不应被破坏"
+        );
+        let detail = value.get("detail").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            detail.get("x-detail").and_then(Value::as_str),
+            Some("keep3")
+        );
+        assert_eq!(
+            detail
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["metadata", "notes"])
+        );
+    }
+
+    #[test]
+    fn save_detail_collapsed_writes_empty_array_keeping_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: light\ndetail:\n  collapsed: [metadata]\n").unwrap();
+
+        save_detail_collapsed_in(base, Some(&[])).unwrap();
+
+        // 空数组必须落盘且保留 key（与 completed.collapsed 的差异）
+        let value = read_value(&path);
+        let detail = value.get("detail").and_then(Value::as_mapping).unwrap();
+        assert!(
+            detail.get("collapsed").is_some(),
+            "空数组应保留 collapsed key"
+        );
+        assert_eq!(
+            detail
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(Vec::len),
+            Some(0)
+        );
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.detail_collapsed, Some(Vec::new()));
+    }
+
+    #[test]
+    fn save_detail_collapsed_none_removes_key_and_empty_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: light\ndetail:\n  collapsed: [metadata]\n").unwrap();
+
+        save_detail_collapsed_in(base, None).unwrap();
+        let value = read_value(&path);
+        assert!(
+            value.get("detail").is_none(),
+            "detail 因此变空时应一并删除"
+        );
+        assert!(load_settings_from(base).unwrap().detail_collapsed.is_none());
+
+        // detail 仍有其它字段时只删 collapsed
+        fs::write(
+            &path,
+            "theme: light\ndetail:\n  collapsed: [notes]\n  x-keep: 1\n",
+        )
+        .unwrap();
+        save_detail_collapsed_in(base, None).unwrap();
+        let value = read_value(&path);
+        let detail = value.get("detail").and_then(Value::as_mapping).unwrap();
+        assert!(detail.get("collapsed").is_none());
+        assert_eq!(detail.get("x-keep").and_then(Value::as_i64), Some(1));
+        assert!(load_settings_from(base).unwrap().detail_collapsed.is_none());
+    }
+
+    #[test]
+    fn save_detail_collapsed_rejects_blank_key_and_malformed_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+
+        // 空白 key → 报错且不写盘
+        fs::write(&path, "theme: dark\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(save_detail_collapsed_in(base, Some(&["metadata".to_string(), "  ".to_string()]))
+            .is_err());
+        assert!(save_detail_collapsed_in(base, Some(&["".to_string()])).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "失败不应写盘");
+
+        // detail 非对象 → 写入与删除都报错、不覆盖未知标量
+        fs::write(&path, "theme: dark\ndetail: 未知标量\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(save_detail_collapsed_in(base, Some(&["metadata".to_string()])).is_err());
+        assert!(save_detail_collapsed_in(base, None).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_detail_collapsed_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert!(!base.join(SETTINGS_FILE).exists());
+
+        save_detail_collapsed_in(base, Some(&["metadata".to_string()])).unwrap();
+
+        assert!(base.join(SETTINGS_FILE).is_file(), "应创建 settings.yaml");
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert_eq!(
+            settings.detail_collapsed,
+            Some(vec!["metadata".to_string()])
+        );
     }
 
     #[test]

@@ -190,6 +190,13 @@ fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String
     storage::save_completed_collapsed_in(&base, collapsed.as_deref())
 }
 
+/// 保存任务详情折叠的子板块 key 集合（`None` → 删除 `detail.collapsed`；空数组照写，表示全部展开）。
+#[tauri::command]
+fn save_detail_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_detail_collapsed_in(&base, collapsed.as_deref())
+}
+
 /// 固定托盘图标 id。
 const TRAY_ID: &str = "main";
 
@@ -525,6 +532,7 @@ pub fn run() {
             save_settings,
             save_app_bar_order,
             save_completed_collapsed,
+            save_detail_collapsed,
             save_minimize_to_tray,
             agent::commands::agent_load_config,
             agent::commands::agent_list_providers,
@@ -543,6 +551,7 @@ pub fn run() {
             agent::commands::agent_get_status,
             agent::commands::agent_list_runs,
             agent::commands::agent_open_result_dir,
+            agent::commands::agent_open_external,
             exit_app
         ])
         .run(tauri::generate_context!())

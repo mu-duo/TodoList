@@ -1,8 +1,10 @@
-//! 任务 Agent 意图：任务 YAML 内 `agent: { enabled, paths }`（按 id 原子补丁，保留未知字段）。
+//! 任务 Agent 意图：任务 YAML 内 `agent: { enabled, paths, links }`（按 id 原子补丁，保留未知字段）。
 //!
 //! 关联 ≠ 授权：此处只存原始绝对路径；实际读取在运行时经沙箱校验（Phase 2）。
+//! `links` 供人工点击打开，同时作为只读抓取工具 `url_read` 的授权范围；抓取内容作不可信数据。
 //! `enabled: true` 的前置（本机执行授权 / 密钥 / 结果根）由命令层校验。
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Serialize;
@@ -16,6 +18,9 @@ use crate::storage;
 pub struct TaskAgent {
     pub enabled: bool,
     pub paths: Vec<String>,
+    /// 人工点击打开的链接；亦为 `url_read` 的授权范围。旧数据无该键 → 空数组。
+    #[serde(default)]
+    pub links: Vec<String>,
 }
 
 /// 从任务映射解析 `agent` 字段；缺失 / 非法不 panic，宽返回 `None` 或默认值。
@@ -35,18 +40,67 @@ pub fn parse_task_agent(m: &Mapping) -> Option<TaskAgent> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(TaskAgent { enabled, paths })
+    let links = agent
+        .get("links")
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TaskAgent {
+        enabled,
+        paths,
+        links,
+    })
 }
 
-/// 按 `task_id` 补丁任务的 `agent.enabled` / `agent.paths`，保留其它 / 未知字段并原子写。
+/// 链接形状校验（写入前）：trim 后长度 / 空白 / 协议前缀 / 去重保序。
+///
+/// 仅用于人工点击打开与 `url_read` 授权范围形状校验；返回 trim 后的值。
+pub fn validate_links(links: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(links.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in links {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("链接不能为空".to_string());
+        }
+        if trimmed.chars().count() > 2048 {
+            return Err("链接过长（上限 2048 字符）".to_string());
+        }
+        if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("链接不能包含空白或控制字符".to_string());
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let allowed = ["http://", "https://", "file://"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
+        if !allowed {
+            return Err(format!(
+                "链接必须以 http://、https:// 或 file:// 开头：{trimmed}"
+            ));
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// 按 `task_id` 补丁任务的 `agent.enabled` / `agent.paths` / `agent.links`，保留其它 / 未知字段并原子写。
 ///
 /// 空白路径报错；`enabled == true` 时要求每个路径为绝对路径（关联≠授权，此处只做形状校验）。
+/// `links` 只做形状校验（见 [`validate_links`]），不参与沙箱。
 pub fn set_task_intent_in(
     base: &Path,
     list_file: &str,
     task_id: &str,
     enabled: bool,
     paths: &[String],
+    links: &[String],
 ) -> Result<(), String> {
     for p in paths {
         if p.trim().is_empty() {
@@ -56,6 +110,7 @@ pub fn set_task_intent_in(
         // 应对每个 `agent.paths` 再调用同一 `sandbox::guard_source_root`（外部 YAML 可绕过命令）。
         sandbox::guard_source_root(p)?;
     }
+    let links = validate_links(links)?;
 
     let path = storage::list_path(base, list_file)?;
     let mut value = storage::read_list_value(&path, list_file)?;
@@ -76,6 +131,10 @@ pub fn set_task_intent_in(
     agent.insert(
         storage::key("paths"),
         Value::Sequence(paths.iter().map(|p| Value::String(p.clone())).collect()),
+    );
+    agent.insert(
+        storage::key("links"),
+        Value::Sequence(links.iter().map(|l| Value::String(l.clone())).collect()),
     );
 
     storage::write_list(&path, &value)
@@ -113,6 +172,7 @@ mod tests {
             "T1",
             true,
             &["D:\\docs\\a.txt".to_string(), "D:\\proj".to_string()],
+            &[],
         )
         .unwrap();
 
@@ -156,7 +216,7 @@ mod tests {
             "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    agent:\n      enabled: false\n      x-extra: keep\n",
         );
 
-        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()]).unwrap();
+        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()], &[]).unwrap();
 
         let value = read(base, "L.yaml");
         let agent = value.get("tasks").and_then(Value::as_sequence).unwrap()[0]
@@ -166,6 +226,73 @@ mod tests {
             .clone();
         assert_eq!(agent.get("x-extra").and_then(Value::as_str), Some("keep"));
         assert_eq!(agent.get("enabled").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn sets_links_trimmed_deduped_and_rejects_invalid_without_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        set_task_intent_in(
+            base,
+            "L.yaml",
+            "T1",
+            false,
+            &[],
+            &[
+                " https://a.example/x ".to_string(),
+                "HTTP://B.example".to_string(),
+                "https://a.example/x".to_string(),
+                "file:///D:/x".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let value = read(base, "L.yaml");
+        let agent = value.get("tasks").and_then(Value::as_sequence).unwrap()[0]
+            .get("agent")
+            .and_then(Value::as_mapping)
+            .unwrap()
+            .clone();
+        let links: Vec<&str> = agent
+            .get("links")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            links,
+            vec!["https://a.example/x", "HTTP://B.example", "file:///D:/x"],
+            "trim + 去重保序"
+        );
+
+        let before = fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap();
+        let too_long = format!("https://{}", "a".repeat(2048));
+        for bad in [
+            "javascript:alert(1)".to_string(),
+            "ftp://x".to_string(),
+            "D:\\a.txt".to_string(),
+            "https://a b".to_string(),
+            "   ".to_string(),
+            too_long,
+        ] {
+            assert!(
+                set_task_intent_in(base, "L.yaml", "T1", false, &[], std::slice::from_ref(&bad))
+                    .is_err(),
+                "非法链接应被拒：{bad:?}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap(),
+            before,
+            "拒绝后不应写盘"
+        );
     }
 
     #[test]
@@ -179,14 +306,14 @@ mod tests {
         );
 
         // 相对路径一律拒绝（架构 §5：只存原始绝对路径）
-        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["rel\\a.txt".to_string()]).is_err());
-        assert!(set_task_intent_in(base, "L.yaml", "T1", true, &["rel\\a.txt".to_string()]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["rel\\a.txt".to_string()], &[]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "T1", true, &["rel\\a.txt".to_string()], &[]).is_err());
         // 空白路径报错
-        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["   ".to_string()]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &["   ".to_string()], &[]).is_err());
         // 未知任务报错
-        assert!(set_task_intent_in(base, "L.yaml", "NOPE", false, &[]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "NOPE", false, &[], &[]).is_err());
         // 合法绝对路径可存（停用态）
-        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()]).unwrap();
+        set_task_intent_in(base, "L.yaml", "T1", false, &["D:\\p".to_string()], &[]).unwrap();
     }
 
     #[test]
@@ -202,11 +329,11 @@ mod tests {
         // P1-4：盘符根 / 设备路径 / UNC / 含 .. 的形状一律拒绝
         for p in ["C:\\", "\\\\?\\C:\\a", "\\\\server\\share", "C:\\a\\..\\b"] {
             assert!(
-                set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()]).is_err(),
+                set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()], &[]).is_err(),
                 "危险授权根应被拒：{p}"
             );
             assert!(
-                set_task_intent_in(base, "L.yaml", "T1", false, &[p.to_string()]).is_err(),
+                set_task_intent_in(base, "L.yaml", "T1", false, &[p.to_string()], &[]).is_err(),
                 "停用态也不应存危险根：{p}"
             );
         }
@@ -226,7 +353,7 @@ mod tests {
             "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    agent: scalar\n",
         );
         let before = fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap();
-        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &[]).is_err());
+        assert!(set_task_intent_in(base, "L.yaml", "T1", false, &[], &[]).is_err());
         assert_eq!(
             fs::read_to_string(base.join(LISTS_DIR).join("L.yaml")).unwrap(),
             before
@@ -251,11 +378,22 @@ mod tests {
         let a = load("schema: 1\ntasks:\n  - id: T1\n    agent:\n      enabled: true\n").unwrap();
         assert!(a.enabled);
         assert!(a.paths.is_empty());
+        assert!(a.links.is_empty(), "旧数据无 links → 空数组");
         // enabled 非布尔 / paths 非数组 → 宽容
         let b = load("schema: 1\ntasks:\n  - id: T1\n    agent:\n      enabled: nope\n      paths: 5\n")
             .unwrap();
         assert!(!b.enabled);
         assert!(b.paths.is_empty());
+        // links：非字符串丢弃、非数组宽容
+        let c = load(
+            "schema: 1\ntasks:\n  - id: T1\n    agent:\n      links:\n        - https://a.example\n        - 5\n        - file:///D:/x\n",
+        )
+        .unwrap();
+        assert_eq!(c.links, vec!["https://a.example", "file:///D:/x"]);
+        assert!(load("schema: 1\ntasks:\n  - id: T1\n    agent:\n      links: nope\n")
+            .unwrap()
+            .links
+            .is_empty());
         // agent 非对象 → None
         assert!(load("schema: 1\ntasks:\n  - id: T1\n    agent: scalar\n").is_none());
     }

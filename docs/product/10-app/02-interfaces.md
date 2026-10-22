@@ -154,7 +154,34 @@ completed:
 - 该字段与 `theme`、`app_bar.order` **互不覆盖**（三者各自 Value 级补丁）。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
-### 5.2 「关闭时最小化到托盘」偏好（minimize_to_tray）
+### 5.2 任务详情子板块折叠偏好（detail.collapsed）
+
+> **状态（2026-10-22）：已实现**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+
+任务详情子板块的折叠状态是**本机偏好**，存现有应用配置 `settings.yaml`（**不写清单、不进数据目录**）。实际字段：
+
+```yaml
+theme: system                 # 现有
+detail:
+  collapsed: [metadata]       # 收起的子板块 key
+```
+
+- 缺失 `detail.collapsed` = **默认值**：仅 `metadata` 收起（由前端解释）。
+- 合法子板块 key 集合：`title` / `metadata` / `subtasks` / `notes` / `meta` / `agent` / `materials`。
+
+**接口（Tauri 命令）**：
+
+- `load_settings()` 增 `detail_collapsed: string[] | null`，取自 `detail.collapsed`；缺失 / 非对象 / 非数组 / 含非字符串或空白元素 → `null`（= 默认）；合法项去重（保留首次）并保序。**显式空数组 `collapsed: []` → `[]`（不是 `null`）**。
+- `save_detail_collapsed({ collapsed: string[] | null })`：Value 级补丁**仅改 `detail.collapsed`**（保留 `theme`、`app_bar`、`completed`、`minimize_to_tray`、`agent`、`detail` 其它字段与全部未知字段，不做整份覆盖）；`Some(list)`（含空 list）→ 写盘，空 list 写成 `collapsed: []` 并**保留该 key**；`None` → **删除 `detail.collapsed`**（`detail` 若因此变空则一并删除）。空白 key、或已有 `detail` 非对象 → 中文错误、不写盘。
+
+**折叠语义**：
+
+- **与 §5.1 的差异**：`completed.collapsed` 的空数组表示「恢复默认」并删除 key；`detail.collapsed` 的空数组是**有效值**（全部展开），必须写盘、不清除 key，以便区分「用户显式全部展开」与「从未设置（默认仅 `metadata` 收起）」。
+- 失效 / 未知 key：由 **UI 静默忽略**，不报错、不主动清理。
+- 该字段与 `theme`、`app_bar.order`、`completed.collapsed`、`minimize_to_tray` **互不覆盖**（各自 Value 级补丁）。
+- **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
+
+### 5.3 「关闭时最小化到托盘」偏好（minimize_to_tray）
 
 > **状态（2026-10-14）：已实现（1.7.0，用户验收通过 2026-10-14）**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
 > 功能定位见 [01-spec.md](01-spec.md) §5（FR-APP-14 **部分实现**）；窗口生命周期与托盘交互行为契约见下；验证见 [10-app 现状](../../current/app.md)。
@@ -192,9 +219,12 @@ tasks:
     agent:
       enabled: true                       # 是否启用 Agent（缺省 = false）
       paths: ["D:\\a.txt", "D:\\proj"]    # 只存原始绝对路径，运行时解析
+      links: ["https://example.com/doc"]  # 人工点击打开；亦为 url_read 授权范围（不参与文件沙箱）
 ```
 
 - 支持文件与目录、存**原路径**；**任意文件 / 目录均可关联**、由 Agent 自主选择读取；**关联 ≠ 授权**（授权为本机行为）。
+- `links`（可选，string[]）：任务级「链接」，用于人工点击打开（`agent_open_external`），同时作为只读抓取工具 `url_read` 的**授权范围**（仅能抓取列表内链接；`file://` 仍受 `agent.paths` 沙箱约束）；旧数据无该键 → 空数组。
+- `links` 写入校验（`agent_set_task_intent` / `set_task_intent_in`，与 `paths` 非法同样**报错且不写盘**）：每条 trim 后须以 `http://` / `https://` / `file://` 之一开头（大小写不敏感）；不允许空白 / 控制字符；长度 ≤ 2048 字符；去重保序（保留首次）。读取宽容：非字符串条目丢弃，历史脏数据不影响加载。
 - 未知字段宽容：沿用 §3，app 写回保留未知字段（`agent` 之外不动）。
 
 ### 6.2 本机全局配置（`settings.yaml`，非密钥）
@@ -233,8 +263,9 @@ agent:
 - `agent_set_key({ key: string, provider?: string }) -> void` ／ `agent_clear_key({ provider?: string }) -> void` ／ `agent_key_present({ provider?: string }) -> bool`：`provider` 缺省 = 当前 provider；**密钥值永不回 JS**。
 - `agent_validate_result_root({ path: string }) -> { ok: bool, message: string }`
 - `agent_probe({ confirmPaid: bool }) -> { ok: bool, error_class?: string, message: string }`：对当前 provider / model 的**最小 chat 请求**（`max_tokens=16`、单条 user 消息、无工具）；**仅用户显式二次费用确认（`confirmPaid === true`）才可发起网络**；`confirmPaid` 为 false 时**不发网络**（fail closed）。keyless 自定义端点亦可测。**不提供自动 / 保存流 / 测试流**，**不做任何自动付费调用**。
-- `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[] }) -> void`：`enabled: true` 需执行授权 /（key_required 时的）密钥 / 结果根齐备；keyless custom 不硬校验密钥。
-- `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[] }`
+- `agent_set_task_intent({ listFile: string, taskId: string, enabled: bool, paths: string[], links?: string[] }) -> void`：`enabled: true` 需执行授权 /（key_required 时的）密钥 / 结果根齐备；keyless custom 不硬校验密钥；`links` 缺省视为空数组，校验规则见 §6.1。
+- `load_lists` 的 `TaskView` 增可选 `agent?: { enabled: bool, paths: string[], links: string[] }`
+- `agent_open_external({ target: string }) -> void`：按 `target`（trim 后）分派——`http://` / `https://` / `file://`（大小写不敏感）→ 默认浏览器打开；本地**目录** → 资源管理器打开；本地**文件** → 资源管理器中**定位并选中**（不执行）；其它带 scheme 的目标（如 `javascript:`、`ms-settings:`）→ `不支持的打开目标：{target}`；空白 → `打开目标不能为空`；路径不存在 → `路径不存在：{target}`。仅响应用户点击；Agent 的链接读取能力**仅**经 `url_read`（受 `agent.links` 白名单约束）。
 - `load_lists` 的 `TaskView` 另暴露 `reminder: false | null`（YAML 键 `reminder`；缺省开启 → `null`）。
 - 目录 / 文件选择（**Rust 侧 dialog 桥**，前端不获原始 FS 能力）：`agent_pick_result_root() -> string | null`、`agent_pick_paths({ directories: bool }) -> string[]`
 
@@ -256,6 +287,7 @@ agent:
 - `RunSummary` 字段（snake_case）：`run_id, task_id, list_file, state, attempt, error_class?, stop_reason?, started_at, ended_at?, result_dir, partial, model, stats{ chat_calls, search_calls, server_search_requests?, bytes_read, steps }`。
   - `stop_reason ∈ { manual | disabled | completed | deleted }`：用于**区分**手动停止与停用 / 完成 / 删除导致的停止。
   - `stats.steps`：本 run 主循环**实际步数**；步数护栏见 §6.6。
+- `RunRecord`（落盘 JSON）含 `snapshot{ title, notes, paths, links }` 与 `web_reads: string[]`：`links` 为运行启动时的任务授权链接快照（旧记录缺该键 → 空数组）；`web_reads` 为**本次实际成功抓取**的链接（去重、按首次抓取顺序；空数组时省略该键）。读取兼容旧记录（缺失字段按空数组处理）。
 - 运行状态 / 重试 / 历史索引**仅存本机**，**不写入任务 YAML**。
 
 ### 6.6 联网与运行约束（规范；**未实测**）
@@ -267,6 +299,12 @@ agent:
   - **混合协议（opencode-go）**：按模型映射协议（chat 组 → OpenAI、messages 组 → Anthropic、responses 组 → 构造报错 fail closed；未知 / 官方未列 → OpenAI 默认）。
 - 默认 `model` 可改，**不自动回退到其它模型**，不支持的模型明确报错；HTTP **禁跟随重定向**（3xx＝失败）。
 - 主循环仅用**客户端只读 fs 工具**；联网仅走**独立辅助 native search 请求**（`tools: [{ type: "web_search_20250305", name: "web_search", max_uses }]`），**不与客户端文件工具混在同一请求**；`max_uses` 是**单请求内**上限、**非运行总帽**。
+- **只读网页抓取工具 `url_read`**：入参 `{ url: string, offset?: integer }`（`offset` 为字节偏移，缺省 0，用于分页续读）。
+  - **授权范围**：`url`（trim 后）必须与当前任务 `agent.links` 中某一项**完全相等**；未命中 → 工具报错且**不发起任何请求**。运行启动时会再次校验已存 `links`（外部 YAML 可绕过命令），非法 → `failed(UnsafePath)`（「授权链接不安全：…」）。
+  - **协议**：仅 `http://` / `https://` / `file://`；`file://` 不走网络，转本地路径后复用 `agent.paths` 的**沙箱白名单**（`sandbox::resolve_allowed`），不在授权根下 → 拒绝。
+  - **分页 / 大小 / 超时 / 重定向**：单次一页 **≤256KiB**，计入运行累计读取预算（`stats.bytes_read`，超预算 → 「超出单次运行读取预算」）；单次超时 **20s** 且不超过运行剩余时限；重定向**手动跟随**、最多 **3 跳**，每跳重新校验。
+  - **SSRF 防护**：目标 host 的**任一**解析结果命中 unspecified / loopback / private / link-local / multicast / broadcast / 文档保留段（IPv4 含 `0.0.0.0/8`、`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`192.0.0/24`、`198.18/15`、`240/4`；IPv6 含 `::1`、`::`、`fc00::/7`、`fe80::/10`、`ff00::/8`，IPv4-mapped 按映射后的 IPv4 处理）即**整体拒绝**（防 DNS 多 A 记录绕过）。
+  - **仅文本类响应**：`text/*`、`application/json`、`application/xml`、`application/xhtml+xml` 等放行；`image/*`、`application/octet-stream` 等 → 工具报错「非文本内容」。HTML 经轻量状态机去 `<script>` / `<style>` 与标签、解码基础实体并压缩空白后作为**不可信数据**交给模型。
 - **搜索按 provider 声明门控**：仅 `search_support=true`（anthropic / deepseek / qwen）构建搜索请求并下发 `native_search` 工具；不支持者**不下发**该工具、其处理路径安全跳过。Qwen 搜索请求注入 system 内容块 `x-anthropic-billing-header: cc_entrypoint=cli;`。
 - 2xx 但**无 `web_search_tool_result` 块＝失败**，**不得判为联网成功**；检索结果 / 引用为**不可信外部内容**，仅作数据、绝不执行。
 - 运行**无全局模型 / 搜索调用次数帽**；保留 **30 分钟 deadline / 取消 / 读取限制**（ADR-0007：单次文本 ≤256KiB、运行累计 ≤5MiB、分页不可绕）。
@@ -308,3 +346,6 @@ agent:
 - 2026-10-14 **多 Provider（细节 part 1+2 + 收口修复）**：§6 契约更新为多 Provider——settings 增 `agent.provider` / `agent.custom{protocol,base_url}` / `agent.model_by_provider`；`agent_list_providers` 增 `protocol("anthropic"/"openai")` / `is_custom` 并含末尾合成 `custom` 条目；新增 `agent_list_models`（`{source:"remote"|"none", models:[{id,protocol,supported}]}`，任何失败一律 none，custom **仅在入参与已保存配置归一化一致时**才带密钥）；key 命令 `provider?` 可选（缺省=当前 provider）；`agent_probe` 改**最小 chat 请求**（`max_tokens=16`、单条 user 消息）；搜索按 `search_support` 门控（`native_search` 不下发）；自定义端点路径约定（openai `/chat/completions`；anthropic base 以 `/v1` 结尾 → `/messages`，否则 `/v1/messages`）+ **keyless**（无认证头）；凭据**分槽** + 旧单槽自动迁移（ADR-0009 修订 ADR-0005/0008 的 provider 限定）。**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**。
 - 2026-10-16 新增 §8「便签窗口」（FR-APP-35，1.8.0）：窗口 / 主题 / 退出联动契约与两套 6 档调色板；新增事件 `theme-pref-changed`、`exit-requested-with-notes` 与命令 `exit_app`；§5 默认顺序更新为 `[refresh, pin, note, settings, agent]`。**未改数据目录 schema、不新增持久化字段**。
 - 2026-10-19 便签进入任务栏分组（FR-APP-35 调整）：取消 `skipTaskbar`，任务栏悬浮缩略图 / 窗口列表可见；缩略图 X 与任务栏「关闭窗口」走默认关闭（丢弃、无提示）；从缩略图激活自动聚焦文本区；托盘开启且便签存在时任务栏图标不消失（方案 A）。**未改 schema、无新增权限。**
+- 2026-10-22 新增 §5.2「任务详情子板块折叠偏好」（`detail.collapsed`）：`load_settings` 增 `detail_collapsed: string[] | null`、新增 `save_detail_collapsed({ collapsed })`——Value 级补丁**仅改 `detail.collapsed`**，保留 `theme` / `app_bar` / `completed` / `minimize_to_tray` / `agent` 与未知字段；合法 key = `title` / `metadata` / `subtasks` / `notes` / `meta` / `agent`，缺 key = 默认仅 `metadata` 收起。**与 §5.1 的差异：显式空数组必须写盘为 `collapsed: []` 并保留 key（不清除）**；`null` 删除该字段（`detail` 因此变空则一并删除）；空白 key / `detail` 非对象报中文错误不写盘。原 §5.2 托盘节顺延为 §5.3。**未改数据目录 schema，与 `load_lists` 无关。**
+- 2026-10-22 任务 Agent 新增「链接」`agent.links` 与命令 `agent_open_external`：`agent: { enabled, paths, links }` 中 `links` 仅用于人工点击打开、**不参与沙箱 / 不传给模型**；写入校验（trim、`http://`/`https://`/`file://` 前缀大小写不敏感、禁空白 / 控制字符、≤2048 字符、去重保序，非法报中文错误且不写盘），读取宽容（非字符串丢弃，旧数据 → 空数组）；`TaskView.agent` 带出 `links`。`agent_open_external({ target })` 分派：URL → 浏览器，目录 → 打开，文件 → 资源管理器中定位并选中，其它 scheme / 不存在 → 中文错误。§5.2 `detail.collapsed` 合法 key 集合补 `materials`。**`agent.paths` 语义与沙箱校验不变。**
+- 2026-10-22 新增 Agent 只读网页抓取工具 `url_read`（§6.6）：参数 `{ url, offset? }`；仅能抓取任务 `agent.links` 中 trim 后完全相等的链接（未授权不请求），`file://` 转本地路径并复用 `agent.paths` 白名单；单页 ≤256KiB 并计入 `stats.bytes_read`，超时 20s（且不超过运行剩余时限），重定向手动跟随 ≤3 跳；每跳重新校验 scheme 与解析 IP（SSRF 拒绝回环 / 内网 / 链路本地 / 组播 / 文档保留段，IPv4-mapped 按映射后处理）；仅接受文本类响应，HTML→纯文本（去 script/style/标签、实体解码、压缩空白）。运行启动时再次校验已存 links（非法 → `failed(UnsafePath)`）。`RunRecord.snapshot.links` 与 `RunRecord.web_reads`（去重保序，旧记录缺省为空数组）落盘；初始 prompt 增加「可用材料」本地路径 / 链接清单。**`agent.paths` 沙箱与 `native_search` 行为不变。**

@@ -305,18 +305,29 @@ export function openAgentResultDir(runId: string): Promise<void> {
   return invoke<void>("agent_open_result_dir", { runId });
 }
 
-/** 任务级 Agent 意图（启用状态 + 关联原路径）。 */
+/**
+ * 打开一个外部目标（详情「关联材料」行点击）。
+ * 后端按目标类型分派：http(s) / file → 浏览器；目录 → 打开；文件 → 资源管理器定位。
+ * 目标不存在 / 非法时 reject（中文错误），由调用方提示。
+ */
+export function openExternal(target: string): Promise<void> {
+  return invoke<void>("agent_open_external", { target });
+}
+
+/** 任务级 Agent 意图（启用状态 + 关联原路径 + 关联链接）。 */
 export function setAgentTaskIntent(
   listFile: string,
   taskId: string,
   enabled: boolean,
   paths: string[],
+  links: string[],
 ): Promise<void> {
   return invoke<void>("agent_set_task_intent", {
     listFile,
     taskId,
     enabled,
     paths,
+    links,
   });
 }
 

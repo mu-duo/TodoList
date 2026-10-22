@@ -76,6 +76,9 @@ pub struct RunSnapshot {
     pub title: String,
     pub notes: String,
     pub paths: Vec<String>,
+    /// 任务授权链接（只读抓取范围）；旧记录无该键 → 空数组。
+    #[serde(default)]
+    pub links: Vec<String>,
 }
 
 /// 一次运行的事实记录。
@@ -100,6 +103,9 @@ pub struct RunRecord {
     pub snapshot: RunSnapshot,
     pub result_dir: String,
     pub partial: bool,
+    /// 本次实际抓取过的授权链接（去重、按首次抓取顺序）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub web_reads: Vec<String>,
 }
 
 /// 运行记录目录路径。
@@ -291,9 +297,11 @@ mod tests {
                 title: "t".to_string(),
                 notes: String::new(),
                 paths: vec![],
+                links: vec![],
             },
             result_dir: "D:\\r".to_string(),
             partial: false,
+            web_reads: vec![],
         }
     }
 
@@ -323,8 +331,38 @@ mod tests {
     }
 
     #[test]
-    fn list_sorts_desc_and_skips_corrupt() {
+    fn web_reads_roundtrip_and_old_records_stay_readable() {
         let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let id = ulid();
+        let mut rec = sample(&id, "T1", RunState::Succeeded, "2026-10-12T01:00");
+        rec.web_reads = vec!["https://a.example/x".to_string(), "file:///D:/x".to_string()];
+        rec.snapshot.links = vec!["https://a.example/x".to_string()];
+        write_record_in(base, &rec).unwrap();
+
+        let back = find_record_in(base, &id).unwrap();
+        assert_eq!(back.web_reads, rec.web_reads);
+        assert_eq!(back.snapshot.links, rec.snapshot.links);
+
+        // 旧记录缺少 links / web_reads → 宽容读取为空数组
+        let old = ulid();
+        let bare = sample(&old, "T1", RunState::Succeeded, "2026-10-12T00:30");
+        let mut json = serde_json::to_value(&bare).unwrap();
+        json.as_object_mut().unwrap().remove("web_reads");
+        json["snapshot"].as_object_mut().unwrap().remove("links");
+        fs::create_dir_all(runs_dir(base)).unwrap();
+        fs::write(
+            runs_dir(base).join(format!("{old}.json")),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = find_record_in(base, &old).unwrap();
+        assert!(loaded.web_reads.is_empty());
+        assert!(loaded.snapshot.links.is_empty());
+    }
+
+    #[test]
+    fn list_sorts_desc_and_skips_corrupt() {        let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let a = ulid();
         let b = ulid();

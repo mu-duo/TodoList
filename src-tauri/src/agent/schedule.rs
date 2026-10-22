@@ -212,9 +212,11 @@ mod tests {
                 title: "t".to_string(),
                 notes: String::new(),
                 paths: vec![],
+                links: vec![],
             },
             result_dir: "D:\\r".to_string(),
             partial: false,
+            web_reads: vec![],
         }
     }
 

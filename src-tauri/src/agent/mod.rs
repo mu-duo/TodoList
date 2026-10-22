@@ -12,6 +12,7 @@ pub mod clock;
 pub mod commands;
 pub mod config;
 pub mod intent;
+pub mod net;
 pub mod presets;
 pub mod provider;
 pub mod record;
