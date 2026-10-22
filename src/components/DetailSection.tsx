@@ -7,6 +7,8 @@ type Props = {
   title: string;
   /** 右侧说明（如「随改随存」）。 */
   hint?: ReactNode;
+  /** 标题行悬浮提示（原生 title，不进可访问名）。 */
+  titleHint?: string;
   /** content 是否加边框包裹。 */
   boxed?: boolean;
   collapsed: boolean;
@@ -24,6 +26,7 @@ export function DetailSection({
   sectionKey,
   title,
   hint,
+  titleHint,
   boxed = false,
   collapsed,
   onToggle,
@@ -32,7 +35,7 @@ export function DetailSection({
   return (
     <section className="detail-section" data-section={sectionKey}>
       <h3 className="detail-section-head" id={`detail-${sectionKey}-head`}>
-        <button type="button" aria-expanded={!collapsed} onClick={onToggle}>
+        <button type="button" title={titleHint} aria-expanded={!collapsed} onClick={onToggle}>
           <span className="detail-section-chevron" aria-hidden="true">
             <svg
               viewBox="0 0 24 24"

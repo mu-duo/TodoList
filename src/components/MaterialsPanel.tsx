@@ -59,9 +59,7 @@ export function MaterialsPanel({
 
   return (
     <>
-      {isEmpty ? (
-        <p className="agent-hint">暂无关联材料。</p>
-      ) : (
+      {!isEmpty && (
         <ul className="material-list">
           {paths.map((path) => (
             <li key={`path:${path}`} className="material-item">
@@ -111,21 +109,21 @@ export function MaterialsPanel({
       <div className="material-add-row">
         <button
           type="button"
-          className="row-action"
+          className="material-add-btn"
           onClick={() => onAddPaths(false)}
         >
           添加文件
         </button>
         <button
           type="button"
-          className="row-action"
+          className="material-add-btn"
           onClick={() => onAddPaths(true)}
         >
           添加目录
         </button>
         <button
           type="button"
-          className="row-action"
+          className="material-add-btn"
           aria-expanded={linkOpen}
           onClick={() => (linkOpen ? closeLinkInput() : setLinkOpen(true))}
         >
@@ -170,10 +168,6 @@ export function MaterialsPanel({
           )}
         </div>
       )}
-
-      <p className="agent-hint">
-        本地路径与链接都会提供给 Agent 只读访问（链接仅支持 http(s) 抓取）。
-      </p>
     </>
   );
 }

@@ -2240,12 +2240,57 @@ body.is-dragging * {
   }
 }
 
-/* 添加入口（文件 / 目录 / 链接） */
+/* 添加入口（文件 / 目录 / 链接）：一行三等分，每个都是明确的「可添加」控件 */
 .material-add-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
   margin-top: 8px;
+}
+
+/* 空态时按钮行就是首个内容：不要再叠一层外边距 */
+.material-add-row:first-child {
+  margin-top: 0;
+}
+
+.material-add-btn {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 8px;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-control);
+  white-space: nowrap;
+}
+
+/* 「+」由伪元素提供，颜色随文字一起过渡 */
+.material-add-btn::before {
+  content: "+";
+  font-weight: 600;
+  line-height: 1;
+}
+
+.material-add-btn:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--surface-muted);
+  border-color: var(--accent);
+}
+
+/* 按下：全局 button:active 已有 1px 下沉，这里只加深一档边框 */
+.material-add-btn:active:not(:disabled) {
+  background: var(--surface-muted);
+  border-color: var(--accent-strong);
+}
+
+.material-add-btn:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
 }
 
 /* 链接就地录入：按钮行下方单行输入 */

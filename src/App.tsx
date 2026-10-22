@@ -2775,6 +2775,7 @@ function App() {
         <DetailSection
           sectionKey="materials"
           title="关联材料"
+          titleHint="本地路径与链接都会提供给 Agent 只读访问（链接仅支持 http(s) 抓取）"
           collapsed={isCollapsed("materials")}
           onToggle={() => toggleDetailSection("materials")}
         >
