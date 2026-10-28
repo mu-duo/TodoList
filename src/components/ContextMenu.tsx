@@ -2,7 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 export type MenuItem = {
   key: string;
-  label: string;
+  /** 分隔线项无需文案（`separator: true` 时忽略）。 */
+  label?: string;
   danger?: boolean;
   /** 禁用（不可选）。默认 false，保持既有行为。 */
   disabled?: boolean;
@@ -10,6 +11,8 @@ export type MenuItem = {
   checked?: boolean;
   /** 子菜单项；存在时该项为父菜单（点击/悬浮展开），`onSelect` 可省。 */
   children?: MenuItem[];
+  /** 渲染为一条细分隔线（分隔菜单区）。不参与焦点 / 悬停 / 点击语义。 */
+  separator?: true;
   onSelect?: () => void;
 };
 
@@ -72,15 +75,24 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
       style={{ left: pos.left, top: pos.top }}
       role="menu"
     >
-      {items.map((item) => (
-        <MenuRow
-          key={item.key}
-          item={item}
-          onClose={onClose}
-          openKey={openKey}
-          onOpen={setOpenKey}
-        />
-      ))}
+      {items.map((item) =>
+        item.separator ? (
+          <div
+            key={item.key}
+            className="context-menu-separator"
+            role="separator"
+            aria-orientation="horizontal"
+          />
+        ) : (
+          <MenuRow
+            key={item.key}
+            item={item}
+            onClose={onClose}
+            openKey={openKey}
+            onOpen={setOpenKey}
+          />
+        ),
+      )}
     </div>
   );
 }

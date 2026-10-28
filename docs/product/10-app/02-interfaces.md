@@ -57,6 +57,7 @@ tasks:
 | `title` | string | ✓ | 标题 |
 | `status` | `open` \| `done` | ✓（缺省 open） | 完成状态 |
 | `completed` | 本地时间 | done 时 | 完成时间 |
+| `archived` | 本地时间 |  | 归档时间（`FR-APP-36`）；只对 `status: done` 有意义；缺失＝未归档；删除该键即取消归档 |
 | `priority` | `high` \| `medium` \| `low` |  | 优先级 |
 | `due` | `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM` |  | 截止（本地时间） |
 | `reminder` | `false` |  | 可选；`false`＝该任务不再提醒；缺省（或 `true` / 非法值）按默认开启处理；无 due 时不可设为 `false`；旧 `reminder_offset_days` 不再写入，任务元数据保存时移除 |
@@ -70,6 +71,7 @@ tasks:
 - **顺序语义**：显示顺序 = `tasks` 数组顺序；拖拽排序即重排数组；自动排序视图不落盘。
 - **清单文件**：文件名 = 清单名规整化（含 Windows 保留名 / 结尾点空格处理）；重命名清单同步改名文件（冲突自动后缀）；删除清单即删除对应文件。
 - **完成留档**：完成任务保留在原文件（带 `completed`），不迁出文件。
+- **归档（FR-APP-36）**：归档＝在任务上写 `archived`（本地时间），**不移动、不删除、不改 `status`、不改数组顺序**；仅已完成视图按视图偏好决定是否渲染。取消归档＝删除 `archived` 键。归档不影响子任务数据。
 - **未知字段一律保留**：app 不认识的字段原样写回（agent 可自定义扩展字段）。
 - **写入**：app 写回 = 重读最新文件 → Value 级补丁只改目标字段 → 原子写（同目录临时文件 + rename）。
 - **外部变更**：文件变更触发 app 自动重载（目标：≤2s 防抖；骨架阶段暂以刷新替代）。
@@ -85,6 +87,12 @@ tasks:
 
 - `update_task_metadata({ listFile, taskId, patch }) -> void`：patch 使用 camelCase 可选字段 `priority?: "high" | "medium" | "low" | null`、`due?: string | null`、`tags?: string[]`、`reminder?: false | null`。字段缺省不修改，显式 `null` 清除（`reminder: null` 删除开关键＝恢复默认提醒）；`reminder: false` 写入关闭（无 due 时报错不写）；空 tags 清除。`due` 只接受本地 `YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`，无时区转换。保存为最新 YAML 上的目标字段 Value 级补丁并原子写。
 - `TaskView` 前端属性为 `reminder: false | null`；磁盘字段名 `reminder`（缺省开启 → `null`）。清除 due 同时清除提醒开关。旧 `reminder_offset_days` 视同开启、任务元数据保存时移除。
+
+### 归档命令（FR-APP-36）
+
+- `archive_tasks({ listFile, taskIds }) -> void`：对同一清单内一批 task 写入 `archived = 本地时间`（`now_local()` 同款格式）。一次重读 + **一次原子写**（Value 级补丁，未知字段与其它任务保留）；跳过不存在的 id 与 `status !== done` 的任务（不报错、不写该键）；已有 `archived` 的任务**不覆盖**原归档时间。
+- `unarchive_tasks({ listFile, taskIds }) -> void`：删除同批 task 的 `archived` 键；缺失该键的 id 静默跳过。
+- 两条命令均以 `listFile` 为作用域（跨清单批量由前端按清单拆分调用）；写入失败返回中文错误且不落盘。
 
 ## 4. 版本与演进
 
@@ -205,6 +213,31 @@ minimize_to_tray: false       # 可选；缺省＝开启（默认）；false＝�
 - **单例唤醒**：第二实例回调＝同一恢复逻辑（隐藏 / 最小化状态均恢复并前置；单例插件代递 `AllowSetForegroundWindow`）。
 - **系统关机 / 注销不拦截**（tao 直接退出，不经本拦截）。
 - **已知边界**：安装器 Restart Manager 提示关闭时，托盘态需先从托盘菜单「退出」再继续（见 `docs/RELEASE.md`）。
+
+### 5.4 「已完成」视图显示归档偏好（completed.show_archived）
+
+> **状态（2026-10-28）：未实现（FR-APP-36 规划中）**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+> 归档字段与批量命令见本文件 §2；归档与时间分层语义见 [01-spec.md](01-spec.md) §6（FR-APP-36）。
+
+「已完成」视图是否渲染已归档任务，是**本机偏好**，与 `completed.collapsed` 同处 `settings.yaml`：
+
+```yaml
+completed:
+  collapsed: [工作.yaml]
+  show_archived: true      # 可选；缺省 / false ＝ 不显示归档（默认）
+```
+
+**接口（Tauri 命令）**：
+
+- `load_settings()` 增 `completed_show_archived: bool`，取自 `completed.show_archived`；缺失 / 非布尔 → `false`（= 默认关闭）。
+- `save_completed_show_archived({ show: bool })`：Value 级补丁**仅改 `completed.show_archived`**（保留 `completed.collapsed`、`theme`、`app_bar`、`detail` 与全部未知字段）；`show: false` → **删除该键**（恢复默认关闭）；`show: true` → 写 `true`；已有 `completed` 非对象时报中文错误、不写盘。
+
+**语义**：
+
+- 关闭（默认）：归档项不渲染；侧栏「已完成」总数与组头「名称 · 数量」均不含归档项。
+- 开启：归档项留在其 `completed` 所属时间组内、排在该组未归档项之后，弱化样式 + 「已归档」角标；计数包含它们。
+- 该字段与 `completed.collapsed` 互不覆盖（各自 Value 级补丁）；失效 / 未知字段照旧保留。
+- **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
 
 ## 6. Agent 协助（多 Provider，**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**）
 
@@ -349,3 +382,4 @@ agent:
 - 2026-10-22 新增 §5.2「任务详情子板块折叠偏好」（`detail.collapsed`）：`load_settings` 增 `detail_collapsed: string[] | null`、新增 `save_detail_collapsed({ collapsed })`——Value 级补丁**仅改 `detail.collapsed`**，保留 `theme` / `app_bar` / `completed` / `minimize_to_tray` / `agent` 与未知字段；合法 key = `title` / `metadata` / `subtasks` / `notes` / `meta` / `agent`，缺 key = 默认仅 `metadata` 收起。**与 §5.1 的差异：显式空数组必须写盘为 `collapsed: []` 并保留 key（不清除）**；`null` 删除该字段（`detail` 因此变空则一并删除）；空白 key / `detail` 非对象报中文错误不写盘。原 §5.2 托盘节顺延为 §5.3。**未改数据目录 schema，与 `load_lists` 无关。**
 - 2026-10-22 任务 Agent 新增「链接」`agent.links` 与命令 `agent_open_external`：`agent: { enabled, paths, links }` 中 `links` 仅用于人工点击打开、**不参与沙箱 / 不传给模型**；写入校验（trim、`http://`/`https://`/`file://` 前缀大小写不敏感、禁空白 / 控制字符、≤2048 字符、去重保序，非法报中文错误且不写盘），读取宽容（非字符串丢弃，旧数据 → 空数组）；`TaskView.agent` 带出 `links`。`agent_open_external({ target })` 分派：URL → 浏览器，目录 → 打开，文件 → 资源管理器中定位并选中，其它 scheme / 不存在 → 中文错误。§5.2 `detail.collapsed` 合法 key 集合补 `materials`。**`agent.paths` 语义与沙箱校验不变。**
 - 2026-10-22 新增 Agent 只读网页抓取工具 `url_read`（§6.6）：参数 `{ url, offset? }`；仅能抓取任务 `agent.links` 中 trim 后完全相等的链接（未授权不请求），`file://` 转本地路径并复用 `agent.paths` 白名单；单页 ≤256KiB 并计入 `stats.bytes_read`，超时 20s（且不超过运行剩余时限），重定向手动跟随 ≤3 跳；每跳重新校验 scheme 与解析 IP（SSRF 拒绝回环 / 内网 / 链路本地 / 组播 / 文档保留段，IPv4-mapped 按映射后处理）；仅接受文本类响应，HTML→纯文本（去 script/style/标签、实体解码、压缩空白）。运行启动时再次校验已存 links（非法 → `failed(UnsafePath)`）。`RunRecord.snapshot.links` 与 `RunRecord.web_reads`（去重保序，旧记录缺省为空数组）落盘；初始 prompt 增加「可用材料」本地路径 / 链接清单。**`agent.paths` 沙箱与 `native_search` 行为不变。**
+- 2026-10-28 规划 FR-APP-36「已完成归档与时间分层」：任务字段新增可选 `archived`（本地时间，删除即取消归档；不移动 / 不改 `status` / 不改数组顺序）；新增命令 `archive_tasks` / `unarchive_tasks`（按 `listFile` + `taskIds` 一次重读一次原子写，跳过不存在与非 done 项，不覆盖已有 `archived`）；新增 §5.4 `completed.show_archived`（`load_settings.completed_show_archived: bool`、`save_completed_show_archived({ show })`，`show: false` 删键恢复默认关闭）。**向后兼容、旧数据无需迁移；未改 schema 版本、不新增文件。**

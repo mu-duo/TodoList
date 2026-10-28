@@ -30,6 +30,20 @@ fn set_task_status(list_file: String, task_id: String, done: bool) -> Result<(),
     storage::set_task_status_in(&base, &list_file, &task_id, done)
 }
 
+/// 批量归档任务（仅 `done`；跳过不存在 / 非 done / 已归档项）。
+#[tauri::command]
+fn archive_tasks(list_file: String, task_ids: Vec<String>) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::archive_tasks_in(&base, &list_file, &task_ids)
+}
+
+/// 批量取消归档任务（删除 `archived` 键；不存在的 id 静默跳过）。
+#[tauri::command]
+fn unarchive_tasks(list_file: String, task_ids: Vec<String>) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::unarchive_tasks_in(&base, &list_file, &task_ids)
+}
+
 /// 向指定清单末尾追加新任务。
 #[tauri::command]
 fn create_task(list_file: String, title: String) -> Result<(), String> {
@@ -188,6 +202,13 @@ fn save_app_bar_order(order: Option<Vec<String>>) -> Result<(), String> {
 fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String> {
     let base = storage::settings_dir()?;
     storage::save_completed_collapsed_in(&base, collapsed.as_deref())
+}
+
+/// 保存「已完成」视图是否显示归档任务（`false` → 删除 `completed.show_archived`，恢复默认关闭）。
+#[tauri::command]
+fn save_completed_show_archived(show: bool) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_completed_show_archived_in(&base, show)
 }
 
 /// 保存任务详情折叠的子板块 key 集合（`None` → 删除 `detail.collapsed`；空数组照写，表示全部展开）。
@@ -513,6 +534,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_lists,
             set_task_status,
+            archive_tasks,
+            unarchive_tasks,
             create_task,
             create_list,
             update_task,
@@ -532,6 +555,7 @@ pub fn run() {
             save_settings,
             save_app_bar_order,
             save_completed_collapsed,
+            save_completed_show_archived,
             save_detail_collapsed,
             save_minimize_to_tray,
             agent::commands::agent_load_config,

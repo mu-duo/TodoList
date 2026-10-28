@@ -48,6 +48,9 @@ pub struct Settings {
     /// 「已完成」视图折叠的清单文件名集合（本机偏好）；缺失 / 空 / 非法 → `None`（默认全部展开）。
     #[serde(default)]
     pub completed_collapsed: Option<Vec<String>>,
+    /// 「已完成」视图是否显示归档任务（本机偏好）；缺失 / 非布尔 → `false`（默认关闭）。
+    #[serde(default)]
+    pub completed_show_archived: bool,
     /// 任务详情折叠的子板块 key 集合（本机偏好）；缺失 / 非法 → `None`（默认仅 `metadata` 收起）。
     /// 与 `completed_collapsed` 不同，显式空数组是有效值（全部展开）。
     #[serde(default)]
@@ -84,6 +87,8 @@ pub struct TaskView {
     /// open | done
     pub status: String,
     pub completed: Option<String>,
+    /// 归档时间（`FR-APP-36`）；缺失 / 非字符串 / 空 → 未归档。
+    pub archived: Option<String>,
     pub priority: Option<String>,
     pub due: Option<String>,
     /// 是否关闭提醒；`Some(false)` = 不再提醒，`None` = 默认开启。
@@ -212,13 +217,15 @@ pub(crate) fn strip_bom(text: &str) -> &str {
 /// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
 /// 且**不会**创建文件、不会 panic。`app_bar.order` 缺失 / 空 / 非法时 `app_bar_order` 为
 /// `None`；合法字符串 id 去重（首次保留）并保留未知 id 原顺序，不自动补已知 id。
-/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析；`detail.collapsed` 由
-/// [`parse_detail_collapsed`] 解析（显式空数组合法）。读取前剥离前导 BOM。
+/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析；`completed.show_archived`
+/// 缺失 / 非布尔 → `false`；`detail.collapsed` 由 [`parse_detail_collapsed`] 解析（显式空数组合法）。
+/// 读取前剥离前导 BOM。
 pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     let fallback = || Settings {
         theme: DEFAULT_THEME.to_string(),
         app_bar_order: None,
         completed_collapsed: None,
+        completed_show_archived: false,
         detail_collapsed: None,
         minimize_to_tray: None,
     };
@@ -243,6 +250,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         theme,
         app_bar_order: parse_app_bar_order(&value),
         completed_collapsed: parse_completed_collapsed(&value),
+        completed_show_archived: parse_completed_show_archived(&value),
         detail_collapsed: parse_detail_collapsed(&value),
         // 缺失 / 非布尔 → None（默认开启）；字面 false → Some(false)（已关闭）。
         minimize_to_tray: value.get("minimize_to_tray").and_then(Value::as_bool),
@@ -289,6 +297,16 @@ fn parse_completed_collapsed(value: &Value) -> Option<Vec<String>> {
     } else {
         Some(collapsed)
     }
+}
+
+/// 从设置 Value 解析 `completed.show_archived`：缺失 / `completed` 非对象 / 非布尔 → `false`
+/// （默认不显示归档）；仅字面 `true` → `true`。
+fn parse_completed_show_archived(value: &Value) -> bool {
+    value
+        .get("completed")
+        .and_then(|completed| completed.get("show_archived"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// 从设置 Value 解析 `detail.collapsed`：缺失 / 非对象 / 非数组 / 含非字符串或空白元素 → `None`；
@@ -449,6 +467,49 @@ pub fn save_completed_collapsed_in(
                 completed.remove("collapsed");
             }
         }
+    }
+
+    write_list(&path, &value)
+}
+
+/// 写入 / 清除 `completed.show_archived`（`false` → 删除该键以恢复默认：不显示归档任务）。
+///
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `completed.show_archived`** → 原子写，
+/// 保留 `theme`、`app_bar`、`completed.collapsed`、`detail` 及所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// 已有 `completed` 若非对象 → 中文错误（不覆盖未知标量）。
+pub fn save_completed_show_archived_in(base: &Path, show: bool) -> Result<(), String> {
+    fs::create_dir_all(base).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let path = base.join(SETTINGS_FILE);
+
+    let mut value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("读取设置文件失败：{e}"))?;
+        yaml_serde::from_str(&text).map_err(|e| format!("解析设置文件失败：{e}"))?
+    } else {
+        Value::Mapping(Mapping::new())
+    };
+
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+
+    if show {
+        let completed = match root.get_mut("completed") {
+            Some(existing) => existing
+                .as_mapping_mut()
+                .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?,
+            None => {
+                root.insert(key("completed"), Value::Mapping(Mapping::new()));
+                root.get_mut("completed")
+                    .and_then(Value::as_mapping_mut)
+                    .expect("刚插入的 completed 应为对象")
+            }
+        };
+        completed.insert(key("show_archived"), Value::Bool(true));
+    } else if let Some(existing) = root.get_mut("completed") {
+        let completed = existing
+            .as_mapping_mut()
+            .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?;
+        completed.remove("show_archived");
     }
 
     write_list(&path, &value)
@@ -673,7 +734,8 @@ pub(crate) fn find_task_mut<'a>(
         .ok_or_else(|| format!("任务 {task_id} 不是对象"))
 }
 
-/// 按任务 id 仅修改 `status`（及 `completed`），Value 级补丁后原子写回。
+/// 按任务 id 仅修改 `status`（及 `completed`；回到 `open` 时同时移除 `archived`），
+/// Value 级补丁后原子写回。
 pub fn set_task_status_in(
     base: &Path,
     list_file: &str,
@@ -697,9 +759,83 @@ pub fn set_task_status_in(
         map.insert(key("completed"), Value::String(now_local()));
     } else {
         map.remove("completed");
+        // 未完成任务不可能处于归档态（FR-APP-36）；取消完成时一并取消归档。
+        map.remove("archived");
     }
 
     write_list(&path, &value)
+}
+
+/// 批量写入 / 删除任务的 `archived` 键：一次重读 + 一次原子写（Value 级补丁）。
+///
+/// `archive = true`：仅对 `status == "done"` 且当前无归档时间的任务写入 `now_local()`；
+/// 不存在的 id、非 done、已有非空 `archived` 的任务静默跳过（不覆盖原归档时间）。
+/// `archive = false`：删除匹配任务的 `archived` 键；缺失该键的任务同样静默跳过。
+/// 未知字段与未命中任务原样保留。
+fn patch_task_archive(
+    base: &Path,
+    list_file: &str,
+    task_ids: &[String],
+    archive: bool,
+) -> Result<(), String> {
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = task_file_write_guard();
+    let path = list_path(base, list_file)?;
+    let mut value = read_list_value(&path, list_file)?;
+
+    let tasks = value
+        .get_mut("tasks")
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("清单「{list_file}」缺少 tasks 数组"))?;
+
+    for task in tasks.iter_mut() {
+        let matched = task
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| task_ids.iter().any(|target| target == id));
+        if !matched {
+            continue;
+        }
+        let Some(map) = task.as_mapping_mut() else {
+            continue;
+        };
+
+        if archive {
+            if map.get("status").and_then(Value::as_str) != Some("done") {
+                continue;
+            }
+            let already_archived = map
+                .get("archived")
+                .and_then(Value::as_str)
+                .is_some_and(|archived| !archived.trim().is_empty());
+            if already_archived {
+                continue;
+            }
+            map.insert(key("archived"), Value::String(now_local()));
+        } else {
+            map.remove("archived");
+        }
+    }
+
+    write_list(&path, &value)
+}
+
+/// 批量归档同一清单内的任务：对每个 `status == done` 的任务写入 `archived = 本地时间`。
+///
+/// 跳过不存在的 id 与非 done 任务（不报错）；已有非空 `archived` 的任务不覆盖。
+/// 一次重读 + 一次原子写，未知字段与其它任务原样保留。
+pub fn archive_tasks_in(base: &Path, list_file: &str, task_ids: &[String]) -> Result<(), String> {
+    patch_task_archive(base, list_file, task_ids, true)
+}
+
+/// 批量取消归档同一清单内的任务：删除匹配任务的 `archived` 键。
+///
+/// 不存在的 id、缺失该键的任务静默跳过；一次重读 + 一次原子写。
+pub fn unarchive_tasks_in(base: &Path, list_file: &str, task_ids: &[String]) -> Result<(), String> {
+    patch_task_archive(base, list_file, task_ids, false)
 }
 
 /// 若 `value` 的 `tasks` 为数组则在其末尾追加 `task`，否则报错。
@@ -1483,6 +1619,7 @@ fn mapping_to_task(value: &Value) -> Option<TaskView> {
         title,
         status,
         completed: get_str(m, "completed"),
+        archived: get_str(m, "archived").filter(|value| !value.trim().is_empty()),
         priority: get_str(m, "priority"),
         due: get_str(m, "due"),
         // 仅字面 `false` = 关；`true` / 缺省 = 默认开（归一化为 None）。
@@ -1583,6 +1720,16 @@ mod tests {
 
     fn read_value(path: &Path) -> Value {
         yaml_serde::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn task_by_id<'a>(value: &'a Value, id: &str) -> &'a Value {
+        value
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .find(|task| task.get("id").and_then(Value::as_str) == Some(id))
+            .unwrap()
     }
 
     fn order_of(base: &Path, file: &str) -> i64 {
@@ -1926,6 +2073,159 @@ tasks:
             .unwrap();
         assert_eq!(t1.get("status").and_then(Value::as_str), Some("open"));
         assert!(t1.get("completed").is_none(), "取消完成应移除 completed");
+    }
+
+    #[test]
+    fn set_task_status_open_removes_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\ntasks:\n  - id: T1\n    title: T\n    status: done\n    completed: 2026-10-01T09:00\n    archived: 2026-10-02T09:00\n    x-task: keep\n",
+        );
+
+        set_task_status_in(base, "L.yaml", "T1", false).unwrap();
+
+        let value = read_value(&path);
+        let task = task_by_id(&value, "T1");
+        assert_eq!(task.get("status").and_then(Value::as_str), Some("open"));
+        assert!(task.get("completed").is_none(), "取消完成应移除 completed");
+        assert!(
+            task.get("archived").is_none(),
+            "未完成任务不应保留 archived（取消完成即取消归档）"
+        );
+        assert_eq!(task.get("x-task").and_then(Value::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn archive_tasks_only_done_skips_unknown_and_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\nx-top: keep\ntasks:\n  - id: DONE1\n    title: 已完成\n    status: done\n    completed: 2026-10-01T09:00\n    x-task: keep1\n  - id: DONE2\n    title: 已归档\n    status: done\n    completed: 2026-10-02T09:00\n    archived: 2026-10-03T08:30\n  - id: OPEN1\n    title: 未完成\n    status: open\n  - id: NO_STATUS\n    title: 缺省状态\n  - id: DONE3\n    title: 也完成\n    status: done\n    completed: 2026-10-04T09:00\n",
+        );
+
+        let ids = vec![
+            "DONE1".to_string(),
+            "DONE2".to_string(),
+            "OPEN1".to_string(),
+            "NO_STATUS".to_string(),
+            "MISSING".to_string(),
+            "DONE3".to_string(),
+        ];
+        archive_tasks_in(base, "L.yaml", &ids).unwrap();
+
+        let value = read_value(&path);
+        let archived = task_by_id(&value, "DONE1")
+            .get("archived")
+            .and_then(Value::as_str)
+            .expect("done 任务应写入 archived")
+            .to_string();
+        assert_eq!(archived.len(), 16, "archived 应为 YYYY-MM-DDTHH:MM：{archived}");
+        assert!(archived.contains('T'));
+        // 其它字段不受影响
+        let done1 = task_by_id(&value, "DONE1");
+        assert_eq!(done1.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(
+            done1.get("completed").and_then(Value::as_str),
+            Some("2026-10-01T09:00")
+        );
+        assert_eq!(
+            done1.get("x-task").and_then(Value::as_str),
+            Some("keep1")
+        );
+
+        // 已有归档时间：不覆盖
+        assert_eq!(
+            task_by_id(&value, "DONE2")
+                .get("archived")
+                .and_then(Value::as_str),
+            Some("2026-10-03T08:30")
+        );
+        // 非 done / 缺省 status / 不存在 id：不写键
+        assert!(task_by_id(&value, "OPEN1").get("archived").is_none());
+        assert!(task_by_id(&value, "NO_STATUS").get("archived").is_none());
+        // 其它 done 任务照常归档
+        assert!(task_by_id(&value, "DONE3").get("archived").is_some());
+
+        // 数组顺序与顶层未知字段保留
+        let ids_after: Vec<&str> = value
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(|task| task.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            ids_after,
+            vec!["DONE1", "DONE2", "OPEN1", "NO_STATUS", "DONE3"]
+        );
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+
+        // 读回视图：archived 解析为字符串，前置前端可用
+        let lists = load_lists_from(base).unwrap().lists;
+        let view = lists[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == "DONE1")
+            .unwrap();
+        assert!(view.archived.is_some());
+    }
+
+    #[test]
+    fn unarchive_tasks_removes_key_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\nx-top: keep\ntasks:\n  - id: DONE1\n    title: 已归档\n    status: done\n    completed: 2026-10-01T09:00\n    archived: 2026-10-02T09:00\n    x-task: keep1\n  - id: DONE2\n    title: 未归档\n    status: done\n    completed: 2026-10-02T09:00\n",
+        );
+
+        let ids = vec![
+            "DONE1".to_string(),
+            "DONE2".to_string(),
+            "MISSING".to_string(),
+        ];
+        unarchive_tasks_in(base, "L.yaml", &ids).unwrap();
+
+        let value = read_value(&path);
+        let done1 = task_by_id(&value, "DONE1");
+        assert!(done1.get("archived").is_none(), "应删除 archived");
+        assert_eq!(done1.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(
+            done1.get("completed").and_then(Value::as_str),
+            Some("2026-10-01T09:00")
+        );
+        assert_eq!(
+            done1.get("x-task").and_then(Value::as_str),
+            Some("keep1")
+        );
+        // 未归档任务与未知 id 静默跳过
+        assert_eq!(
+            task_by_id(&value, "DONE2").get("status").and_then(Value::as_str),
+            Some("done")
+        );
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert!(load_lists_from(base).unwrap().lists[0].tasks[0]
+            .archived
+            .is_none());
+    }
+
+    #[test]
+    fn archive_and_unarchive_error_on_invalid_list_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(base, "L.yaml", "schema: 1\nname: L\ntasks: notaseq\n");
+        let before = fs::read(&path).unwrap();
+
+        let ids = vec!["T1".to_string()];
+        assert!(archive_tasks_in(base, "L.yaml", &ids).is_err());
+        assert!(unarchive_tasks_in(base, "L.yaml", &ids).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before, "失败不应写盘");
     }
 
     #[test]
@@ -3350,6 +3650,156 @@ tasks:
 
         assert!(save_completed_collapsed_in(base, Some(&["工作.yaml".to_string()])).is_err());
         assert!(save_completed_collapsed_in(base, None).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "保存失败不应写盘"
+        );
+    }
+
+    #[test]
+    fn load_settings_completed_show_archived_defaults_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // 缺失文件
+        assert!(
+            !load_settings_from(base).unwrap().completed_show_archived,
+            "缺失文件时默认关闭"
+        );
+
+        let cases = [
+            "theme: dark\n",                                            // completed 缺失
+            "theme: dark\ncompleted:\n  collapsed: [工作.yaml]\n",      // show_archived 缺失
+            "theme: dark\ncompleted:\n  show_archived: maybe\n",        // 非布尔
+            "theme: dark\ncompleted:\n  show_archived: 1\n",            // 整数
+            "theme: dark\ncompleted:\n  show_archived: null\n",         // null
+            "theme: dark\ncompleted: notamap\n",                        // completed 非对象
+        ];
+        for text in cases {
+            fs::write(base.join(SETTINGS_FILE), text).unwrap();
+            assert!(
+                !load_settings_from(base).unwrap().completed_show_archived,
+                "缺失 / 非布尔应回退 false：{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_completed_show_archived_roundtrips_true_and_false_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: dark\nx-top: keep\ncompleted:\n  collapsed: [工作.yaml, 家务.yaml]\n  x-custom: keep2\n",
+        )
+        .unwrap();
+
+        // true → 写 true，保留 collapsed 与未知字段
+        save_completed_show_archived_in(base, true).unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert!(settings.completed_show_archived);
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["工作.yaml".to_string(), "家务.yaml".to_string()])
+        );
+
+        let value = read_value(&path);
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let completed = value.get("completed").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            completed.get("show_archived").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            completed.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(
+            completed
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.len()),
+            Some(2)
+        );
+
+        // false → 删除键，collapsed / 未知字段仍保留
+        save_completed_show_archived_in(base, false).unwrap();
+        let value = read_value(&path);
+        let completed = value.get("completed").and_then(Value::as_mapping).unwrap();
+        assert!(
+            completed.get("show_archived").is_none(),
+            "false 应删除 completed.show_archived"
+        );
+        assert_eq!(
+            completed.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(
+            completed
+                .get("collapsed")
+                .and_then(Value::as_sequence)
+                .map(|seq| seq.len()),
+            Some(2)
+        );
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert!(!load_settings_from(base).unwrap().completed_show_archived);
+    }
+
+    #[test]
+    fn save_completed_show_archived_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert!(!base.join(SETTINGS_FILE).exists());
+
+        save_completed_show_archived_in(base, true).unwrap();
+
+        assert!(base.join(SETTINGS_FILE).is_file(), "应创建 settings.yaml");
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert!(settings.completed_show_archived);
+
+        // false 在没有 completed 时也不应报错
+        save_completed_show_archived_in(base, false).unwrap();
+        assert!(!load_settings_from(base).unwrap().completed_show_archived);
+    }
+
+    #[test]
+    fn save_completed_show_archived_rejects_malformed_completed_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: dark\ncompleted: 未知标量\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            save_completed_show_archived_in(base, true).is_err(),
+            "completed 非对象应报错"
+        );
+        assert!(
+            save_completed_show_archived_in(base, false).is_err(),
+            "关闭也不应覆盖未知标量"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "失败不应写盘"
+        );
+    }
+
+    #[test]
+    fn save_completed_show_archived_errors_on_non_mapping_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "- not\n- a map\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(save_completed_show_archived_in(base, true).is_err());
+        assert!(save_completed_show_archived_in(base, false).is_err());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             before,

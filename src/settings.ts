@@ -11,6 +11,8 @@ export type AppSettings = {
   appBarOrder: string[] | null;
   /** 「已完成」视图折叠的清单文件名集合；null = 默认全展开（字段缺失 / 为空 / 非法）。 */
   completedCollapsed: string[] | null;
+  /** 「已完成」视图是否渲染已归档任务；false = 默认关闭（字段缺失 / 非布尔）。 */
+  completedShowArchived: boolean;
   /** 任务详情中收起的子板块 key；null = 默认（仅「任务属性」收起）。空数组合法 = 全部展开。 */
   detailCollapsed: DetailSectionKey[] | null;
   /** 「关闭时最小化到托盘」；null = 默认开启（字段缺失 / 非法），false = 已关闭。 */
@@ -27,6 +29,7 @@ export async function loadSettings(): Promise<AppSettings> {
       theme?: unknown;
       app_bar_order?: unknown;
       completed_collapsed?: unknown;
+      completed_show_archived?: unknown;
       detail_collapsed?: unknown;
       minimize_to_tray?: unknown;
     }>("load_settings");
@@ -34,6 +37,11 @@ export async function loadSettings(): Promise<AppSettings> {
       theme: isThemePref(raw?.theme) ? raw.theme : "system",
       appBarOrder: sanitizeAppBarOrder(raw?.app_bar_order),
       completedCollapsed: sanitizeCompletedCollapsed(raw?.completed_collapsed),
+      // 仅接受真正的布尔；缺失 / 非法 → false（= 默认不显示归档）
+      completedShowArchived:
+        typeof raw?.completed_show_archived === "boolean"
+          ? raw.completed_show_archived
+          : false,
       detailCollapsed: sanitizeDetailCollapsed(raw?.detail_collapsed),
       // 仅接受真正的布尔；缺失 / 非法 → null（= 默认开启）
       minimizeToTray:
@@ -46,6 +54,7 @@ export async function loadSettings(): Promise<AppSettings> {
       theme: "system",
       appBarOrder: null,
       completedCollapsed: null,
+      completedShowArchived: false,
       detailCollapsed: null,
       minimizeToTray: null,
     };

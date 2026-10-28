@@ -1278,6 +1278,7 @@ mod p2_tests {
             title: "t".to_string(),
             status: status.to_string(),
             completed: None,
+            archived: None,
             priority: None,
             due: None,
             reminder: None,

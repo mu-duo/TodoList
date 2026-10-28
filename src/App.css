@@ -444,36 +444,54 @@ button:focus-visible {
   color: var(--text-muted);
 }
 
+/* 页头右侧：视图偏好开关 + 计数（与标题同基线） */
+.pane-head-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.pane-head-actions .reminder-toggle {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.pane-head-actions .reminder-toggle:hover {
+  color: var(--text);
+}
+
 /* ---------------------------------------- 已完成：按来源清单分组 / 折叠 ---- */
 
 /* 分组容器：组间留白大于组内行距，形成清晰的来源分组节奏 */
 .completed-groups {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 30px;
 }
 
 .completed-group {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
-/* 组头：整行可点（button 语义），低调的分组标签观感 */
+/* 组头（一级）：来源清单名，字号 / 字重 / 主文本色都明显高于下面的任务；
+   整行仍是可点折叠按钮，hover 只做很轻的底色反馈 */
 .completed-group-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   width: 100%;
-  padding: 4px 6px;
+  padding: 6px 8px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-control);
-  color: var(--text-muted);
+  color: var(--text);
   text-align: left;
-  font-size: 0.82rem;
-  font-weight: 600;
-  letter-spacing: 0.005em;
+  font-size: 1.06rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
 
 .completed-group-head:hover:not(:disabled) {
@@ -490,7 +508,7 @@ button:focus-visible {
   justify-content: center;
   width: 14px;
   height: 14px;
-  color: var(--text-faint);
+  color: var(--text-muted);
   transition: transform var(--ease);
 }
 
@@ -512,20 +530,47 @@ button:focus-visible {
   white-space: nowrap;
 }
 
-.completed-group-sep,
+/* 数量：低对比 pill 后缀，读作组头的附注而不是第二段标题 */
 .completed-group-count {
   flex: none;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
   color: var(--text-faint);
-  font-weight: 400;
-}
-
-.completed-group-count {
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.6;
   font-variant-numeric: tabular-nums;
 }
 
-/* 组体：展开时轻微淡入（不做高度动画，避免布局抖动） */
+/* 组体（二 / 三级）：左侧缩进一档 + 组头下一条极淡分隔线，
+   让「今天 / 七天内 / 更早」与任务都明确从属于上面的清单名 */
 .completed-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin-left: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
   animation: group-open 150ms ease backwards;
+}
+
+/* 时间档：不可折叠，只是说明性小标签 + 该档任务 */
+.completed-bucket {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 时间档标签（二级）：12px、muted、带字距，明显弱于组头、又强于正文 */
+.completed-bucket-label {
+  margin: 0;
+  padding-left: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
 }
 
 @keyframes group-open {
@@ -598,6 +643,32 @@ button:focus-visible {
   background: #f2f3f6;
 }
 
+/* 归档项：从卡片底色退回页面底色（视觉上「沉下去」），文案转弱但保持可读；
+   由「已归档」角标明确标识，不靠低透明度硬压 */
+.task-card.is-archived {
+  background: transparent;
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+.task-card.is-archived:hover {
+  background: var(--surface-muted);
+  box-shadow: none;
+}
+
+.task-card.is-archived .task-title {
+  color: var(--text-muted);
+}
+
+.task-card.is-archived .task-title.done {
+  color: var(--text-faint);
+}
+
+/* 归档项没有完成复选框：补出等宽缩进，保持各行的正文左缘对齐 */
+.task-card.is-archived .task-row {
+  padding-left: 26px;
+}
+
 /* 选中态：强调色描边 + 淡强调底（覆盖完成态的弱化底色） */
 .task-card.is-selected {
   border-color: var(--accent);
@@ -664,6 +735,28 @@ button:focus-visible {
   line-height: 1.5;
   overflow-wrap: anywhere;
   transition: color var(--ease);
+}
+
+/* 标题行：标题 +「已归档」角标（角标不换行、不掉到下一行中间） */
+.task-title-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.task-archived-badge {
+  flex: none;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.55;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
 .task-title.done {
@@ -1527,6 +1620,13 @@ body.is-dragging * {
 
 .context-menu-item.is-checked {
   color: var(--accent-strong);
+}
+
+/* 菜单分区线：只做视觉分隔，上下各留一点呼吸 */
+.context-menu-separator {
+  height: 1px;
+  margin: 5px 6px;
+  background: var(--border);
 }
 
 /* ---------------------------------------------------------- 启动门控 ---- */
@@ -2562,6 +2662,15 @@ body.is-dragging * {
     padding: 16px 16px 12px;
   }
 
+  /* 单列下横向更紧：组头字号收一档、组体缩进减半，层级差仍然成立 */
+  .completed-group-head {
+    font-size: 1rem;
+  }
+
+  .completed-group-body {
+    margin-left: 12px;
+  }
+
   /* 单列：清单条 → 任务列表（填满剩余）；清单条样式与宽屏一致 */
   .layout {
     grid-template-columns: minmax(0, 1fr);
@@ -2641,6 +2750,58 @@ body.is-dragging * {
     color: var(--text);
     background: var(--surface-muted);
   }
+}
+
+/* -------------------------------------------------------------- 撤销提示 ---- */
+
+/* 归档后的单槽位撤销条：贴底居中，不遮挡内容滚动区（超时自隐 / 新归档替换） */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  z-index: var(--z-menu);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 10px 9px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(16, 24, 40, 0.16);
+  font-size: 0.85rem;
+  color: var(--text);
+  transform: translateX(-50%);
+  animation: toast-in 140ms ease backwards;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+.toast-text {
+  white-space: nowrap;
+}
+
+.toast-action {
+  flex: none;
+  padding: 3px 9px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+}
+
+.toast-action:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 
 /* -------------------------------------------------------------- 无障碍 ---- */

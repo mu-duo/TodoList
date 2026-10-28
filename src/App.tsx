@@ -60,9 +60,11 @@ import {
 } from "./appBar";
 import {
   activeCollapsedFiles,
+  bucketCompletedGroups,
   buildCompletedGroups,
   nextCollapsed,
   sameCollapsed,
+  totalVisibleCompleted,
 } from "./completedGroups";
 import {
   DEFAULT_DETAIL_COLLAPSED,
@@ -88,6 +90,11 @@ type Task = {
   due: string | null;
   tags: string[] | null;
   reminder?: false | null;
+  /**
+   * 归档时间（本地时间字符串，`FR-APP-36`）；字段存在即已归档，删除该键即取消归档。
+   * 只对 `status: "done"` 有意义；旧数据缺失 → 未归档。
+   */
+  archived?: string | null;
   notes: string | null;
   subtasks: Subtask[] | null;
   /**
@@ -209,6 +216,23 @@ function App() {
   // 串行写盘链：保证「始终保存最新完整集合」，避免并发乱序覆盖
   const completedSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
+  // 「已完成」视图是否渲染已归档任务（本机偏好；默认关）
+  const [completedShowArchived, setCompletedShowArchived] = useState(false);
+  const [completedShowArchivedError, setCompletedShowArchivedError] = useState<
+    string | null
+  >(null);
+  // 当前期望值 / 最近一次成功落盘值 / 串行写盘链（与折叠集合同款）
+  const completedShowArchivedRef = useRef(false);
+  const completedShowArchivedSavedRef = useRef(false);
+  const showArchivedSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+
+  // 归档撤销提示：单槽位，新的归档覆盖旧的；5 秒后自隐
+  const [archiveToast, setArchiveToast] = useState<{
+    listFile: string;
+    taskIds: string[];
+  } | null>(null);
+  const archiveToastTimerRef = useRef<number | null>(null);
+
   // 任务详情子板块折叠集合（key 见 detailSections；空数组 = 全部展开，合法）
   const [detailCollapsed, setDetailCollapsed] = useState<string[]>([]);
   const [detailCollapsedError, setDetailCollapsedError] = useState<
@@ -262,6 +286,12 @@ function App() {
   const [menu, setMenu] = useState<{ file: string; x: number; y: number } | null>(
     null,
   );
+  // 「已完成」来源清单组头的右键菜单位置（与侧栏清单菜单相互独立）
+  const [completedGroupMenu, setCompletedGroupMenu] = useState<{
+    listFile: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   // 任务详情面板的编辑草稿
   const [editTitle, setEditTitle] = useState("");
@@ -369,6 +399,21 @@ function App() {
   const completedGroups = useMemo(
     () => buildCompletedGroups(lists, completedTasks),
     [lists, completedTasks],
+  );
+
+  // 组内再按完成时间分「今天 / 七天内 / 更早」；归档项按开关决定是否参与。
+  // 时间基准只在进入视图 / 数据变化时重算（不加午夜定时器）。
+  const completedBucketedGroups = useMemo(
+    () => bucketCompletedGroups(completedGroups, completedShowArchived, new Date()),
+    // 进入已完成视图时重算一次，跨天后档位不会停在旧值
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [completedGroups, completedShowArchived, isCompletedView],
+  );
+
+  // 侧栏与组头共用同一口径：只统计当前渲染的可见项
+  const completedVisibleCount = useMemo(
+    () => totalVisibleCompleted(completedBucketedGroups),
+    [completedBucketedGroups],
   );
 
   // 当前生效的折叠集合（过滤重命名 / 删除后的失效键，静默忽略）
@@ -974,6 +1019,7 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
     setMenu(null);
+    setCompletedGroupMenu(null);
     setTaskMenu({
       listFile: entry.listFile,
       taskId: entry.task.id,
@@ -994,6 +1040,7 @@ function App() {
       latestResultDir: live?.resultDir ?? null,
     });
     const isDone = task.status === "done";
+    const isArchived = typeof task.archived === "string";
     // 「移动到清单」目标：除任务所在清单外的全部真实清单（侧栏顺序）；无目标则整项不显示
     const moveTargets = moveTargetLists(lists, listFile);
     const moveItem: MenuItem[] = moveTargets.length
@@ -1009,7 +1056,47 @@ function App() {
           },
         ]
       : [];
+
+    // 分隔线项（仅视觉分区，不参与聚焦 / 悬停 / 选择）
+    const sep = (key: string): MenuItem => ({ key, separator: true });
+
+    // 已归档：只剩「打开详情 / 取消归档 / 删除」，不可完成、不可移动、无 Agent
+    if (isArchived) {
+      return [
+        {
+          key: "open",
+          label: "打开详情",
+          onSelect: () => openTask(task.id),
+        },
+        sep("sep-open"),
+        {
+          key: "unarchive",
+          label: "取消归档",
+          onSelect: () => void unarchiveTasks(listFile, [task.id]),
+        },
+        sep("sep-archive"),
+        {
+          key: "delete",
+          label: "删除",
+          danger: true,
+          onSelect: () => removeTask(listFile, task),
+        },
+      ];
+    }
+
+    // 「归档」只对已完成任务出现；未归档才可归档
+    const archiveItem: MenuItem[] = isDone
+      ? [
+          {
+            key: "archive",
+            label: "归档",
+            onSelect: () => void archiveTasks(listFile, [task.id]),
+          },
+        ]
+      : [];
+
     return [
+      // 一区：查看 / 编辑
       {
         key: "open",
         label: "打开详情",
@@ -1020,12 +1107,17 @@ function App() {
         label: "编辑",
         onSelect: () => startEditTask(entry),
       },
+      sep("sep-view"),
+      // 二区：状态流转（完成 / 移动 / 归档）
       {
         key: "toggle-done",
         label: isDone ? "取消完成" : "完成",
         onSelect: () => toggle(listFile, task, !isDone),
       },
       ...moveItem,
+      ...archiveItem,
+      sep("sep-state"),
+      // 三区：Agent
       {
         key: "agent",
         label: "Agent",
@@ -1070,6 +1162,8 @@ function App() {
           },
         ],
       },
+      sep("sep-agent"),
+      // 四区：删除（独立成区，恒在最后）
       {
         key: "delete",
         label: "删除",
@@ -1087,6 +1181,7 @@ function App() {
         theme: pref,
         appBarOrder: order,
         completedCollapsed: collapsed,
+        completedShowArchived: showArchivedPref,
         detailCollapsed: detailCollapsedPref,
         minimizeToTray: trayPref,
       } = await loadSettings();
@@ -1099,6 +1194,9 @@ function App() {
       completedCollapsedRef.current = initialCollapsed;
       completedCollapsedSavedRef.current = initialCollapsed;
       setCompletedCollapsed(initialCollapsed);
+      completedShowArchivedRef.current = showArchivedPref;
+      completedShowArchivedSavedRef.current = showArchivedPref;
+      setCompletedShowArchived(showArchivedPref);
       // 详情子板块：null = 默认（仅「任务属性」收起）；空数组 = 全部展开
       const initialDetail = detailCollapsedPref ?? [...DEFAULT_DETAIL_COLLAPSED];
       detailCollapsedRef.current = initialDetail;
@@ -1634,6 +1732,90 @@ function App() {
     persistCompletedCollapsed(next);
   }
 
+  // 切换「显示归档」：立即生效，随后落盘；失败且期间无新改动则回滚到最后成功值
+  function changeCompletedShowArchived(next: boolean) {
+    completedShowArchivedRef.current = next;
+    setCompletedShowArchived(next);
+    setCompletedShowArchivedError(null);
+    showArchivedSaveChainRef.current = showArchivedSaveChainRef.current.then(
+      async () => {
+        try {
+          await invoke("save_completed_show_archived", { show: next });
+          completedShowArchivedSavedRef.current = next;
+        } catch (e) {
+          setCompletedShowArchivedError(String(e));
+          if (completedShowArchivedRef.current === next) {
+            const saved = completedShowArchivedSavedRef.current;
+            completedShowArchivedRef.current = saved;
+            setCompletedShowArchived(saved);
+          }
+        }
+      },
+    );
+  }
+
+  // ---- 归档 / 取消归档（FR-APP-36）----
+
+  // 归档后 5 秒内可撤销；单槽位：新的归档直接覆盖旧的提示
+  function showArchiveToast(listFile: string, taskIds: string[]) {
+    if (archiveToastTimerRef.current !== null) {
+      window.clearTimeout(archiveToastTimerRef.current);
+    }
+    setArchiveToast({ listFile, taskIds });
+    archiveToastTimerRef.current = window.setTimeout(() => {
+      archiveToastTimerRef.current = null;
+      setArchiveToast(null);
+    }, 5000);
+  }
+
+  function dismissArchiveToast() {
+    if (archiveToastTimerRef.current !== null) {
+      window.clearTimeout(archiveToastTimerRef.current);
+      archiveToastTimerRef.current = null;
+    }
+    setArchiveToast(null);
+  }
+
+  // 归档：成功后按既有路径重读清单，再给一次撤销机会
+  async function archiveTasks(listFile: string, taskIds: string[]) {
+    if (taskIds.length === 0) return;
+    setActionError(null);
+    try {
+      await invoke("archive_tasks", { listFile, taskIds });
+      await refresh();
+      showArchiveToast(listFile, taskIds);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function unarchiveTasks(listFile: string, taskIds: string[]) {
+    if (taskIds.length === 0) return;
+    setActionError(null);
+    try {
+      await invoke("unarchive_tasks", { listFile, taskIds });
+      await refresh();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  // 撤销上一次列表级 / 单条归档
+  async function undoArchive() {
+    const toast = archiveToast;
+    dismissArchiveToast();
+    if (!toast) return;
+    await unarchiveTasks(toast.listFile, toast.taskIds);
+  }
+
+  // 清理撤销提示的计时器
+  useEffect(() => () => {
+    if (archiveToastTimerRef.current !== null) {
+      window.clearTimeout(archiveToastTimerRef.current);
+      archiveToastTimerRef.current = null;
+    }
+  }, []);
+
   // ---- 任务详情子板块折叠接线 ----
 
   // 应用折叠集合并同步 state 与 ref
@@ -2132,7 +2314,20 @@ function App() {
   function openListMenu(event: MouseEvent, list: TaskList) {
     event.preventDefault();
     event.stopPropagation();
+    setCompletedGroupMenu(null);
     setMenu({ file: list.file, x: event.clientX, y: event.clientY });
+  }
+
+  // 「已完成」组头右键：批量归档入口（左键行为不变，仍是折叠 / 展开）
+  function openCompletedGroupMenu(event: MouseEvent, listFile: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setMenu(null);
+    setCompletedGroupMenu({
+      listFile,
+      x: event.clientX,
+      y: event.clientY,
+    });
   }
 
   function startRenameList(list: TaskList) {
@@ -2311,6 +2506,7 @@ function App() {
     const doneCount = subs.filter((s) => s.status === "done").length;
     const agentKey = taskKey(entry.listFile, task.id);
     const agentLive = agentStates.get(agentKey);
+    const isArchived = typeof task.archived === "string";
     const badgeState = rowBadgeState(
       !!task.agent?.enabled,
       agentLive?.state,
@@ -2318,16 +2514,19 @@ function App() {
     );
     return (
       <div className="task-row">
-        <input
-          type="checkbox"
-          className="task-check"
-          checked={isDone}
-          disabled={!task.id}
-          aria-label={task.title || "任务"}
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
-          onChange={(e) => toggle(entry.listFile, task, e.currentTarget.checked)}
-        />
+        {/* 归档项不可取消完成：不渲染完成复选框 */}
+        {!isArchived && (
+          <input
+            type="checkbox"
+            className="task-check"
+            checked={isDone}
+            disabled={!task.id}
+            aria-label={task.title || "任务"}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onChange={(e) => toggle(entry.listFile, task, e.currentTarget.checked)}
+          />
+        )}
         {editingTaskId === task.id ? (
           <input
             ref={taskEditRef}
@@ -2364,8 +2563,13 @@ function App() {
             disabled={!task.id}
             title="查看详情"
           >
-            <span className={`task-title${isDone ? " done" : ""}`}>
-              {task.title || "(无标题)"}
+            <span className="task-title-line">
+              <span className={`task-title${isDone ? " done" : ""}`}>
+                {task.title || "(无标题)"}
+              </span>
+              {isArchived && (
+                <span className="task-archived-badge">已归档</span>
+              )}
             </span>
             {(task.priority || task.due || showSource) && (
               <span className="task-meta-row">
@@ -2453,8 +2657,10 @@ function App() {
     const { task } = entry;
     const isDone = leaving.get(task.id) ?? task.status === "done";
     return `task-card${isDone ? " is-done" : ""}${
-      task.id === selectedTaskId ? " is-selected" : ""
-    }${leaving.has(task.id) ? " is-leaving" : ""}`;
+      typeof task.archived === "string" ? " is-archived" : ""
+    }${task.id === selectedTaskId ? " is-selected" : ""}${
+      leaving.has(task.id) ? " is-leaving" : ""
+    }`;
   }
 
   function renderOverlayTask(id: string) {
@@ -2832,11 +3038,40 @@ function App() {
           label: "重命名",
           onSelect: () => startRenameList(menuList),
         },
+        { key: "sep-rename", separator: true },
         {
           key: "delete",
           label: "删除",
           danger: true,
           onSelect: () => removeList(menuList),
+        },
+      ]
+    : [];
+
+  // 「已完成」视图：来源清单组头的右键菜单（唯一项＝批量归档该清单的已完成任务）
+  const completedGroupMenuTarget = completedGroupMenu
+    ? completedBucketedGroups.find(
+        (g) => g.listFile === completedGroupMenu.listFile,
+      ) ?? null
+    : null;
+  // 取该组内「已完成且未归档」的任务 id（组内只有可见项，归档项须再过滤）
+  const completedGroupArchivableIds = completedGroupMenuTarget
+    ? completedGroupMenuTarget.buckets
+        .flatMap((bucket) => bucket.tasks)
+        .filter((entry) => typeof entry.task.archived !== "string")
+        .map((entry) => entry.task.id)
+    : [];
+  const completedGroupMenuItems: MenuItem[] = completedGroupMenuTarget
+    ? [
+        {
+          key: "archive-group-done",
+          label: "归档该清单的已完成任务",
+          disabled: completedGroupArchivableIds.length === 0,
+          onSelect: () =>
+            void archiveTasks(
+              completedGroupMenuTarget.listFile,
+              completedGroupArchivableIds,
+            ),
         },
       ]
     : [];
@@ -2873,7 +3108,7 @@ function App() {
           </span>
           已完成
         </span>
-        <span className="list-nav-count">{completedTasks.length}</span>
+        <span className="list-nav-count">{completedVisibleCount}</span>
       </button>
     </li>
   );
@@ -2946,6 +3181,12 @@ function App() {
         {completedCollapsedError && (
           <p className="error">
             已完成分组折叠保存失败：{completedCollapsedError}
+          </p>
+        )}
+
+        {completedShowArchivedError && (
+          <p className="error">
+            显示归档偏好保存失败：{completedShowArchivedError}
           </p>
         )}
 
@@ -3022,27 +3263,50 @@ function App() {
                 <>
                   <div className="pane-head">
                     <h2>已完成</h2>
-                    <span className="pane-count">{completedTasks.length} 项</span>
+                    <div className="pane-head-actions">
+                      <label className="reminder-toggle">
+                        <input
+                          type="checkbox"
+                          checked={completedShowArchived}
+                          onChange={(e) =>
+                            changeCompletedShowArchived(e.currentTarget.checked)
+                          }
+                        />
+                        <span>显示归档</span>
+                      </label>
+                      <span className="pane-count">
+                        {completedVisibleCount} 项
+                      </span>
+                    </div>
                   </div>
                   <div className="task-scroll">
-                    {completedGroups.length === 0 ? (
+                    {completedBucketedGroups.length === 0 ? (
                       <p className="hint">暂无已完成任务。</p>
                     ) : (
                       <div className="completed-groups">
-                        {completedGroups.map((group) => {
-                          const collapsed = collapsedCompletedSet.has(group.file);
-                          const groupIds = group.tasks.map((e) => e.task.id);
+                        {completedBucketedGroups.map((group) => {
+                          const collapsed = collapsedCompletedSet.has(
+                            group.listFile,
+                          );
                           return (
-                            <section className="completed-group" key={group.file}>
+                            <section
+                              className="completed-group"
+                              key={group.listFile}
+                            >
                               <button
                                 type="button"
                                 className="completed-group-head"
                                 aria-expanded={!collapsed}
-                                onClick={() => toggleCompletedGroup(group.file)}
+                                onClick={() =>
+                                  toggleCompletedGroup(group.listFile)
+                                }
+                                onContextMenu={(e) =>
+                                  openCompletedGroupMenu(e, group.listFile)
+                                }
                                 title={
                                   collapsed
-                                    ? `展开「${group.name}」`
-                                    : `折叠「${group.name}」`
+                                    ? `展开「${group.listName}」`
+                                    : `折叠「${group.listName}」`
                                 }
                               >
                                 <span
@@ -3061,39 +3325,45 @@ function App() {
                                   </svg>
                                 </span>
                                 <span className="completed-group-name">
-                                  {group.name}
-                                </span>
-                                <span
-                                  className="completed-group-sep"
-                                  aria-hidden="true"
-                                >
-                                  ·
+                                  {group.listName}
                                 </span>
                                 <span className="completed-group-count">
-                                  {group.tasks.length}
+                                  {group.count}
                                 </span>
                               </button>
                               {!collapsed && (
                                 <div className="completed-group-body">
-                                  <SortableList
-                                    sortable={false}
-                                    className="task-list"
-                                    ids={groupIds}
-                                    rowClassName={(id) =>
-                                      taskRowClass(entryById.get(id)!)
-                                    }
-                                    renderItem={(id) =>
-                                      renderTaskCard(
-                                        entryById.get(id)!,
-                                        undefined,
-                                        true,
-                                      )
-                                    }
-                                    onItemContextMenu={(id, event) => {
-                                      const entry = entryById.get(id);
-                                      if (entry) openTaskMenu(event, entry);
-                                    }}
-                                  />
+                                  {group.buckets.map((bucket) => (
+                                    <section
+                                      className="completed-bucket"
+                                      key={bucket.bucket}
+                                    >
+                                      <h3 className="completed-bucket-label">
+                                        {bucket.label}
+                                      </h3>
+                                      <SortableList
+                                        sortable={false}
+                                        className="task-list"
+                                        ids={bucket.tasks.map(
+                                          (e) => e.task.id,
+                                        )}
+                                        rowClassName={(id) =>
+                                          taskRowClass(entryById.get(id)!)
+                                        }
+                                        renderItem={(id) =>
+                                          renderTaskCard(
+                                            entryById.get(id)!,
+                                            undefined,
+                                            true,
+                                          )
+                                        }
+                                        onItemContextMenu={(id, event) => {
+                                          const entry = entryById.get(id);
+                                          if (entry) openTaskMenu(event, entry);
+                                        }}
+                                      />
+                                    </section>
+                                  ))}
                                 </div>
                               )}
                             </section>
@@ -3224,6 +3494,15 @@ function App() {
         />
       )}
 
+      {completedGroupMenu && completedGroupMenuTarget && (
+        <ContextMenu
+          x={completedGroupMenu.x}
+          y={completedGroupMenu.y}
+          items={completedGroupMenuItems}
+          onClose={() => setCompletedGroupMenu(null)}
+        />
+      )}
+
       {taskMenu && taskMenuEntry && (
         <ContextMenu
           x={taskMenu.x}
@@ -3277,6 +3556,21 @@ function App() {
           onConfirm={() => void invoke("exit_app")}
           onCancel={() => setExitNoteCount(null)}
         />
+      )}
+
+      {archiveToast && (
+        <div className="toast" role="status" aria-live="polite">
+          <span className="toast-text">
+            已归档 {archiveToast.taskIds.length} 项
+          </span>
+          <button
+            type="button"
+            className="toast-action"
+            onClick={() => void undoArchive()}
+          >
+            撤销
+          </button>
+        </div>
       )}
     </main>
   );
