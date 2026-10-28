@@ -37,7 +37,7 @@
 
 - **凭据保护**：密钥经 Windows **DPAPI** 加密、独立本机文件；仅内存解密；**绝不回 JS / 日志 / 错误串**（presence 仅返回布尔）。
 - **无执行能力**：只读沙箱——工具面仅「只读文件」+「服务端 search」，**无 exec / shell / spawn**；修改源文件在能力上不存在。
-- **只读授权边界**：open-first（从句柄读、最终路径比对授权根；**不 canonicalize 后再 open**）以收敛 TOCTOU；拒绝 UNC / 设备路径 / 相对路径 / ADS / 结尾点空格 / 保留设备名；默认阻止敏感文件与 `.git` / `.ssh` / 密钥等；防链接（reparse / junction / symlink）越界。
+- **只读授权边界**：open-first（从句柄读、最终路径比对授权根；**不 canonicalize 后再 open**）以收敛 TOCTOU；接受盘符路径与 **UNC 路径**（`\\server\share\...`，含 WSL 的 `\\wsl.localhost\` / `\\wsl$\`），拒绝**设备命名空间**（`\\?\` / `\\.\`）、`//` 写法、**共享根 / 盘符根**作为授权根、相对路径（含 `/home`、`/mnt/c` 这类 WSL 内部路径）、ADS、结尾点空格、保留设备名；默认阻止敏感文件与 `.git` / `.ssh` / 密钥等；防链接（reparse / junction / symlink）越界。批量添加材料为**全有或全无**，失败时报错**点名**具体路径。
 - **输出目录安全**：结果路径全部由 Rust 拼装（校验 `result_root` + ULID + 时间戳），结果与源目录分离写；防 reparse / junction 替换；`open_result_dir` 只取 `runId`、拒绝任意路径参数。
 - **读取限额**：单次文本 ≤256KiB、单次运行累计 ≤5MiB（分页、不可绕，ADR-0007）。
 - **网络边界**：仅 Agent 功能、仅用户启用时联网；端点由**内置预设 / 用户自定义端点**提供；**禁跟随重定向**；2xx 无结果块不得判成功；结果视为不可信输入；**搜索按 provider 声明门控**；**keyless 自定义端点无认证头**；模型列表失败一律 `{source:"none"}`。

@@ -108,7 +108,8 @@ pub fn set_task_intent_in(
         }
         // 存前对每个路径套源根语义护栏（与结果根同等强度）；P2 runner 启动处理已存根时
         // 应对每个 `agent.paths` 再调用同一 `sandbox::guard_source_root`（外部 YAML 可绕过命令）。
-        sandbox::guard_source_root(p)?;
+        // 全有或全无：任一路径不合格则整批不写；错误点名该路径便于用户定位。
+        sandbox::guard_source_root(p).map_err(|e| format!("路径「{p}」不可用：{e}"))?;
     }
     let links = validate_links(links)?;
 
@@ -326,8 +327,15 @@ mod tests {
             "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
         );
 
-        // P1-4：盘符根 / 设备路径 / UNC / 含 .. 的形状一律拒绝
-        for p in ["C:\\", "\\\\?\\C:\\a", "\\\\server\\share", "C:\\a\\..\\b"] {
+        // P1-4：盘符根 / 设备路径 / UNC 共享根 / 含 .. 的形状一律拒绝
+        for p in [
+            "C:\\",
+            "\\\\?\\C:\\a",
+            "\\\\server\\share",
+            "\\\\wsl.localhost\\Ubuntu",
+            "C:\\a\\..\\b",
+            "//server/share/a",
+        ] {
             assert!(
                 set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()], &[]).is_err(),
                 "危险授权根应被拒：{p}"
@@ -341,6 +349,16 @@ mod tests {
         let value = read(base, "L.yaml");
         let t1 = &value.get("tasks").and_then(Value::as_sequence).unwrap()[0];
         assert!(t1.get("agent").is_none(), "拒绝后不应写入 agent");
+
+        // UNC 子路径是合法授权根（共享根之外的任意层级）
+        for p in [
+            "\\\\server\\share\\proj",
+            "\\\\wsl.localhost\\Ubuntu\\home\\me",
+            "\\\\wsl$\\Ubuntu\\home\\me\\notes.md",
+        ] {
+            set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()], &[])
+                .unwrap_or_else(|e| panic!("UNC 子路径应可授权：{p} / {e}"));
+        }
     }
 
     #[test]
@@ -396,5 +414,157 @@ mod tests {
             .is_empty());
         // agent 非对象 → None
         assert!(load("schema: 1\ntasks:\n  - id: T1\n    agent: scalar\n").is_none());
+    }
+
+    // ---- WSL UNC 路径：接受 / 全有或全无 ----
+
+    fn agent_paths(base: &Path, file: &str) -> Vec<String> {
+        let value = read(base, file);
+        value
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .and_then(|s| s.first())
+            .and_then(|t| t.get("agent"))
+            .and_then(Value::as_mapping)
+            .and_then(|a| a.get("paths"))
+            .and_then(Value::as_sequence)
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn wsl_unc_path_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        let wsl = "\\\\wsl.localhost\\Ubuntu\\home\\me\\notes.md".to_string();
+        set_task_intent_in(base, "L.yaml", "T1", false, std::slice::from_ref(&wsl), &[])
+            .expect("WSL UNC 路径应被接受（用户从资源管理器选中）");
+
+        assert_eq!(
+            agent_paths(base, "L.yaml"),
+            vec![wsl],
+            "agent.paths 应包含所选 WSL 路径（原样写入）"
+        );
+    }
+
+    #[test]
+    fn wsl_dollar_unc_path_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        let wsl = "\\\\wsl$\\Ubuntu\\home\\me\\notes.md".to_string();
+        set_task_intent_in(base, "L.yaml", "T1", false, std::slice::from_ref(&wsl), &[])
+            .expect("wsl$ UNC 路径应被接受（用户从资源管理器选中）");
+
+        assert_eq!(
+            agent_paths(base, "L.yaml"),
+            vec![wsl],
+            "agent.paths 应包含所选 wsl$ 路径"
+        );
+    }
+
+    #[test]
+    fn unc_paths_written_verbatim_including_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        // 目录、文件、网络共享 → 一律原样写入，不做规范化
+        let paths = vec![
+            "\\\\server\\share\\proj".to_string(),
+            "\\\\server\\share\\proj\\a b.txt".to_string(),
+            "\\\\wsl.localhost\\Ubuntu\\home\\me".to_string(),
+            "D:\\docs\\a.txt".to_string(),
+        ];
+        set_task_intent_in(base, "L.yaml", "T1", true, &paths, &[]).unwrap();
+        assert_eq!(agent_paths(base, "L.yaml"), paths);
+    }
+
+    #[test]
+    fn one_bad_path_rejects_whole_batch_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        let good = "C:\\Users\\me\\ok.txt".to_string();
+        let bad = "C:\\Users\\me\\dir.\\b.txt".to_string();
+        let err = set_task_intent_in(
+            base,
+            "L.yaml",
+            "T1",
+            true,
+            &[good.clone(), bad.clone()],
+            &[],
+        )
+        .expect_err("含一条不合格路径时整批应被拒");
+
+        assert!(
+            err.contains(&bad),
+            "错误必须点名 offending 路径，实际：{err}"
+        );
+        assert!(
+            !err.contains(&good),
+            "不应把好路径也算作问题：{err}"
+        );
+        assert!(agent_paths(base, "L.yaml").is_empty(), "整批不写盘");
+    }
+
+    #[test]
+    fn wsl_internal_path_rejected_with_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        for p in ["/home/me/notes.md", "/mnt/c/Users/me/x.txt"] {
+            let err = set_task_intent_in(base, "L.yaml", "T1", false, &[p.to_string()], &[])
+                .expect_err("WSL 内部路径应被拒");
+            assert!(err.contains(p), "应点名路径：{err}");
+            assert!(err.contains("WSL"), "应提示 WSL 内部路径不可访问：{err}");
+        }
+        assert!(agent_paths(base, "L.yaml").is_empty());
+    }
+
+    #[test]
+    fn sensitive_unc_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 1\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+
+        let p = "\\\\server\\share\\.ssh\\id_rsa";
+        let err = set_task_intent_in(base, "L.yaml", "T1", true, &[p.to_string()], &[])
+            .expect_err("UNC 下的敏感组件同样应被拒");
+        assert!(err.contains(p), "应点名路径：{err}");
     }
 }

@@ -170,6 +170,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // 「关联材料」板块内的添加错误（就地展示，不飘到全局横幅）
+  const [materialsError, setMaterialsError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   // 窗口置顶（pin）
@@ -466,6 +468,7 @@ function App() {
     setSubtaskDraft("");
     setEditingSubtaskId(null);
     setSubtaskEditDraft("");
+    setMaterialsError(null);
     subtaskEditHandledRef.current = true;
   }, [selectedTaskId]);
 
@@ -885,6 +888,7 @@ function App() {
     try {
       const picked = await pickAgentPaths(directories);
       if (!picked || picked.length === 0) return;
+      setMaterialsError(null);
       const next = (entry.task.agent?.paths ?? []).slice();
       for (const p of picked) if (!next.includes(p)) next.push(p);
       await persistTaskIntent(
@@ -894,7 +898,8 @@ function App() {
         entry.task.agent?.links ?? [],
       );
     } catch (e) {
-      setActionError(String(e));
+      // 就地展示：错误与「关联材料」板块同屏，避免用户以为选完文件没反应
+      setMaterialsError(String(e));
     }
   }
 
@@ -2989,6 +2994,7 @@ function App() {
             key={selectedTask.id}
             paths={selectedTask.agent?.paths ?? []}
             links={selectedTask.agent?.links ?? []}
+            addError={materialsError}
             onAddPaths={(directories) =>
               void addTaskPaths(selectedEntry!, directories)
             }

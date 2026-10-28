@@ -17,7 +17,10 @@ pub const DIR_PAGE_LIMIT: usize = 200;
 #[allow(dead_code)] // P2 runner：累计读取预算。
 pub const READ_BUDGET_LIMIT: u64 = 5 * 1024 * 1024;
 
-/// 路径字符串护栏：拒绝 UNC / 设备路径 / 相对路径 / ADS / 结尾点空格 / 保留名 / 敏感项 / `..`。
+/// 路径字符串护栏：拒绝设备路径 / 相对路径 / ADS / 结尾点空格 / 保留名 / 敏感项 / `..`。
+///
+/// UNC 路径（`\\server\share\...`，含 `\\wsl.localhost\` / `\\wsl$\`）形状合法即放行；
+/// 但设备命名空间（`\\?\` / `\\.\`）与 `//server/share` 写法仍拒绝。
 pub fn guard_path_string(path: &str) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("路径不能为空".to_string());
@@ -26,13 +29,39 @@ pub fn guard_path_string(path: &str) -> Result<(), String> {
         return Err("路径不能以空白结尾".to_string());
     }
     let p = path;
-    if p.starts_with("\\\\") || p.starts_with("//") {
-        return Err("拒绝 UNC / 设备路径".to_string());
+    let lower = p.to_ascii_lowercase();
+
+    // 设备命名空间：`\\?\...` / `\\.\...`（分隔符正反斜杠均视为设备前缀）
+    if let Some(rest) = lower.strip_prefix(r"\\") {
+        let mut chars = rest.chars();
+        if matches!(chars.next(), Some('?' | '.'))
+            && matches!(chars.next(), Some('\\' | '/'))
+        {
+            return Err("不支持 \\?\\ 或 \\.\\ 设备路径".to_string());
+        }
+    }
+    // 正斜杠 UNC：不静默归一化，直接要求反斜杠写法
+    if p.starts_with("//") || p.starts_with(r"\\/") {
+        return Err("UNC 路径请使用 \\\\server\\share 写法（不支持 // 开头）".to_string());
+    }
+    // UNC：要求至少 `\\server\share` 两段
+    if let Some(rest) = p.strip_prefix(r"\\") {
+        let mut parts = rest.split(['\\', '/']);
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if server.is_empty() || share.is_empty() {
+            return Err("UNC 路径缺少共享名".to_string());
+        }
+        check_component_name(server)?;
+        check_component_name(share)?;
     }
 
     let parsed = Path::new(p);
     if !parsed.is_absolute() {
-        return Err("路径必须为绝对路径".to_string());
+        return Err(
+            "路径必须为绝对路径（Windows 无法访问 /home、/mnt/c 这类 WSL 内部路径，请从资源管理器的 WSL 位置选择）"
+                .to_string(),
+        );
     }
 
     // ADS：盘符后的额外 `:`（首个 `:` 仅允许出现在索引 1 且后跟分隔符）
@@ -52,16 +81,7 @@ pub fn guard_path_string(path: &str) -> Result<(), String> {
                 return Err("拒绝包含 .. 的路径".to_string());
             }
             std::path::Component::Normal(os) => {
-                let name = os.to_string_lossy();
-                if name.ends_with('.') || name.ends_with(' ') {
-                    return Err(format!("路径组件不能以点或空格结尾：{name}"));
-                }
-                if is_reserved_name(&name) {
-                    return Err(format!("拒绝保留设备名：{name}"));
-                }
-                if is_sensitive_component(&name) {
-                    return Err(format!("拒绝敏感路径：{name}"));
-                }
+                check_component_name(&os.to_string_lossy())?;
             }
             _ => {}
         }
@@ -69,14 +89,28 @@ pub fn guard_path_string(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 源授权根语义护栏：字符串护栏 + 拒绝盘符根。
+/// 单个路径组件（含 UNC 的 server / share 段）的名字护栏。
+fn check_component_name(name: &str) -> Result<(), String> {
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err(format!("路径组件不能以点或空格结尾：{name}"));
+    }
+    if is_reserved_name(name) {
+        return Err(format!("拒绝保留设备名：{name}"));
+    }
+    if is_sensitive_component(name) {
+        return Err(format!("拒绝敏感路径：{name}"));
+    }
+    Ok(())
+}
+
+/// 源授权根语义护栏：字符串护栏 + 拒绝盘符根 / UNC 共享根。
 ///
 /// 供 `intent` 存储前校验使用；**P2 runner 在启动处理每个已存根时应再次调用本函数**
 /// （外部 YAML 可绕过命令直接写 `agent.enabled: true` + 危险根）。
 pub fn guard_source_root(path: &str) -> Result<(), String> {
     guard_path_string(path)?;
     if Path::new(path).parent().is_none() {
-        return Err("不能使用盘符根目录作为授权根".to_string());
+        return Err("不能使用整个共享 / 盘符根目录作为授权根".to_string());
     }
     Ok(())
 }
@@ -191,12 +225,13 @@ pub fn open_readonly_final_path(_path: &Path) -> Result<PathBuf, String> {
     Err("句柄级路径校验仅支持 Windows".to_string())
 }
 
-/// 去掉 `\\?\` / `\\?\UNC\` 前缀，还原常规路径。
+/// 去掉 `\\?\` / `\\?\UNC\` 前缀，还原常规路径（前缀比较忽略大小写）。
 fn normalize_final_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        PathBuf::from(format!(r"\\{}", &raw[8..]))
+    } else if lower.starts_with(r"\\?\") {
+        PathBuf::from(&raw[4..])
     } else {
         PathBuf::from(raw)
     }
@@ -499,7 +534,7 @@ pub fn validate_result_root_in(app_config_base: &Path, path: &str) -> Result<(),
     guard_path_string(p)?;
     let dir = Path::new(p);
     if dir.parent().is_none() {
-        return Err("不能使用盘符根目录作为结果目录".to_string());
+        return Err("不能使用整个共享 / 盘符根目录作为结果目录".to_string());
     }
     if is_under_root(dir, app_config_base) {
         return Err("结果目录不能位于应用配置目录内".to_string());
@@ -547,8 +582,12 @@ mod tests {
         let bad = [
             "",
             "relative\\a.txt",
-            "\\\\server\\share\\a",
             "\\\\?\\C:\\a",
+            "\\\\.\\C:\\a",
+            "\\\\?/C:/a",
+            "//server/share/a",
+            "\\\\server",
+            "\\\\wsl.localhost",
             "C:\\a\\b:stream",
             "C:\\dir.",
             "C:\\dir ",
@@ -560,24 +599,80 @@ mod tests {
             "C:\\keys\\server.pem",
             "C:\\keys\\my.key",
             "C:\\creds\\credentials.json",
+            // UNC 下同样生效的护栏
+            "\\\\server\\share\\.ssh\\id_rsa",
+            "\\\\server\\share\\a\\..\\b",
+            "\\\\server\\share\\dir.",
+            "\\\\server\\share\\CON",
+            "\\\\server\\share\\a:b",
+            "\\\\server\\share\\.env.local",
+            "/home/me/notes.md",
+            "/mnt/c/Users/me/x.txt",
         ];
         for p in bad {
             assert!(guard_path_string(p).is_err(), "应拒绝：{p}");
         }
-        let good = ["C:\\docs\\a.txt", "D:\\proj", "C:\\a\\b c.txt"];
+        let good = [
+            "C:\\docs\\a.txt",
+            "D:\\proj",
+            "C:\\a\\b c.txt",
+            "\\\\server\\share\\a",
+            "\\\\server\\share",
+            "\\\\wsl.localhost\\Ubuntu\\home\\me\\notes.md",
+            "\\\\wsl$\\Ubuntu\\home\\me\\notes.md",
+            "\\\\10.0.0.5\\share\\dir\\a.txt",
+        ];
         for p in good {
             assert!(guard_path_string(p).is_ok(), "应允许：{p}");
         }
     }
 
     #[test]
+    fn unc_guard_messages_and_shapes() {
+        assert_eq!(
+            guard_path_string("\\\\?\\C:\\a").unwrap_err(),
+            "不支持 \\?\\ 或 \\.\\ 设备路径"
+        );
+        assert_eq!(
+            guard_path_string("\\\\.\\C:\\a").unwrap_err(),
+            "不支持 \\?\\ 或 \\.\\ 设备路径"
+        );
+        let err = guard_path_string("//server/share/a").unwrap_err();
+        assert!(err.contains("\\\\server\\share"), "应提示反斜杠写法：{err}");
+        assert_eq!(guard_path_string("\\\\server").unwrap_err(), "UNC 路径缺少共享名");
+        assert_eq!(
+            guard_path_string("\\\\wsl.localhost").unwrap_err(),
+            "UNC 路径缺少共享名"
+        );
+        // WSL 内部路径 → 相对路径错误 + 提示
+        let err = guard_path_string("/mnt/c/Users/me/x.txt").unwrap_err();
+        assert!(err.contains("WSL"), "应提示 WSL 内部路径不可访问：{err}");
+        assert!(err.contains("/mnt/c"), "应点名示例路径：{err}");
+    }
+
+    #[test]
     fn source_root_guard_rejects_root_unc_device_and_dotdot() {
         // P1-4：源授权根与结果根同等强度
-        for p in ["C:\\", "D:\\", "\\\\?\\C:\\a", "\\\\server\\share", "C:\\a\\..\\b"] {
+        for p in [
+            "C:\\",
+            "D:\\",
+            "\\\\?\\C:\\a",
+            "\\\\server\\share",
+            "\\\\wsl.localhost\\Ubuntu",
+            "C:\\a\\..\\b",
+        ] {
             assert!(guard_source_root(p).is_err(), "危险授权根应被拒：{p}");
         }
+        assert_eq!(
+            guard_source_root("\\\\server\\share").unwrap_err(),
+            "不能使用整个共享 / 盘符根目录作为授权根"
+        );
         assert!(guard_source_root("C:\\docs\\a.txt").is_ok());
         assert!(guard_source_root("D:\\proj").is_ok());
+        // UNC 子路径（含 WSL）可作为授权根
+        assert!(guard_source_root("\\\\server\\share\\proj").is_ok());
+        assert!(guard_source_root("\\\\wsl.localhost\\Ubuntu\\home\\me").is_ok());
+        assert!(guard_source_root("\\\\wsl$\\Ubuntu\\home\\me\\a.md").is_ok());
     }
 
     #[test]
@@ -603,6 +698,65 @@ mod tests {
         // 兄弟前缀不得误判：root C:\a 不应覆盖 C:\ab\f
         assert!(!is_under_root(Path::new("C:\\ab\\f"), Path::new("C:\\a")));
         assert!(is_under_root(Path::new("C:\\a\\f"), Path::new("C:\\a")));
+    }
+
+    #[test]
+    fn roots_matching_handles_unc_case_insensitively() {
+        let root = PathBuf::from(r"\\server\share\Proj");
+        assert!(is_under_root(
+            Path::new(r"\\SERVER\Share\proj\a.txt"),
+            &root
+        ));
+        // 共享根本身覆盖其子路径；根与子路径同形视为在内
+        assert!(is_under_root(
+            Path::new(r"\\server\share\a.txt"),
+            Path::new(r"\\server\share")
+        ));
+        assert!(is_under_root(
+            Path::new(r"\\server\share"),
+            Path::new(r"\\server\share")
+        ));
+        // 兄弟共享不得误判
+        assert!(!is_under_root(
+            Path::new(r"\\server\other\proj\a.txt"),
+            &root
+        ));
+        assert!(!is_under_root(
+            Path::new(r"\\other-server\share\proj\a.txt"),
+            &root
+        ));
+        // WSL 发行版之间亦然
+        assert!(is_under_root(
+            Path::new(r"\\wsl.localhost\ubuntu\home\me\a.md"),
+            Path::new(r"\\wsl.localhost\Ubuntu")
+        ));
+        assert!(!is_under_root(
+            Path::new(r"\\wsl.localhost\Debian\home\me\a.md"),
+            Path::new(r"\\wsl.localhost\Ubuntu")
+        ));
+    }
+
+    #[test]
+    fn normalize_final_path_unwraps_unc_prefix() {
+        // open_guard 对 UNC 返回 `\\?\UNC\server\share\...`，需还原为常规 UNC
+        let restored = normalize_final_path(r"\\?\UNC\server\share\a.txt");
+        assert_eq!(restored, PathBuf::from(r"\\server\share\a.txt"));
+        // 还原结果必须仍被放行（否则会出现「存得进、读时报 UnsafePath」）
+        guard_path_string(&restored.to_string_lossy()).unwrap();
+        // 大小写变体
+        let restored = normalize_final_path(r"\\?\unc\WSL.LOCALHOST\Ubuntu\home\me\a.md");
+        assert_eq!(
+            restored,
+            PathBuf::from(r"\\WSL.LOCALHOST\Ubuntu\home\me\a.md")
+        );
+        guard_path_string(&restored.to_string_lossy()).unwrap();
+        // 本地卷前缀
+        assert_eq!(normalize_final_path(r"\\?\C:\a\b"), PathBuf::from(r"C:\a\b"));
+        // 普通路径原样返回
+        assert_eq!(
+            normalize_final_path(r"\\server\share\a"),
+            PathBuf::from(r"\\server\share\a")
+        );
     }
 
     #[test]

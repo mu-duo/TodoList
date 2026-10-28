@@ -251,11 +251,12 @@ tasks:
     title: ...
     agent:
       enabled: true                       # 是否启用 Agent（缺省 = false）
-      paths: ["D:\\a.txt", "D:\\proj"]    # 只存原始绝对路径，运行时解析
+      paths: ["D:\\a.txt", "\\\\wsl.localhost\\Ubuntu\\home\\me\\proj"]   # 只存原始绝对路径，运行时解析
       links: ["https://example.com/doc"]  # 人工点击打开；亦为 url_read 授权范围（不参与文件沙箱）
 ```
 
 - 支持文件与目录、存**原路径**；**任意文件 / 目录均可关联**、由 Agent 自主选择读取；**关联 ≠ 授权**（授权为本机行为）。
+- `paths` 写入校验（`agent_set_task_intent` / `set_task_intent_in`）：接受盘符路径与 **UNC 路径**（`\\server\share\...`，含 WSL 的 `\\wsl.localhost\` / `\\wsl$\`）；拒绝设备命名空间（`\\?\` / `\\.\`）、`//` 写法、**共享根 / 盘符根**（如 `\\server\share` 本身）、相对路径（含 `/home`、`/mnt/c` 这类 WSL 内部路径）、ADS、结尾点空格、保留设备名与敏感组件（`.git` / `.ssh` / `.env*` / 密钥）。批量添加为**全有或全无**：任一非法则不写盘，错误信息点名该路径（`路径「{p}」不可用：{原因}`）。
 - `links`（可选，string[]）：任务级「链接」，用于人工点击打开（`agent_open_external`），同时作为只读抓取工具 `url_read` 的**授权范围**（仅能抓取列表内链接；`file://` 仍受 `agent.paths` 沙箱约束）；旧数据无该键 → 空数组。
 - `links` 写入校验（`agent_set_task_intent` / `set_task_intent_in`，与 `paths` 非法同样**报错且不写盘**）：每条 trim 后须以 `http://` / `https://` / `file://` 之一开头（大小写不敏感）；不允许空白 / 控制字符；长度 ≤ 2048 字符；去重保序（保留首次）。读取宽容：非字符串条目丢弃，历史脏数据不影响加载。
 - 未知字段宽容：沿用 §3，app 写回保留未知字段（`agent` 之外不动）。
@@ -383,3 +384,4 @@ agent:
 - 2026-10-22 任务 Agent 新增「链接」`agent.links` 与命令 `agent_open_external`：`agent: { enabled, paths, links }` 中 `links` 仅用于人工点击打开、**不参与沙箱 / 不传给模型**；写入校验（trim、`http://`/`https://`/`file://` 前缀大小写不敏感、禁空白 / 控制字符、≤2048 字符、去重保序，非法报中文错误且不写盘），读取宽容（非字符串丢弃，旧数据 → 空数组）；`TaskView.agent` 带出 `links`。`agent_open_external({ target })` 分派：URL → 浏览器，目录 → 打开，文件 → 资源管理器中定位并选中，其它 scheme / 不存在 → 中文错误。§5.2 `detail.collapsed` 合法 key 集合补 `materials`。**`agent.paths` 语义与沙箱校验不变。**
 - 2026-10-22 新增 Agent 只读网页抓取工具 `url_read`（§6.6）：参数 `{ url, offset? }`；仅能抓取任务 `agent.links` 中 trim 后完全相等的链接（未授权不请求），`file://` 转本地路径并复用 `agent.paths` 白名单；单页 ≤256KiB 并计入 `stats.bytes_read`，超时 20s（且不超过运行剩余时限），重定向手动跟随 ≤3 跳；每跳重新校验 scheme 与解析 IP（SSRF 拒绝回环 / 内网 / 链路本地 / 组播 / 文档保留段，IPv4-mapped 按映射后处理）；仅接受文本类响应，HTML→纯文本（去 script/style/标签、实体解码、压缩空白）。运行启动时再次校验已存 links（非法 → `failed(UnsafePath)`）。`RunRecord.snapshot.links` 与 `RunRecord.web_reads`（去重保序，旧记录缺省为空数组）落盘；初始 prompt 增加「可用材料」本地路径 / 链接清单。**`agent.paths` 沙箱与 `native_search` 行为不变。**
 - 2026-10-28 规划 FR-APP-36「已完成归档与时间分层」：任务字段新增可选 `archived`（本地时间，删除即取消归档；不移动 / 不改 `status` / 不改数组顺序）；新增命令 `archive_tasks` / `unarchive_tasks`（按 `listFile` + `taskIds` 一次重读一次原子写，跳过不存在与非 done 项，不覆盖已有 `archived`）；新增 §5.4 `completed.show_archived`（`load_settings.completed_show_archived: bool`、`save_completed_show_archived({ show })`，`show: false` 删键恢复默认关闭）。**向后兼容、旧数据无需迁移；未改 schema 版本、不新增文件。**
+- 2026-10-28 `agent.paths` 放宽为**接受 UNC**（§6.1）：`\\server\share\...`、`\\wsl.localhost\<发行版>\...`、`\\wsl$\<发行版>\...` 均可作为材料路径、**原样存储**；仍拒绝设备命名空间（`\\?\` / `\\.\`）、`//` 写法、**共享根 / 盘符根**、相对路径（含 `/home`、`/mnt/c` 这类 WSL 内部路径）、ADS、结尾点空格、保留设备名与敏感组件。写前校验与读时 `resolve_allowed`、运行前复查共用同一 `guard_path_string`，避免「存得进去、读时 UnsafePath」。批量添加保持**全有或全无**，错误改为 `路径「{p}」不可用：{原因}` **点名路径**；前端就地显示在材料板。**未改 schema、未改字段名。**

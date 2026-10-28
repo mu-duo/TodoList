@@ -10,6 +10,8 @@ type MaterialsPanelProps = {
   onRemovePath: (path: string) => void;
   onAddLink: (url: string) => void;
   onRemoveLink: (url: string) => void;
+  /** 添加文件 / 目录失败时的后端消息（就地展示，路径原样换行显示）。 */
+  addError?: string | null;
   /** 点击材料行：文件 → 资源管理器定位、目录 → 打开、http(s)/file → 浏览器。 */
   onOpen: (target: string) => void;
 };
@@ -28,6 +30,7 @@ export function MaterialsPanel({
   onAddLink,
   onRemoveLink,
   onOpen,
+  addError,
 }: MaterialsPanelProps) {
   const [linkOpen, setLinkOpen] = useState(false);
   const [draft, setDraft] = useState("");
@@ -130,6 +133,12 @@ export function MaterialsPanel({
           添加链接
         </button>
       </div>
+
+      {addError && (
+        <p className="error" role="alert">
+          添加失败：{addError}
+        </p>
+      )}
 
       {linkOpen && (
         <div className="material-link-field">
