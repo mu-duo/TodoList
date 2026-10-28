@@ -85,9 +85,16 @@ try {
     Write-Host "==> pnpm tauri build" -ForegroundColor Cyan
     Push-Location $repoRoot
     try {
-        & pnpm tauri build
-        if ($LASTEXITCODE -ne 0) {
-            Fail "pnpm tauri build 失败（退出码 $LASTEXITCODE）"
+        # pnpm 会把横幅（如 `$ tauri "build"`）写到 stderr；在 $ErrorActionPreference='Stop'
+        # 下 PowerShell 会把它当成 NativeCommandError 抛出，导致构建明明成功也被判失败。
+        # 因此这里临时放宽，只用退出码判定成败。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & pnpm tauri build 2>&1 | Out-Host
+        $buildExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($buildExit -ne 0) {
+            Fail "pnpm tauri build 失败（退出码 $buildExit）"
         }
     }
     finally {
