@@ -30,6 +30,8 @@ fn task_file_write_guard() -> MutexGuard<'static, ()> {
 
 pub const LISTS_DIR: &str = "lists";
 pub const EXAMPLE_LIST_FILE: &str = "收集箱.yaml";
+/// 删除回收站保留文件名（位于 `lists/` 下；**不是**普通清单）。
+pub const TRASH_FILE: &str = ".trash.yaml";
 
 /// 设置文件名（位于应用配置目录 `%APPDATA%\com.lftan.todolist`）。
 pub const SETTINGS_FILE: &str = "settings.yaml";
@@ -48,6 +50,9 @@ pub struct Settings {
     /// 「已完成」视图折叠的清单文件名集合（本机偏好）；缺失 / 空 / 非法 → `None`（默认全部展开）。
     #[serde(default)]
     pub completed_collapsed: Option<Vec<String>>,
+    /// 「已删除」视图折叠的来源清单文件名集合（本机偏好）；语义同 `completed_collapsed`。
+    #[serde(default)]
+    pub trash_collapsed: Option<Vec<String>>,
     /// 「已完成」视图是否显示归档任务（本机偏好）；缺失 / 非布尔 → `false`（默认关闭）。
     #[serde(default)]
     pub completed_show_archived: bool,
@@ -152,6 +157,33 @@ pub struct TaskMetadataPatch {
     pub reminder: FieldPatch<bool>,
 }
 
+/// 回收站视图（`load_trash`）：两数组均按保留文件内顺序（新条目在前）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashView {
+    pub tasks: Vec<TrashTaskView>,
+    pub lists: Vec<TrashListView>,
+}
+
+/// 回收站中的任务条目（`task` 复用 [`TaskView`] 形状）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashTaskView {
+    pub trash_id: String,
+    pub deleted: String,
+    pub list_file: String,
+    pub list_name: String,
+    pub task: TaskView,
+}
+
+/// 回收站中的清单条目（仅摘要；恢复时从保留文件重建完整清单）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrashListView {
+    pub trash_id: String,
+    pub deleted: String,
+    pub file: String,
+    pub name: String,
+    pub task_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtaskView {
     pub id: String,
@@ -181,7 +213,8 @@ pub fn ensure_data_dir(base: &Path) -> Result<(), String> {
     let mut has_yaml = false;
     if let Ok(entries) = fs::read_dir(&lists) {
         for entry in entries.flatten() {
-            if is_yaml(&entry.path()) {
+            let path = entry.path();
+            if is_yaml(&path) && !is_trash_file_name(&file_name(&path)) {
                 has_yaml = true;
                 break;
             }
@@ -217,7 +250,7 @@ pub(crate) fn strip_bom(text: &str) -> &str {
 /// 文件不存在、读取 / 解析失败、或 `theme` 值非法时均回退默认 `{ theme: "system" }`，
 /// 且**不会**创建文件、不会 panic。`app_bar.order` 缺失 / 空 / 非法时 `app_bar_order` 为
 /// `None`；合法字符串 id 去重（首次保留）并保留未知 id 原顺序，不自动补已知 id。
-/// `completed.collapsed` 同理由 [`parse_completed_collapsed`] 严格解析；`completed.show_archived`
+/// `completed.collapsed` / `trash.collapsed` 同理由 [`parse_section_collapsed`] 严格解析；`completed.show_archived`
 /// 缺失 / 非布尔 → `false`；`detail.collapsed` 由 [`parse_detail_collapsed`] 解析（显式空数组合法）。
 /// 读取前剥离前导 BOM。
 pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
@@ -225,6 +258,7 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
         theme: DEFAULT_THEME.to_string(),
         app_bar_order: None,
         completed_collapsed: None,
+        trash_collapsed: None,
         completed_show_archived: false,
         detail_collapsed: None,
         minimize_to_tray: None,
@@ -249,7 +283,8 @@ pub fn load_settings_from(base: &Path) -> Result<Settings, String> {
     Ok(Settings {
         theme,
         app_bar_order: parse_app_bar_order(&value),
-        completed_collapsed: parse_completed_collapsed(&value),
+        completed_collapsed: parse_section_collapsed(&value, "completed"),
+        trash_collapsed: parse_section_collapsed(&value, "trash"),
         completed_show_archived: parse_completed_show_archived(&value),
         detail_collapsed: parse_detail_collapsed(&value),
         // 缺失 / 非布尔 → None（默认开启）；字面 false → Some(false)（已关闭）。
@@ -278,10 +313,10 @@ fn parse_app_bar_order(value: &Value) -> Option<Vec<String>> {
     }
 }
 
-/// 从设置 Value 解析 `completed.collapsed`：缺失 / 非对象 / 非数组 / 含非字符串或空白元素 /
+/// 从设置 Value 解析 `{section}.collapsed`：缺失 / 非对象 / 非数组 / 含非字符串或空白元素 /
 /// 去重后为空 → `None`；否则按首次出现去重并保留原始顺序。
-fn parse_completed_collapsed(value: &Value) -> Option<Vec<String>> {
-    let seq = value.get("completed")?.get("collapsed")?.as_sequence()?;
+fn parse_section_collapsed(value: &Value, section: &str) -> Option<Vec<String>> {
+    let seq = value.get(section)?.get("collapsed")?.as_sequence()?;
     let mut collapsed: Vec<String> = Vec::with_capacity(seq.len());
     for item in seq {
         let file = item.as_str()?;
@@ -408,20 +443,22 @@ pub fn save_app_bar_order_in(base: &Path, order: Option<&[String]>) -> Result<()
     write_list(&path, &value)
 }
 
-/// 写入 / 清除 `completed.collapsed`（`None` 或空数组 → 删除 `collapsed` 以恢复默认：全部展开）。
+/// 写入 / 清除 `{section}.collapsed`（`None` 或空数组 → 删除 `collapsed` 以恢复默认）。
 ///
-/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `completed.collapsed`** → 原子写，
-/// 保留 `theme`、`app_bar`、`completed` 其它字段及所有未知字段（不做整份 [`Settings`] 覆盖）。
-/// 空白文件名 → 中文错误；已有 `completed` 若非对象 → 中文错误（不覆盖未知标量）。
-pub fn save_completed_collapsed_in(
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `{section}.collapsed`** → 原子写，
+/// 保留其它字段与所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// 空白键 → `blank_error`；已有 `section` 若非对象 → 中文错误（不覆盖未知标量）。
+fn save_section_collapsed_in(
     base: &Path,
+    section: &str,
     collapsed: Option<&[String]>,
+    blank_error: &str,
 ) -> Result<(), String> {
     let files = collapsed.filter(|files| !files.is_empty());
     if let Some(files) = files {
         for file in files {
             if file.trim().is_empty() {
-                return Err("已完成清单折叠键不能为空".to_string());
+                return Err(blank_error.to_string());
             }
         }
     }
@@ -439,37 +476,58 @@ pub fn save_completed_collapsed_in(
     let root = value
         .as_mapping_mut()
         .ok_or_else(|| "设置文件格式无效：期望对象".to_string())?;
+    let malformed = || format!("设置文件中的 {section} 不是对象，无法写入");
 
     match files {
         Some(files) => {
-            let completed = match root.get_mut("completed") {
-                Some(existing) => existing
-                    .as_mapping_mut()
-                    .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?,
+            let target = match root.get_mut(section) {
+                Some(existing) => existing.as_mapping_mut().ok_or_else(malformed)?,
                 None => {
-                    root.insert(key("completed"), Value::Mapping(Mapping::new()));
-                    root.get_mut("completed")
+                    root.insert(key(section), Value::Mapping(Mapping::new()));
+                    root.get_mut(section)
                         .and_then(Value::as_mapping_mut)
-                        .expect("刚插入的 completed 应为对象")
+                        .expect("刚插入的 section 应为对象")
                 }
             };
             let seq = files
                 .iter()
                 .map(|file| Value::String(file.clone()))
                 .collect();
-            completed.insert(key("collapsed"), Value::Sequence(seq));
+            target.insert(key("collapsed"), Value::Sequence(seq));
         }
         None => {
-            if let Some(existing) = root.get_mut("completed") {
-                let completed = existing
-                    .as_mapping_mut()
-                    .ok_or_else(|| "设置文件中的 completed 不是对象，无法写入".to_string())?;
-                completed.remove("collapsed");
+            if let Some(existing) = root.get_mut(section) {
+                let target = existing.as_mapping_mut().ok_or_else(malformed)?;
+                target.remove("collapsed");
             }
         }
     }
 
     write_list(&path, &value)
+}
+
+/// 写入 / 清除 `completed.collapsed`（`None` 或空数组 → 删除 `collapsed` 以恢复默认：全部展开）。
+///
+/// 沿用现有做法：重读最新设置文件 → Value 级补丁**仅改 `completed.collapsed`** → 原子写，
+/// 保留 `theme`、`app_bar`、`completed` 其它字段及所有未知字段（不做整份 [`Settings`] 覆盖）。
+/// 空白文件名 → 中文错误；已有 `completed` 若非对象 → 中文错误（不覆盖未知标量）。
+pub fn save_completed_collapsed_in(
+    base: &Path,
+    collapsed: Option<&[String]>,
+) -> Result<(), String> {
+    save_section_collapsed_in(base, "completed", collapsed, "已完成清单折叠键不能为空")
+}
+
+/// 写入 / 清除 `trash.collapsed`（`None` 或空数组 → 删除 `collapsed` 以恢复默认：全部展开）。
+///
+/// 语义与 [`save_completed_collapsed_in`] 一致：Value 级补丁**仅改 `trash.collapsed`**，
+/// 保留 `theme`、`app_bar`、`completed`、`detail`、`trash` 其它字段及全部未知字段。
+/// 空白文件名 → 中文错误；已有 `trash` 若非对象 → 中文错误（不覆盖未知标量）。
+pub fn save_trash_collapsed_in(
+    base: &Path,
+    collapsed: Option<&[String]>,
+) -> Result<(), String> {
+    save_section_collapsed_in(base, "trash", collapsed, "回收站清单折叠键不能为空")
 }
 
 /// 写入 / 清除 `completed.show_archived`（`false` → 删除该键以恢复默认：不显示归档任务）。
@@ -628,7 +686,7 @@ pub fn load_lists_from(base: &Path) -> Result<LoadResult, String> {
         match entry {
             Ok(entry) => {
                 let path = entry.path();
-                if is_yaml(&path) {
+                if is_yaml(&path) && !is_trash_file_name(&file_name(&path)) {
                     paths.push(path);
                 }
             }
@@ -693,10 +751,16 @@ pub(crate) fn list_path(base: &Path, list_file: &str) -> Result<PathBuf, String>
         || list_file.contains('/')
         || list_file.contains('\\')
         || list_file.contains("..")
+        || is_trash_file_name(list_file)
     {
         return Err(format!("非法的清单文件名：{list_file}"));
     }
     Ok(base.join(LISTS_DIR).join(list_file))
+}
+
+/// 是否为回收站保留文件名（Windows 文件系统大小写不敏感，比较时忽略 ASCII 大小写）。
+fn is_trash_file_name(file: &str) -> bool {
+    file.eq_ignore_ascii_case(TRASH_FILE)
 }
 
 /// 构造 YAML 字符串键。
@@ -1022,11 +1086,195 @@ fn validate_due(value: &str) -> Result<(), String> {
     }
 }
 
-/// 从清单的 `tasks` 数组中移除指定任务。
+/// 回收站保留文件路径：`lists/.trash.yaml`。
+fn trash_path(base: &Path) -> PathBuf {
+    base.join(LISTS_DIR).join(TRASH_FILE)
+}
+
+/// 文件名去掉 `.yaml` / `.yml` 后缀（作为清单显示名的回退）。
+fn file_stem_name(file: &str) -> String {
+    file.trim_end_matches(".yaml").trim_end_matches(".yml").to_string()
+}
+
+/// 清单显示名：`name` 缺失 / 非字符串 → 文件名去扩展名。
+fn list_display_name(value: &Value, file: &str) -> String {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| file_stem_name(file))
+}
+
+/// 读取回收站 Value；文件不存在 → 空回收站（`schema: 1` + 两个空数组）。
+///
+/// 文件存在但损坏 → 中文错误（不影响普通清单加载）。
+fn read_trash_value(path: &Path) -> Result<Value, String> {
+    if !path.is_file() {
+        let mut empty = Mapping::new();
+        empty.insert(key("schema"), Value::Number(1.into()));
+        empty.insert(key("tasks"), Value::Sequence(Vec::new()));
+        empty.insert(key("lists"), Value::Sequence(Vec::new()));
+        return Ok(Value::Mapping(empty));
+    }
+    let text = fs::read_to_string(path).map_err(|e| format!("读取回收站文件失败：{e}"))?;
+    let value: Value = yaml_serde::from_str(strip_bom(&text))
+        .map_err(|e| format!("解析回收站文件失败：{e}"))?;
+    if value.as_mapping().is_none() {
+        return Err("回收站文件格式无效：根节点必须是对象".to_string());
+    }
+    Ok(value)
+}
+
+/// 取得回收站中的 `tasks` / `lists` 数组；缺失或非数组时按空数组重建。
+fn trash_sequence_mut<'a>(root: &'a mut Value, field: &str) -> Result<&'a mut Vec<Value>, String> {
+    let map = root
+        .as_mapping_mut()
+        .ok_or_else(|| "回收站文件格式无效：根节点必须是对象".to_string())?;
+    if !matches!(map.get(field), Some(Value::Sequence(_))) {
+        map.insert(key(field), Value::Sequence(Vec::new()));
+    }
+    map.get_mut(field)
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| format!("回收站文件字段 {field} 不是数组"))
+}
+
+/// 回收站是否没有任何条目（两个数组均缺失 / 空）。
+fn trash_is_empty(value: &Value) -> bool {
+    ["tasks", "lists"].iter().all(|field| {
+        value
+            .get(*field)
+            .and_then(Value::as_sequence)
+            .map(|entries| entries.is_empty())
+            .unwrap_or(true)
+    })
+}
+
+/// 写入回收站；为空时删除保留文件（契约：不留空文件）。
+fn write_trash_value(path: &Path, value: &Value) -> Result<(), String> {
+    if trash_is_empty(value) {
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| format!("删除空回收站文件失败：{e}"))?;
+        }
+        return Ok(());
+    }
+    write_list(path, value)
+}
+
+/// 本地时间 `YYYY-MM-DDTHH:MM:SS`（回收站 `deleted` 用；与 [`now_local`] 的分钟格式互不影响）。
+fn now_local_secs() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+/// 回收站条目是否已过 24 小时保留期（`deleted` 无法解析 → 保留）。
+fn is_entry_expired(entry: &Value, now: chrono::NaiveDateTime) -> bool {
+    let Some(deleted) = entry.get("deleted").and_then(Value::as_str) else {
+        return false;
+    };
+    match chrono::NaiveDateTime::parse_from_str(deleted, "%Y-%m-%dT%H:%M:%S") {
+        Ok(time) => time + chrono::Duration::hours(24) <= now,
+        Err(_) => false,
+    }
+}
+
+/// 移除回收站中过期条目（`tasks` + `lists`），返回移除数量；非 mapping 条目保留。
+fn purge_expired(value: &mut Value, now: chrono::NaiveDateTime) -> usize {
+    let mut removed = 0;
+    let Some(map) = value.as_mapping_mut() else {
+        return 0;
+    };
+    for field in ["tasks", "lists"] {
+        if let Some(entries) = map.get_mut(field).and_then(Value::as_sequence_mut) {
+            let before = entries.len();
+            entries.retain(|entry| !is_entry_expired(entry, now));
+            removed += before - entries.len();
+        }
+    }
+    removed
+}
+
+/// 构造回收站任务条目（`task` 原样保留，含未知字段）。
+fn trash_task_entry(task: &Value, list_file: &str, list_name: &str) -> Value {
+    let mut entry = Mapping::new();
+    entry.insert(key("trash_id"), Value::String(ulid::Ulid::generate().to_string()));
+    entry.insert(key("deleted"), Value::String(now_local_secs()));
+    entry.insert(key("list_file"), Value::String(list_file.to_string()));
+    entry.insert(key("list_name"), Value::String(list_name.to_string()));
+    entry.insert(key("task"), task.clone());
+    Value::Mapping(entry)
+}
+
+/// 构造回收站清单条目（`list` 为整份清单 Value）。
+fn trash_list_entry(list: &Value, file: &str, name: &str) -> Value {
+    let mut entry = Mapping::new();
+    entry.insert(key("trash_id"), Value::String(ulid::Ulid::generate().to_string()));
+    entry.insert(key("deleted"), Value::String(now_local_secs()));
+    entry.insert(key("file"), Value::String(file.to_string()));
+    entry.insert(key("name"), Value::String(name.to_string()));
+    entry.insert(key("list"), list.clone());
+    Value::Mapping(entry)
+}
+
+/// 把回收站 Value 转为前端视图（跳过非 mapping / 缺 `trash_id` / 任务非法条目）。
+fn trash_view(value: &Value) -> TrashView {
+    let tasks = value
+        .get("tasks")
+        .and_then(Value::as_sequence)
+        .map(|entries| entries.iter().filter_map(trash_task_view).collect())
+        .unwrap_or_default();
+    let lists = value
+        .get("lists")
+        .and_then(Value::as_sequence)
+        .map(|entries| entries.iter().filter_map(trash_list_view).collect())
+        .unwrap_or_default();
+    TrashView { tasks, lists }
+}
+
+fn trash_task_view(entry: &Value) -> Option<TrashTaskView> {
+    let map = entry.as_mapping()?;
+    let trash_id = get_str(map, "trash_id")?;
+    let task_value = map.get("task")?;
+    let task = mapping_to_task(task_value)?;
+    let list_file = get_str(map, "list_file").unwrap_or_default();
+    let list_name = get_str(map, "list_name")
+        .unwrap_or_else(|| file_stem_name(&list_file));
+    Some(TrashTaskView {
+        trash_id,
+        deleted: get_str(map, "deleted").unwrap_or_default(),
+        list_file,
+        list_name,
+        task,
+    })
+}
+
+fn trash_list_view(entry: &Value) -> Option<TrashListView> {
+    let map = entry.as_mapping()?;
+    let trash_id = get_str(map, "trash_id")?;
+    let file = get_str(map, "file").unwrap_or_default();
+    let name = get_str(map, "name").unwrap_or_else(|| file_stem_name(&file));
+    let task_count = map
+        .get("list")
+        .and_then(|list| list.get("tasks"))
+        .and_then(Value::as_sequence)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(TrashListView {
+        trash_id,
+        deleted: get_str(map, "deleted").unwrap_or_default(),
+        file,
+        name,
+        task_count,
+    })
+}
+
+/// 把指定任务移入回收站（`lists/.trash.yaml`），再从原清单移除。
+///
+/// 写序：先写回收站，再写原清单；原清单写失败时用删除前的回收站 Value 回滚。
+/// 回滚失败返回明确错误（任务可能同时存在于清单与回收站），绝不静默。
 pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(), String> {
     let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
+    let list_name = list_display_name(&value, list_file);
     let tasks = value
         .get_mut("tasks")
         .and_then(Value::as_sequence_mut)
@@ -1035,8 +1283,230 @@ pub fn delete_task_in(base: &Path, list_file: &str, task_id: &str) -> Result<(),
         .iter()
         .position(|t| t.get("id").and_then(Value::as_str) == Some(task_id))
         .ok_or_else(|| format!("清单「{list_file}」中未找到任务 {task_id}"))?;
-    tasks.remove(index);
-    write_list(&path, &value)
+    let task = tasks.remove(index);
+
+    let trash_path = trash_path(base);
+    let mut trash = read_trash_value(&trash_path)?;
+    let trash_before = trash.clone();
+    trash_sequence_mut(&mut trash, "tasks")?.insert(0, trash_task_entry(&task, list_file, &list_name));
+    write_trash_value(&trash_path, &trash)?;
+
+    if let Err(list_error) = write_list(&path, &value) {
+        return match write_trash_value(&trash_path, &trash_before) {
+            Ok(()) => Err(format!(
+                "删除任务 {task_id} 失败（原清单「{list_file}」写回失败，回收站已回滚，删除未生效）：{list_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "删除任务 {task_id} 失败且状态不一致：原清单「{list_file}」写回失败（{list_error}），\
+                 回滚回收站也失败（{rollback_error}）；任务可能同时存在于清单与回收站，请手动检查"
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// 在回收站指定数组内按 `trash_id` 定位条目下标。
+fn trash_entry_index(value: &Value, field: &str, trash_id: &str) -> Option<usize> {
+    value
+        .get(field)?
+        .as_sequence()?
+        .iter()
+        .position(|entry| entry.get("trash_id").and_then(Value::as_str) == Some(trash_id))
+}
+
+/// 读取回收站（先清理过期条目，有变化则写回；空则删文件）。
+///
+/// 过期判定：`deleted + 24h <= now`；`deleted` 无法解析的条目保留。
+pub fn load_trash_from(base: &Path) -> Result<TrashView, String> {
+    let _guard = task_file_write_guard();
+    let path = trash_path(base);
+    let mut value = read_trash_value(&path)?;
+    let removed = purge_expired(&mut value, chrono::Local::now().naive_local());
+    if removed > 0 || (path.is_file() && trash_is_empty(&value)) {
+        write_trash_value(&path, &value)?;
+    }
+    Ok(trash_view(&value))
+}
+
+/// 把回收站中的任务恢复到目标清单末尾（`target_list_file` 缺省用原清单文件名）。
+///
+/// 目标必须存在且不含同 id 任务（否则报错且不写盘）。先写目标清单，再移除回收站条目；
+/// 回收站写失败时把目标清单回滚为写入前 Value。
+pub fn restore_task_in(
+    base: &Path,
+    trash_id: &str,
+    target_list_file: Option<&str>,
+) -> Result<(), String> {
+    let _guard = task_file_write_guard();
+    let trash_file = trash_path(base);
+    let mut trash = read_trash_value(&trash_file)?;
+    let index = trash_entry_index(&trash, "tasks", trash_id)
+        .ok_or_else(|| format!("回收站中未找到任务条目 {trash_id}"))?;
+    let entry = trash
+        .get("tasks")
+        .and_then(Value::as_sequence)
+        .and_then(|entries| entries.get(index))
+        .cloned()
+        .ok_or_else(|| format!("回收站中未找到任务条目 {trash_id}"))?;
+
+    let original_file = entry
+        .get("list_file")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("回收站任务条目 {trash_id} 缺少原清单文件名"))?;
+    let task = entry
+        .get("task")
+        .cloned()
+        .ok_or_else(|| format!("回收站任务条目 {trash_id} 缺少任务内容"))?;
+    let task_id = task.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+
+    let target_file = target_list_file.unwrap_or(original_file);
+    let target_path = list_path(base, target_file)?;
+    if !target_path.is_file() {
+        return if target_list_file.is_some() {
+            Err(format!("目标清单不存在：{target_file}"))
+        } else {
+            Err("原清单不存在，请选择目标清单".to_string())
+        };
+    }
+
+    let mut target = read_list_value(&target_path, target_file)?;
+    let target_before = target.clone();
+    {
+        let tasks = target
+            .get_mut("tasks")
+            .and_then(Value::as_sequence_mut)
+            .ok_or_else(|| format!("清单「{target_file}」缺少 tasks 数组"))?;
+        if !task_id.is_empty()
+            && tasks
+                .iter()
+                .any(|t| t.get("id").and_then(Value::as_str) == Some(task_id.as_str()))
+        {
+            return Err(format!("目标清单「{target_file}」已存在任务 {task_id}"));
+        }
+        tasks.push(task);
+    }
+
+    write_list(&target_path, &target)?;
+
+    let sequence = trash_sequence_mut(&mut trash, "tasks")?;
+    if index < sequence.len() {
+        sequence.remove(index);
+    }
+    if let Err(trash_error) = write_trash_value(&trash_file, &trash) {
+        return match write_list(&target_path, &target_before) {
+            Ok(()) => Err(format!(
+                "恢复任务 {task_id} 失败（回收站写回失败，目标清单「{target_file}」已回滚）：{trash_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "恢复任务 {task_id} 失败且状态不一致：回收站写回失败（{trash_error}），\
+                 回滚目标清单「{target_file}」也失败（{rollback_error}）；任务可能同时存在于清单与回收站，请手动检查"
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// 把回收站中的清单重建为文件，返回新文件名。
+///
+/// 原文件名可用且未被占用 → 沿用；否则按显示名生成不冲突文件名。先写文件、后移除回收站条目；
+/// 回收站写失败时删除刚创建的文件。
+pub fn restore_list_in(base: &Path, trash_id: &str) -> Result<String, String> {
+    let _guard = task_file_write_guard();
+    let trash_file = trash_path(base);
+    let mut trash = read_trash_value(&trash_file)?;
+    let index = trash_entry_index(&trash, "lists", trash_id)
+        .ok_or_else(|| format!("回收站中未找到清单条目 {trash_id}"))?;
+    let entry = trash
+        .get("lists")
+        .and_then(Value::as_sequence)
+        .and_then(|entries| entries.get(index))
+        .cloned()
+        .ok_or_else(|| format!("回收站中未找到清单条目 {trash_id}"))?;
+
+    let list = entry
+        .get("list")
+        .cloned()
+        .ok_or_else(|| format!("回收站清单条目 {trash_id} 缺少清单内容"))?;
+    if list.as_mapping().is_none() || list.get("tasks").and_then(Value::as_sequence).is_none() {
+        return Err(format!(
+            "回收站清单条目 {trash_id} 内容无效：缺少 tasks 数组"
+        ));
+    }
+
+    let lists_dir = base.join(LISTS_DIR);
+    fs::create_dir_all(&lists_dir).map_err(|e| format!("创建清单目录失败：{e}"))?;
+
+    let original_file = entry.get("file").and_then(Value::as_str).unwrap_or_default();
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| name.to_string())
+        .or_else(|| list.get("name").and_then(Value::as_str).map(|name| name.to_string()))
+        .unwrap_or_else(|| file_stem_name(original_file));
+
+    let target_file = match list_path(base, original_file) {
+        Ok(path) if !original_file.is_empty() && !path.exists() => original_file.to_string(),
+        _ => unique_file_name(&lists_dir, &name),
+    };
+    let target_path = lists_dir.join(&target_file);
+
+    // 回收站 `list` 原样重建（未知字段 / order / tasks 顺序均保留）。
+    write_list(&target_path, &list)?;
+
+    let sequence = trash_sequence_mut(&mut trash, "lists")?;
+    if index < sequence.len() {
+        sequence.remove(index);
+    }
+    if let Err(trash_error) = write_trash_value(&trash_file, &trash) {
+        return match fs::remove_file(&target_path) {
+            Ok(()) => Err(format!(
+                "恢复清单「{name}」失败（回收站写回失败，已删除刚创建的 {target_file}）：{trash_error}"
+            )),
+            Err(cleanup_error) => Err(format!(
+                "恢复清单「{name}」失败且状态不一致：回收站写回失败（{trash_error}），\
+                 删除刚创建的 {target_file} 也失败（{cleanup_error}）；清单可能同时存在于目录与回收站，请手动检查"
+            )),
+        };
+    }
+
+    Ok(target_file)
+}
+
+/// 彻底删除回收站中的单条条目（`tasks` 优先、其后 `lists`），立即真删除、不等 24 小时。
+///
+/// 匹配不到 → 中文错误且不写盘；移除后回收站为空则删除保留文件；
+/// 其它条目与未知字段保留。
+pub fn purge_trash_entry_in(base: &Path, trash_id: &str) -> Result<(), String> {
+    let _guard = task_file_write_guard();
+    let path = trash_path(base);
+    let mut trash = read_trash_value(&path)?;
+    let (field, index) = if let Some(index) = trash_entry_index(&trash, "tasks", trash_id) {
+        ("tasks", index)
+    } else if let Some(index) = trash_entry_index(&trash, "lists", trash_id) {
+        ("lists", index)
+    } else {
+        return Err(format!("回收站中未找到条目 {trash_id}"));
+    };
+    let sequence = trash_sequence_mut(&mut trash, field)?;
+    if index < sequence.len() {
+        sequence.remove(index);
+    }
+    write_trash_value(&path, &trash)
+}
+
+/// 清理回收站过期条目并写回（供后台定时调用；空则删除保留文件）。
+pub fn purge_trash_in(base: &Path) -> Result<(), String> {
+    let _guard = task_file_write_guard();
+    let path = trash_path(base);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut value = read_trash_value(&path)?;
+    let removed = purge_expired(&mut value, chrono::Local::now().naive_local());
+    if removed > 0 || trash_is_empty(&value) {
+        write_trash_value(&path, &value)?;
+    }
+    Ok(())
 }
 
 /// 把任务从一个清单转移到另一个清单末尾（Value 级移动，id 与全部字段原样保留）。
@@ -1369,14 +1839,40 @@ pub fn rename_list_in(base: &Path, list_file: &str, new_name: &str) -> Result<St
     Ok(target_file)
 }
 
-/// 删除清单文件（不存在 → 错误）。
+/// 把整份清单移入回收站（`lists/.trash.yaml`），再删除原文件。
+///
+/// 清单无法解析 → 中文错误且不删除（避免丢失不可解析内容）。删除原文件失败时回滚回收站。
 pub fn delete_list_in(base: &Path, list_file: &str) -> Result<(), String> {
     let _guard = task_file_write_guard();
     let path = list_path(base, list_file)?;
     if !path.is_file() {
         return Err(format!("清单文件不存在：{list_file}"));
     }
-    fs::remove_file(&path).map_err(|e| format!("删除清单「{list_file}」失败：{e}"))
+    let value = read_list_value(&path, list_file)?;
+    if value.as_mapping().is_none() {
+        return Err(format!("清单「{list_file}」格式无效：根节点必须是对象"));
+    }
+    let name = list_display_name(&value, list_file);
+
+    let trash_path = trash_path(base);
+    let mut trash = read_trash_value(&trash_path)?;
+    let trash_before = trash.clone();
+    trash_sequence_mut(&mut trash, "lists")?
+        .insert(0, trash_list_entry(&value, list_file, &name));
+    write_trash_value(&trash_path, &trash)?;
+
+    if let Err(remove_error) = fs::remove_file(&path) {
+        return match write_trash_value(&trash_path, &trash_before) {
+            Ok(()) => Err(format!(
+                "删除清单「{list_file}」失败（回收站已回滚，清单未删除）：{remove_error}"
+            )),
+            Err(rollback_error) => Err(format!(
+                "删除清单「{list_file}」失败且状态不一致：删除文件失败（{remove_error}），\
+                 回滚回收站也失败（{rollback_error}）；清单可能同时存在于目录与回收站，请手动检查"
+            )),
+        };
+    }
+    Ok(())
 }
 
 /// 按显示顺序上 / 下移清单：与相邻清单交换后按 `index * 10 + 10` 整体重编号写回。
@@ -1479,6 +1975,9 @@ fn read_ordered_lists(lists_dir: &Path) -> Result<Vec<(String, i64, String)>, St
             continue;
         }
         let file = file_name(&path);
+        if is_trash_file_name(&file) {
+            continue;
+        }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => continue,
@@ -1516,7 +2015,7 @@ fn unique_file_name(lists_dir: &Path, name: &str) -> String {
     let stem = sanitize_file_stem(name);
     let mut candidate = format!("{stem}.yaml");
     let mut n = 2;
-    while lists_dir.join(&candidate).exists() {
+    while lists_dir.join(&candidate).exists() || is_trash_file_name(&candidate) {
         candidate = format!("{stem}-{n}.yaml");
         n += 1;
     }
@@ -4130,5 +4629,528 @@ tasks:
         let settings = load_settings_from(base).unwrap();
         assert_eq!(settings.theme, "system");
         assert_eq!(settings.minimize_to_tray, Some(false));
+    }
+
+    fn trash_file(base: &Path) -> PathBuf {
+        base.join(LISTS_DIR).join(TRASH_FILE)
+    }
+
+    fn first_trash_task_id(base: &Path) -> String {
+        read_value(&trash_file(base))
+            .get("tasks")
+            .and_then(Value::as_sequence)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("trash_id"))
+            .and_then(Value::as_str)
+            .expect("回收站首个任务条目应有 trash_id")
+            .to_string()
+    }
+
+    fn first_trash_list_id(base: &Path) -> String {
+        read_value(&trash_file(base))
+            .get("lists")
+            .and_then(Value::as_sequence)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("trash_id"))
+            .and_then(Value::as_str)
+            .expect("回收站首个清单条目应有 trash_id")
+            .to_string()
+    }
+
+    #[test]
+    fn delete_task_moves_task_to_trash_preserving_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "工作.yaml",
+            "schema: 1\nname: 工作\norder: 10\nx-top: keep\ntasks:\n  - id: T1\n    title: 写周报\n    status: open\n    priority: high\n    x-task: keep-task\n  - id: T2\n    title: 二\n    status: open\n",
+        );
+
+        delete_task_in(base, "工作.yaml", "T1").unwrap();
+
+        // 原清单：仅移除目标，未知字段保留
+        let list = read_value(&path);
+        let tasks = list.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].get("id").and_then(Value::as_str), Some("T2"));
+        assert_eq!(list.get("x-top").and_then(Value::as_str), Some("keep"));
+
+        // 回收站：新条目、原任务字段完整
+        let trash = read_value(&trash_file(base));
+        assert_eq!(trash.get("schema").and_then(Value::as_i64), Some(1));
+        let entries = trash.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.get("list_file").and_then(Value::as_str), Some("工作.yaml"));
+        assert_eq!(entry.get("list_name").and_then(Value::as_str), Some("工作"));
+        let deleted = entry.get("deleted").and_then(Value::as_str).unwrap();
+        assert_eq!(deleted.len(), 19, "deleted 应为 YYYY-MM-DDTHH:MM:SS");
+        assert_eq!(&deleted[10..11], "T");
+        let trash_id = entry.get("trash_id").and_then(Value::as_str).unwrap();
+        assert_eq!(trash_id.len(), 26, "trash_id 应为 ULID");
+        let task = entry.get("task").unwrap();
+        assert_eq!(task.get("id").and_then(Value::as_str), Some("T1"));
+        assert_eq!(task.get("title").and_then(Value::as_str), Some("写周报"));
+        assert_eq!(task.get("priority").and_then(Value::as_str), Some("high"));
+        assert_eq!(task.get("x-task").and_then(Value::as_str), Some("keep-task"));
+    }
+
+    #[test]
+    fn delete_list_moves_full_value_to_trash_and_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "旧清单.yaml",
+            "schema: 1\nname: 旧清单\norder: 5\nx-list: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep-task\n  - id: T2\n    title: 二\n    status: done\n",
+        );
+        let original_value = read_value(&path);
+
+        delete_list_in(base, "旧清单.yaml").unwrap();
+        assert!(!path.exists(), "原清单文件应消失");
+
+        let trash = read_value(&trash_file(base));
+        let entries = trash.get("lists").and_then(Value::as_sequence).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.get("file").and_then(Value::as_str), Some("旧清单.yaml"));
+        assert_eq!(entry.get("name").and_then(Value::as_str), Some("旧清单"));
+        let stored = entry.get("list").unwrap();
+        assert_eq!(stored.get("x-list").and_then(Value::as_str), Some("keep"));
+        assert_eq!(stored.get("order").and_then(Value::as_i64), Some(5));
+        assert_eq!(
+            stored.get("tasks").and_then(Value::as_sequence).unwrap().len(),
+            2
+        );
+
+        let listed = load_trash_from(base).unwrap();
+        assert_eq!(listed.lists.len(), 1);
+        assert_eq!(listed.lists[0].task_count, 2);
+        assert_eq!(listed.lists[0].name, "旧清单");
+
+        let restored = restore_list_in(base, &first_trash_list_id(base)).unwrap();
+        assert_eq!(restored, "旧清单.yaml");
+        assert_eq!(read_value(&path), original_value, "恢复内容应与删除前一致");
+        assert!(!trash_file(base).exists(), "空回收站文件应被删除");
+    }
+
+    #[test]
+    fn restore_task_appends_to_end_and_preserves_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 10\nx-top: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n    x-task: keep-task\n  - id: T2\n    title: 二\n    status: open\n",
+        );
+
+        delete_task_in(base, "L.yaml", "T1").unwrap();
+        let trash_id = first_trash_task_id(base);
+
+        restore_task_in(base, &trash_id, None).unwrap();
+
+        let value = read_value(&path);
+        let tasks = value.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].get("id").and_then(Value::as_str), Some("T2"));
+        assert_eq!(tasks[1].get("id").and_then(Value::as_str), Some("T1"));
+        assert_eq!(
+            tasks[1].get("x-task").and_then(Value::as_str),
+            Some("keep-task")
+        );
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        assert!(!trash_file(base).exists(), "回收站条目移除后应删除空文件");
+    }
+
+    #[test]
+    fn restore_task_requires_target_when_original_list_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 10\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+        delete_task_in(base, "L.yaml", "T1").unwrap();
+        let trash_id = first_trash_task_id(base);
+        fs::remove_file(base.join(LISTS_DIR).join("L.yaml")).unwrap();
+
+        let error = restore_task_in(base, &trash_id, None).unwrap_err();
+        assert!(error.contains("原清单不存在"), "错误：{error}");
+
+        // 提供目标 → 成功追加到目标末尾
+        let target = write_list(
+            base,
+            "M.yaml",
+            "schema: 1\nname: M\norder: 20\ntasks:\n  - id: T9\n    title: 九\n    status: open\n",
+        );
+        restore_task_in(base, &trash_id, Some("M.yaml")).unwrap();
+        let target_value = read_value(&target);
+        let tasks = target_value.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].get("id").and_then(Value::as_str), Some("T1"));
+        assert!(!trash_file(base).exists());
+    }
+
+    #[test]
+    fn restore_task_rejects_duplicate_id_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            "L.yaml",
+            "schema: 1\nname: L\norder: 10\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+        delete_task_in(base, "L.yaml", "T1").unwrap();
+        let trash_id = first_trash_task_id(base);
+        fs::remove_file(base.join(LISTS_DIR).join("L.yaml")).unwrap();
+
+        let target = write_list(
+            base,
+            "M.yaml",
+            "schema: 1\nname: M\norder: 20\ntasks:\n  - id: T1\n    title: 已有\n    status: open\n",
+        );
+        let target_before = fs::read_to_string(&target).unwrap();
+        let trash_before = fs::read_to_string(trash_file(base)).unwrap();
+
+        let error = restore_task_in(base, &trash_id, Some("M.yaml")).unwrap_err();
+        assert!(error.contains("已存在"), "错误：{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), target_before);
+        assert_eq!(fs::read_to_string(trash_file(base)).unwrap(), trash_before);
+    }
+
+    #[test]
+    fn restore_list_reuses_original_name_or_generates_unique_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let lists = base.join(LISTS_DIR);
+        let path = write_list(
+            base,
+            "旧清单.yaml",
+            "schema: 1\nname: 旧清单\norder: 5\nx-list: keep\ntasks:\n  - id: T1\n    title: 一\n    status: open\n",
+        );
+        let original_value = read_value(&path);
+
+        // 首次：原文件名可用 → 沿用
+        delete_list_in(base, "旧清单.yaml").unwrap();
+        let restored = restore_list_in(base, &first_trash_list_id(base)).unwrap();
+        assert_eq!(restored, "旧清单.yaml");
+        assert_eq!(read_value(&lists.join(&restored)), original_value);
+
+        // 再次删除后占用原文件名 → 生成不冲突的新文件名
+        delete_list_in(base, "旧清单.yaml").unwrap();
+        write_list(
+            base,
+            "旧清单.yaml",
+            "schema: 1\nname: 占位\norder: 1\ntasks: []\n",
+        );
+        let restored = restore_list_in(base, &first_trash_list_id(base)).unwrap();
+        assert_eq!(restored, "旧清单-2.yaml");
+        let value = read_value(&lists.join(&restored));
+        assert_eq!(value.get("name").and_then(Value::as_str), Some("旧清单"));
+        assert_eq!(value.get("x-list").and_then(Value::as_str), Some("keep"));
+        assert_eq!(value.get("order").and_then(Value::as_i64), Some(5));
+        assert_eq!(
+            value.get("tasks").and_then(Value::as_sequence).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn purge_expired_respects_24h_and_keeps_unparseable_entries() {
+        let now = chrono::NaiveDateTime::parse_from_str(
+            "2026-10-29T12:00:00",
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        .unwrap();
+        let mut value: Value = yaml_serde::from_str(
+            r#"schema: 1
+x-top: keep
+tasks:
+  - trash_id: A
+    deleted: 2026-10-28T12:01:00
+  - trash_id: B
+    deleted: not-a-date
+  - trash_id: C
+    deleted: 2026-10-28T12:00:00
+lists:
+  - trash_id: D
+    deleted: 2020-01-01T00:00:00
+  - not-a-mapping
+"#,
+        )
+        .unwrap();
+
+        let removed = purge_expired(&mut value, now);
+
+        assert_eq!(removed, 2, "只应移除恰好 24h 与更早的条目");
+        let tasks = value.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|entry| entry.get("trash_id").and_then(Value::as_str).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"],
+            "23h59m 与无法解析时间的条目保留"
+        );
+        let lists = value.get("lists").and_then(Value::as_sequence).unwrap();
+        assert_eq!(lists.len(), 1, "非 mapping 条目保留");
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+    }
+
+    #[test]
+    fn purge_trash_in_deletes_file_when_everything_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            TRASH_FILE,
+            "schema: 1\ntasks:\n  - trash_id: OLD\n    deleted: 2020-01-01T00:00:00\n    list_file: L.yaml\n    task:\n      id: T1\n      title: 一\nlists: []\n",
+        );
+        assert!(trash_file(base).is_file());
+
+        purge_trash_in(base).unwrap();
+
+        assert!(!trash_file(base).exists(), "全部过期后应删除保留文件");
+        let view = load_trash_from(base).unwrap();
+        assert!(view.tasks.is_empty());
+        assert!(view.lists.is_empty());
+    }
+
+    #[test]
+    fn trash_file_is_never_treated_as_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        ensure_data_dir(base).unwrap();
+        let lists = base.join(LISTS_DIR);
+        assert!(lists.join(EXAMPLE_LIST_FILE).is_file());
+
+        write_list(base, TRASH_FILE, "schema: 1\ntasks: []\nlists: []\n");
+
+        let loaded = load_lists_from(base).unwrap();
+        assert!(
+            loaded.lists.iter().all(|list| list.file != TRASH_FILE),
+            "load_lists 不得把 .trash.yaml 当清单"
+        );
+        assert!(loaded.warnings.is_empty());
+
+        let ordered = read_ordered_lists(&lists).unwrap();
+        assert!(ordered.iter().all(|(file, _, _)| file != TRASH_FILE));
+        assert_eq!(ordered.len(), 1, "仅示例清单参与排序");
+
+        // 只有回收站文件时仍应生成示例清单
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(base, TRASH_FILE, "schema: 1\ntasks: []\nlists: []\n");
+        ensure_data_dir(base).unwrap();
+        assert!(base.join(LISTS_DIR).join(EXAMPLE_LIST_FILE).is_file());
+
+        // 保留文件名不能当普通清单传入
+        assert!(list_path(base, TRASH_FILE).is_err());
+        assert!(list_path(base, ".TRASH.yaml").is_err());
+    }
+
+    #[test]
+    fn purge_trash_entry_removes_single_task_preserving_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            TRASH_FILE,
+            "schema: 1\nx-top: keep\ntasks:\n  - trash_id: A\n    deleted: 2026-10-29T10:00:00\n    list_file: L.yaml\n    task:\n      id: T1\n      title: 一\n  - trash_id: B\n    deleted: 2026-10-29T10:00:00\n    list_file: L.yaml\n    task:\n      id: T2\n      title: 二\nlists:\n  - trash_id: C\n    deleted: 2026-10-29T10:00:00\n    file: M.yaml\n    name: M\n    list:\n      tasks: []\n",
+        );
+
+        purge_trash_entry_in(base, "A").unwrap();
+
+        assert!(trash_file(base).is_file(), "仍有条目时文件应保留");
+        let trash = read_value(&trash_file(base));
+        assert_eq!(trash.get("schema").and_then(Value::as_i64), Some(1));
+        assert_eq!(trash.get("x-top").and_then(Value::as_str), Some("keep"));
+        let tasks = trash.get("tasks").and_then(Value::as_sequence).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].get("trash_id").and_then(Value::as_str), Some("B"));
+        assert_eq!(
+            tasks[0].get("task").and_then(|task| task.get("title")).and_then(Value::as_str),
+            Some("二")
+        );
+        let lists = trash.get("lists").and_then(Value::as_sequence).unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].get("trash_id").and_then(Value::as_str), Some("C"));
+    }
+
+    #[test]
+    fn purge_trash_entry_removes_single_list_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            TRASH_FILE,
+            "schema: 1\ntasks: []\nlists:\n  - trash_id: L1\n    deleted: 2026-10-29T10:00:00\n    file: A.yaml\n    name: A\n    list:\n      tasks: []\n  - trash_id: L2\n    deleted: 2026-10-29T10:00:00\n    file: B.yaml\n    name: B\n    list:\n      tasks: []\n",
+        );
+
+        purge_trash_entry_in(base, "L2").unwrap();
+
+        let trash = read_value(&trash_file(base));
+        let lists = trash.get("lists").and_then(Value::as_sequence).unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].get("trash_id").and_then(Value::as_str), Some("L1"));
+        assert_eq!(lists[0].get("file").and_then(Value::as_str), Some("A.yaml"));
+    }
+
+    #[test]
+    fn purge_trash_entry_missing_id_errors_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            TRASH_FILE,
+            "schema: 1\ntasks:\n  - trash_id: A\n    task:\n      id: T1\nlists: []\n",
+        );
+        let before = fs::read_to_string(trash_file(base)).unwrap();
+
+        let error = purge_trash_entry_in(base, "MISSING").unwrap_err();
+        assert!(error.contains("回收站中未找到条目 MISSING"), "错误：{error}");
+        assert_eq!(fs::read_to_string(trash_file(base)).unwrap(), before);
+    }
+
+    #[test]
+    fn purge_trash_entry_deletes_file_when_last_entry_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_list(
+            base,
+            TRASH_FILE,
+            "schema: 1\ntasks:\n  - trash_id: A\n    task:\n      id: T1\nlists: []\n",
+        );
+
+        purge_trash_entry_in(base, "A").unwrap();
+
+        assert!(!trash_file(base).exists(), "最后一条移除后应删除保留文件");
+    }
+
+    #[test]
+    fn load_settings_parses_trash_collapsed_and_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+
+        // 缺失文件 → None
+        assert!(load_settings_from(base).unwrap().trash_collapsed.is_none());
+
+        // 正常 + 去重保序
+        fs::write(
+            &path,
+            "theme: dark\ntrash:\n  collapsed: [工作.yaml, 工作.yaml, 家务.yaml]\n  x-keep: 1\n",
+        )
+        .unwrap();
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(
+            settings.trash_collapsed,
+            Some(vec!["工作.yaml".to_string(), "家务.yaml".to_string()])
+        );
+
+        // 缺失 / 空 / 非法 → None
+        let cases = [
+            "theme: dark\n",
+            "theme: dark\ntrash:\n  collapsed: []\n",
+            "theme: dark\ntrash: notamap\n",
+            "theme: dark\ntrash:\n  collapsed: notaseq\n",
+            "theme: dark\ntrash:\n  collapsed: [工作.yaml, 42]\n",
+            "theme: dark\ntrash:\n  collapsed: [工作.yaml, '  ']\n",
+        ];
+        for text in cases {
+            fs::write(&path, text).unwrap();
+            assert!(
+                load_settings_from(base).unwrap().trash_collapsed.is_none(),
+                "case: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_trash_collapsed_writes_and_removes_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "theme: dark\nx-top: keep\napp_bar:\n  order: [tasks]\ncompleted:\n  collapsed: [已完成.yaml]\ndetail:\n  collapsed: [metadata]\ntrash:\n  x-custom: keep2\n",
+        )
+        .unwrap();
+
+        let collapsed = vec!["工作.yaml".to_string(), "家务.yaml".to_string()];
+        save_trash_collapsed_in(base, Some(&collapsed)).unwrap();
+
+        let settings = load_settings_from(base).unwrap();
+        assert_eq!(settings.trash_collapsed, Some(collapsed.clone()));
+        assert_eq!(
+            settings.completed_collapsed,
+            Some(vec!["已完成.yaml".to_string()])
+        );
+
+        let value = read_value(&path);
+        assert_eq!(value.get("theme").and_then(Value::as_str), Some("dark"));
+        assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
+        let trash = value.get("trash").and_then(Value::as_mapping).unwrap();
+        assert_eq!(
+            trash.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert_eq!(
+            trash.get("collapsed").and_then(Value::as_sequence).map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .get("app_bar")
+                .and_then(|app_bar| app_bar.get("order"))
+                .and_then(Value::as_sequence)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        // 空数组 → 删除 collapsed，保留 trash 其它字段
+        save_trash_collapsed_in(base, Some(&[])).unwrap();
+        let value = read_value(&path);
+        let trash = value.get("trash").and_then(Value::as_mapping).unwrap();
+        assert!(trash.get("collapsed").is_none());
+        assert_eq!(
+            trash.get("x-custom").and_then(Value::as_str),
+            Some("keep2")
+        );
+        assert!(load_settings_from(base).unwrap().trash_collapsed.is_none());
+
+        // None → 幂等删除
+        save_trash_collapsed_in(base, None).unwrap();
+        assert!(read_value(&path)
+            .get("trash")
+            .and_then(Value::as_mapping)
+            .unwrap()
+            .get("collapsed")
+            .is_none());
+    }
+
+    #[test]
+    fn save_trash_collapsed_rejects_malformed_trash_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let path = base.join(SETTINGS_FILE);
+        fs::write(&path, "theme: dark\ntrash: 未知标量\n").unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            save_trash_collapsed_in(base, Some(&["工作.yaml".to_string()])).is_err(),
+            "trash 非对象应报错"
+        );
+        assert!(
+            save_trash_collapsed_in(base, None).is_err(),
+            "恢复默认也不应覆盖未知标量"
+        );
+        assert!(
+            save_trash_collapsed_in(base, Some(&["   ".to_string()])).is_err(),
+            "空白文件名应报错"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "失败不应写盘");
     }
 }

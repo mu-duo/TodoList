@@ -73,6 +73,16 @@ import {
   type DetailSectionKey,
 } from "./detailSections";
 import { useMediaQuery, usePrefersReducedMotion } from "./hooks";
+import {
+  buildTrashTaskGroups,
+  formatTrashRemaining,
+  trashEntryCount,
+  visibleTrashLists,
+  visibleTrashTasks,
+  type TrashListRef,
+  type TrashTaskRef,
+  type TrashView,
+} from "./trash";
 import "./App.css";
 
 type Subtask = {
@@ -110,6 +120,12 @@ type TaskList = {
   tasks: Task[];
 };
 
+/**
+ * 回收站条目的 `task` 实际是后端序列化的完整任务（含优先级 / 截止 / 标签 / 提醒）；
+ * `trash.ts` 只声明了 UI 行渲染用到的子集，详情只读展示需要更完整的字段。
+ */
+type TrashTaskFull = Omit<TrashTaskRef, "task"> & { task: Task };
+
 type LoadResult = {
   lists: TaskList[];
   warnings: string[];
@@ -141,6 +157,13 @@ const PRIORITY_LABEL: Record<string, string> = {
 
 /** 「已完成」虚拟清单的哨兵 id（非真实文件）。 */
 const COMPLETED_ID = "__completed__";
+
+/** 「已删除」虚拟清单的哨兵 id（非真实文件）。 */
+const TRASH_ID = "__trash__";
+
+/** 回收站倒计时 / 过期清理的刷新节奏。 */
+const TRASH_TICK_MS = 30_000;
+const TRASH_SWEEP_MS = 60_000;
 
 /** 详情 / 行尾共用的运行态快照（来自事件 / 状态 / 历史）。 */
 type AgentLiveState = {
@@ -234,6 +257,49 @@ function App() {
     taskIds: string[];
   } | null>(null);
   const archiveToastTimerRef = useRef<number | null>(null);
+
+  // ---- 「已删除」回收站（FR-APP-37）----
+  // 后端视图快照（含已过期条目；展示前再按 now 过滤）
+  const [trashView, setTrashView] = useState<TrashView>({ tasks: [], lists: [] });
+  const [trashError, setTrashError] = useState<string | null>(null);
+  // 倒计时基准：进入回收站后每 30 秒推进
+  const [trashNow, setTrashNow] = useState<Date>(() => new Date());
+  // 恢复中的条目 id（防重复点击；ref 供异步回调同步判断）
+  const [restoringIds, setRestoringIds] = useState<Set<string>>(new Set());
+  const restoringIdsRef = useRef<Set<string>>(new Set());
+  // 彻底删除中的条目 id（与恢复互斥判断共用一份「在途」语义，但单独记录便于禁用）
+  const [purgingIds, setPurgingIds] = useState<Set<string>>(new Set());
+  const purgingIdsRef = useRef<Set<string>>(new Set());
+  // 回收站任务行右键菜单（与普通任务菜单相互独立）
+  const [trashTaskMenu, setTrashTaskMenu] = useState<{
+    trashId: string;
+    title: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  // 待确认彻底删除的条目（非空即显示确认模态）
+  const [purgeTarget, setPurgeTarget] = useState<{
+    trashId: string;
+    title: string;
+  } | null>(null);
+  // 「已删除」视图折叠的来源清单文件名集合（键 = 清单文件；空 = 全展开）
+  const [trashCollapsed, setTrashCollapsed] = useState<string[]>([]);
+  const [trashCollapsedError, setTrashCollapsedError] = useState<string | null>(
+    null,
+  );
+  // 当前期望集合 / 最近一次成功落盘的集合 / 串行写盘链（与已完成折叠同款）
+  const trashCollapsedRef = useRef<string[]>([]);
+  const trashCollapsedSavedRef = useRef<string[]>([]);
+  const trashSaveChainRef = useRef<Promise<void>>(Promise.resolve());
+  // 「选择恢复到的清单」模态
+  const [restoreTarget, setRestoreTarget] = useState<{
+    trashId: string;
+    title: string;
+  } | null>(null);
+  const [restoreTargetFile, setRestoreTargetFile] = useState("");
+  // 删除任务后的轻量提示（独立单槽，不影响归档撤销提示）
+  const [deleteToast, setDeleteToast] = useState(false);
+  const deleteToastTimerRef = useRef<number | null>(null);
 
   // 任务详情子板块折叠集合（key 见 detailSections；空数组 = 全部展开，合法）
   const [detailCollapsed, setDetailCollapsed] = useState<string[]>([]);
@@ -384,6 +450,7 @@ function App() {
   const reduceMotion = usePrefersReducedMotion();
 
   const isCompletedView = selectedListFile === COMPLETED_ID;
+  const isTrashView = selectedListFile === TRASH_ID;
   const selectedList = lists.find((l) => l.file === selectedListFile) ?? null;
 
   // 聚合所有清单的已完成任务（「已完成」虚拟视图）
@@ -418,10 +485,35 @@ function App() {
     [completedBucketedGroups],
   );
 
+  // ---- 回收站派生数据（可见项 = 未过期，按删除时间倒序）----
+  const trashTasksVisible = useMemo(
+    () => visibleTrashTasks(trashView, trashNow),
+    [trashView, trashNow],
+  );
+  const trashListsVisible = useMemo(
+    () => visibleTrashLists(trashView, trashNow),
+    [trashView, trashNow],
+  );
+  const trashCount = useMemo(
+    () => trashEntryCount(trashView, trashNow),
+    [trashView, trashNow],
+  );
+  // 任务按来源清单分组：现有清单顺序优先，原清单已不存在的追加在后
+  const trashTaskGroups = useMemo(
+    () => buildTrashTaskGroups(lists, trashTasksVisible),
+    [lists, trashTasksVisible],
+  );
+
   // 当前生效的折叠集合（过滤重命名 / 删除后的失效键，静默忽略）
   const collapsedCompletedSet = useMemo(
     () => new Set(activeCollapsedFiles(completedCollapsed, lists)),
     [completedCollapsed, lists],
+  );
+
+  // 回收站折叠集合：原清单可能已不存在，不能按 `lists` 过滤；失效键静默忽略
+  const collapsedTrashSet = useMemo(
+    () => new Set(trashCollapsed),
+    [trashCollapsed],
   );
 
   // 详情面板中收起的子板块集合（顺序无关；未知 key 已在读取时过滤）
@@ -447,6 +539,13 @@ function App() {
     const task = selectedList?.tasks.find((t) => t.id === selectedTaskId);
     return task && selectedList ? { task, listFile: selectedList.file } : null;
   }, [isCompletedView, completedTasks, selectedList, selectedTaskId]);
+
+  // 回收站选中项：按 trash_id 匹配当前可见条目（条目消失即视为未选中）
+  const selectedTrashEntry = useMemo<TrashTaskFull | null>(() => {
+    if (!isTrashView || !selectedTaskId) return null;
+    const found = trashTasksVisible.find((t) => t.trash_id === selectedTaskId);
+    return (found as TrashTaskFull | undefined) ?? null;
+  }, [isTrashView, trashTasksVisible, selectedTaskId]);
   const selectedTask = selectedEntry?.task ?? null;
   const selectedTaskListFile = selectedEntry?.listFile ?? null;
 
@@ -517,19 +616,37 @@ function App() {
   }, [appBarOrder]);
 
   async function refresh() {
-    try {
-      const data = await invoke<LoadResult>("load_lists");
-      setLists(data.lists);
-      setWarnings(data.warnings);
+    // 清单与回收站并行读取：回收站失败只提示自身，不影响清单的成功 / 告警
+    const [listsResult, trashResult] = await Promise.allSettled([
+      invoke<LoadResult>("load_lists"),
+      invoke<TrashView>("load_trash"),
+    ]);
+
+    if (trashResult.status === "fulfilled") {
+      setTrashView({
+        tasks: trashResult.value?.tasks ?? [],
+        lists: trashResult.value?.lists ?? [],
+      });
+      setTrashError(null);
+    } else {
+      setTrashError(String(trashResult.reason));
+    }
+
+    if (listsResult.status === "fulfilled") {
+      setLists(listsResult.value.lists);
+      setWarnings(listsResult.value.warnings);
       setError(null);
-    } catch (e) {
-      setError(String(e));
+    } else {
+      setError(String(listsResult.reason));
       // 硬失败时清空可能过期的告警
       setWarnings([]);
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   }
+
+  // 最新 refresh 的镜像：供回收站轮询定时器调用，避免因函数重建而重启 interval
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
 
   // ---- Agent 任务 UI（Phase 2）：状态同步 / 历史 / 意图 / 启动停止 ----
 
@@ -1187,6 +1304,7 @@ function App() {
         appBarOrder: order,
         completedCollapsed: collapsed,
         completedShowArchived: showArchivedPref,
+        trashCollapsed: trashCollapsedPref,
         detailCollapsed: detailCollapsedPref,
         minimizeToTray: trayPref,
       } = await loadSettings();
@@ -1202,6 +1320,11 @@ function App() {
       completedShowArchivedRef.current = showArchivedPref;
       completedShowArchivedSavedRef.current = showArchivedPref;
       setCompletedShowArchived(showArchivedPref);
+      // 回收站折叠：null = 全部展开
+      const initialTrashCollapsed = trashCollapsedPref ?? [];
+      trashCollapsedRef.current = initialTrashCollapsed;
+      trashCollapsedSavedRef.current = initialTrashCollapsed;
+      setTrashCollapsed(initialTrashCollapsed);
       // 详情子板块：null = 默认（仅「任务属性」收起）；空数组 = 全部展开
       const initialDetail = detailCollapsedPref ?? [...DEFAULT_DETAIL_COLLAPSED];
       detailCollapsedRef.current = initialDetail;
@@ -1281,27 +1404,48 @@ function App() {
     };
   }, []);
 
-  // 选中清单：仍存在则保持，否则回落到第一个（无清单则为空）
+  // 选中清单：虚拟视图（已完成 / 已删除）保持，真实清单仍存在则保持，否则回落
   useEffect(() => {
     setSelectedListFile((prev) => {
-      if (prev === COMPLETED_ID) return prev;
+      if (prev === COMPLETED_ID || prev === TRASH_ID) return prev;
       if (prev && lists.some((l) => l.file === prev)) return prev;
       return lists[0]?.file ?? null;
     });
   }, [lists]);
 
+  // 进入回收站：重置倒计时基准，每 30 秒推进剩余时长；每 60 秒重读一次，让后端清理过期条目
+  useEffect(() => {
+    if (!isTrashView) return;
+    setTrashNow(new Date());
+    const tick = window.setInterval(
+      () => setTrashNow(new Date()),
+      TRASH_TICK_MS,
+    );
+    // 定时重读：后端会顺手清理超过 24h 的条目；切走后清除
+    const sweep = window.setInterval(
+      () => void refreshRef.current(),
+      TRASH_SWEEP_MS,
+    );
+    return () => {
+      window.clearInterval(tick);
+      window.clearInterval(sweep);
+    };
+  }, [isTrashView]);
+
   // 选中任务：在当前视图内仍存在则保持，否则清空（清空前 flush 待写改动）
   useEffect(() => {
-    const ids = isCompletedView
-      ? completedTasks.map((e) => e.task.id)
-      : selectedList?.tasks.map((t) => t.id) ?? [];
+    const ids = isTrashView
+      ? trashTasksVisible.map((t) => t.trash_id)
+      : isCompletedView
+        ? completedTasks.map((e) => e.task.id)
+        : selectedList?.tasks.map((t) => t.id) ?? [];
     setSelectedTaskId((prev) => {
       if (prev && ids.includes(prev)) return prev;
       if (prev) flushPendingSave();
       return null;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lists, selectedListFile]);
+  }, [lists, selectedListFile, isTrashView, trashTasksVisible]);
 
   // 没有选中任务时关闭抽屉
   useEffect(() => {
@@ -1320,13 +1464,14 @@ function App() {
   }, [selectedTaskId, selectedListFile]);
 
   // 统一的操作执行器：防重复（busy）+ 失败提示 + 成功后刷新
-  async function run(action: () => Promise<unknown>) {
+  async function run(action: () => Promise<unknown>, onSuccess?: () => void) {
     if (busy) return;
     setBusy(true);
     setActionError(null);
     try {
       await action();
       await refresh();
+      onSuccess?.();
     } catch (e) {
       setActionError(String(e));
     } finally {
@@ -1737,6 +1882,41 @@ function App() {
     persistCompletedCollapsed(next);
   }
 
+  // ---- 「已删除」分组折叠接线（与已完成同款；偏好键 trash_collapsed）----
+
+  function applyTrashCollapsed(next: string[]) {
+    trashCollapsedRef.current = next;
+    setTrashCollapsed(next);
+  }
+
+  function persistTrashCollapsed(next: string[]) {
+    const snapshot = next.slice();
+    const payload = snapshot.length > 0 ? snapshot : null;
+    trashSaveChainRef.current = trashSaveChainRef.current.then(async () => {
+      setTrashCollapsedError(null);
+      try {
+        await invoke("save_trash_collapsed", { collapsed: payload });
+        trashCollapsedSavedRef.current = snapshot;
+        setTrashCollapsedError(null);
+      } catch (e) {
+        setTrashCollapsedError(String(e));
+        // 仅当没有更新的改动时才回滚，避免覆盖用户后续操作
+        if (sameCollapsed(trashCollapsedRef.current, snapshot)) {
+          applyTrashCollapsed(trashCollapsedSavedRef.current.slice());
+        }
+      }
+    });
+  }
+
+  // 回收站分组不按 `lists` 过滤：原清单可能已不存在，那些组同样要能折叠
+  function toggleTrashGroup(file: string) {
+    const current = trashCollapsedRef.current;
+    const collapsedNow = current.includes(file);
+    const next = nextCollapsed(current, file, !collapsedNow) ?? [];
+    applyTrashCollapsed(next);
+    persistTrashCollapsed(next);
+  }
+
   // 切换「显示归档」：立即生效，随后落盘；失败且期间无新改动则回滚到最后成功值
   function changeCompletedShowArchived(next: boolean) {
     completedShowArchivedRef.current = next;
@@ -2006,7 +2186,11 @@ function App() {
     // 键盘打开的保留焦点与焦点环。禁止全局 outline:none。
     if (!openedByKeyboardRef.current) {
       const active = document.activeElement;
-      if (active instanceof HTMLElement && active.classList.contains("task-open")) {
+      if (
+        active instanceof HTMLElement &&
+        (active.classList.contains("task-open") ||
+          active.classList.contains("trash-row-open"))
+      ) {
         active.blur();
       }
     }
@@ -2328,7 +2512,149 @@ function App() {
 
   function removeTask(listFile: string, task: Task) {
     // 直接删除（行内图标 + 悬停显形 + 位置固定防误删，不做 web 确认框）
-    void run(() => invoke("delete_task", { listFile, taskId: task.id }));
+    // 后端为软删除：条目进入「已删除」，24 小时内可恢复
+    void run(
+      () => invoke("delete_task", { listFile, taskId: task.id }),
+      showDeleteToast,
+    );
+  }
+
+  // 删除任务后的轻量提示（5 秒自隐；与归档撤销提示互不影响）
+  function showDeleteToast() {
+    if (deleteToastTimerRef.current !== null) {
+      window.clearTimeout(deleteToastTimerRef.current);
+    }
+    setDeleteToast(true);
+    deleteToastTimerRef.current = window.setTimeout(() => {
+      deleteToastTimerRef.current = null;
+      setDeleteToast(false);
+    }, 5000);
+  }
+
+  function dismissDeleteToast() {
+    if (deleteToastTimerRef.current !== null) {
+      window.clearTimeout(deleteToastTimerRef.current);
+      deleteToastTimerRef.current = null;
+    }
+    setDeleteToast(false);
+  }
+
+  useEffect(() => () => {
+    if (deleteToastTimerRef.current !== null) {
+      window.clearTimeout(deleteToastTimerRef.current);
+      deleteToastTimerRef.current = null;
+    }
+  }, []);
+
+  // ---- 回收站：恢复任务 / 清单 ----
+
+  function markRestoring(trashId: string, busy: boolean) {
+    const set = restoringIdsRef.current;
+    if (busy) set.add(trashId);
+    else set.delete(trashId);
+    setRestoringIds(new Set(set));
+  }
+
+  // 恢复任务：优先回原清单；原清单已不存在时由调用方先打开目标选择模态
+  async function restoreTrashTask(trashId: string, targetListFile?: string) {
+    if (restoringIdsRef.current.has(trashId)) return;
+    markRestoring(trashId, true);
+    setActionError(null);
+    try {
+      await invoke(
+        "restore_task",
+        targetListFile ? { trashId, targetListFile } : { trashId },
+      );
+      setRestoreTarget(null);
+      await refresh();
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      markRestoring(trashId, false);
+    }
+  }
+
+  // 点「恢复」：原清单仍在 → 直接恢复；否则打开「选择恢复到的清单」
+  function requestRestoreTask(item: TrashTaskRef) {
+    if (restoringIdsRef.current.has(item.trash_id)) return;
+    if (lists.some((l) => l.file === item.list_file)) {
+      void restoreTrashTask(item.trash_id, item.list_file);
+      return;
+    }
+    setRestoreTargetFile(lists[0]?.file ?? "");
+    setRestoreTarget({
+      trashId: item.trash_id,
+      title: item.task.title || "(无标题)",
+    });
+  }
+
+  function confirmRestoreTarget() {
+    const target = restoreTarget;
+    if (!target || !restoreTargetFile) return;
+    void restoreTrashTask(target.trashId, restoreTargetFile);
+  }
+
+  // ---- 回收站：右键彻底删除 ----
+
+  function markPurging(trashId: string, busy: boolean) {
+    const set = purgingIdsRef.current;
+    if (busy) set.add(trashId);
+    else set.delete(trashId);
+    setPurgingIds(new Set(set));
+  }
+
+  function openTrashTaskMenu(event: MouseEvent, item: TrashTaskRef) {
+    event.preventDefault();
+    event.stopPropagation();
+    setTrashTaskMenu({
+      trashId: item.trash_id,
+      title: item.task.title || "(无标题)",
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }
+
+  // 确认后立即真删除（不等 24 小时）；成功后刷新视图并关闭确认模态
+  async function purgeTrashEntry(trashId: string) {
+    if (purgingIdsRef.current.has(trashId)) return;
+    markPurging(trashId, true);
+    setActionError(null);
+    try {
+      await invoke("purge_trash_entry", { trashId });
+      setPurgeTarget(null);
+      await refresh();
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      markPurging(trashId, false);
+    }
+  }
+
+  function confirmPurgeTrashEntry() {
+    if (!purgeTarget) return;
+    void purgeTrashEntry(purgeTarget.trashId);
+  }
+
+  // 恢复清单：后端返回新文件名；成功后刷新并选中该清单
+  async function restoreTrashList(item: TrashListRef) {
+    if (restoringIdsRef.current.has(item.trash_id)) return;
+    markRestoring(item.trash_id, true);
+    setActionError(null);
+    try {
+      const file = await invoke<string>("restore_list", {
+        trashId: item.trash_id,
+      });
+      await refresh();
+      if (file) {
+        setSelectedTaskId(null);
+        setDrawerOpen(false);
+        setSelectedListFile(file);
+      }
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      markRestoring(item.trash_id, false);
+    }
   }
 
   function openListMenu(event: MouseEvent, list: TaskList) {
@@ -2775,7 +3101,152 @@ function App() {
     return operation;
   }
 
+  /**
+   * 回收站详情（只读）：回收站任务不在任何可写清单里，
+   * 复用普通详情会把编辑写回错误文件，因此单独渲染一套只读板块。
+   */
+  function renderTrashDetail() {
+    const entry = selectedTrashEntry;
+    if (!entry) {
+      return <p className="hint">选择任务查看详情</p>;
+    }
+    const task = entry.task;
+    const isCollapsed = (key: DetailSectionKey) => collapsedSectionSet.has(key);
+    const subs = task.subtasks ?? [];
+    const tags = task.tags ?? [];
+    const priority = task.priority
+      ? PRIORITY_LABEL[task.priority] ?? task.priority
+      : "—";
+    const reminder = !task.due
+      ? "—"
+      : task.reminder === false
+        ? "到期不提醒"
+        : "到期提醒";
+    return (
+      <div className="detail detail--trash">
+        <DetailSection
+          sectionKey="title"
+          title="标题"
+          collapsed={isCollapsed("title")}
+          onToggle={() => toggleDetailSection("title")}
+        >
+          <p className="trash-detail-title">{task.title || "(无标题)"}</p>
+          <p className="trash-detail-note">已删除任务；恢复后可编辑</p>
+        </DetailSection>
+
+        <DetailSection
+          sectionKey="metadata"
+          title="任务属性"
+          boxed
+          collapsed={isCollapsed("metadata")}
+          onToggle={() => toggleDetailSection("metadata")}
+        >
+          <dl className="detail-meta">
+            <div className="detail-row">
+              <dt>优先级</dt>
+              <dd>{priority}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>截止日期</dt>
+              <dd>{task.due || "—"}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>标签</dt>
+              <dd className="trash-detail-tags">
+                {tags.length > 0
+                  ? tags.map((tag) => (
+                      <span className="tag-chip" key={tag}>
+                        {tag}
+                      </span>
+                    ))
+                  : "—"}
+              </dd>
+            </div>
+            <div className="detail-row">
+              <dt>提醒</dt>
+              <dd>{reminder}</dd>
+            </div>
+          </dl>
+        </DetailSection>
+
+        <DetailSection
+          sectionKey="subtasks"
+          title={`子任务 · ${subs.length}`}
+          collapsed={isCollapsed("subtasks")}
+          onToggle={() => toggleDetailSection("subtasks")}
+        >
+          {subs.length > 0 ? (
+            <ul className="subtask-list">
+              {subs.map((sub) => {
+                const done = sub.status === "done";
+                return (
+                  <li
+                    key={sub.id}
+                    className={`subtask${done ? " done" : ""}`}
+                  >
+                    <span
+                      className="trash-subtask-mark"
+                      aria-hidden="true"
+                    >
+                      {done ? "✓" : "○"}
+                    </span>
+                    <span className="subtask-title">
+                      {sub.title || "(无标题)"}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="trash-detail-empty">无子任务</p>
+          )}
+        </DetailSection>
+
+        <DetailSection
+          sectionKey="notes"
+          title="备注"
+          collapsed={isCollapsed("notes")}
+          onToggle={() => toggleDetailSection("notes")}
+        >
+          <p className="trash-detail-notes">{task.notes || "—"}</p>
+        </DetailSection>
+
+        <DetailSection
+          sectionKey="meta"
+          title="其他信息"
+          boxed
+          collapsed={isCollapsed("meta")}
+          onToggle={() => toggleDetailSection("meta")}
+        >
+          <dl className="detail-meta">
+            <div className="detail-row">
+              <dt>状态</dt>
+              <dd>{task.status === "done" ? "已完成" : "未完成"}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>完成时间</dt>
+              <dd>{task.completed || "—"}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>删除时间</dt>
+              <dd>{entry.deleted || "—"}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>来源清单</dt>
+              <dd>{entry.list_name || entry.list_file || "—"}</dd>
+            </div>
+            <div className="detail-row">
+              <dt>ID</dt>
+              <dd className="mono">{task.id || "—"}</dd>
+            </div>
+          </dl>
+        </DetailSection>
+      </div>
+    );
+  }
+
   function renderDetail() {
+    if (isTrashView) return renderTrashDetail();
     if (!selectedTask || !selectedTaskListFile) {
       return <p className="hint">选择任务查看详情</p>;
     }
@@ -3134,6 +3605,45 @@ function App() {
     </li>
   );
 
+  // 「已删除」固定项（非真实清单，不可拖拽 / 右键）
+  const trashFooter = (
+    <li
+      className={`list-nav-item is-fixed${isTrashView ? " is-active" : ""}`}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <button
+        type="button"
+        className="list-nav-select"
+        onClick={() => {
+          if (suppressClickRef.current) return;
+          selectList(TRASH_ID);
+        }}
+        title="已删除"
+      >
+        <span className="list-nav-name">
+          <span className="list-nav-mark" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M3 6h18" />
+              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+            </svg>
+          </span>
+          已删除
+        </span>
+        <span className="list-nav-count">{trashCount}</span>
+      </button>
+    </li>
+  );
+
   // 收缩态浮层的几何变量：以抓取点为原点，按源行实际宽高换算非等比比例
   const dragOverlayStyle: CSSProperties | undefined = dragMetrics
     ? ({
@@ -3211,6 +3721,12 @@ function App() {
           </p>
         )}
 
+        {trashCollapsedError && (
+          <p className="error">
+            回收站分组折叠保存失败：{trashCollapsedError}
+          </p>
+        )}
+
         {detailCollapsedError && (
           <p className="error">
             详情板块折叠保存失败：{detailCollapsedError}
@@ -3246,7 +3762,12 @@ function App() {
                   return list ? renderListRow(list) : null;
                 }}
                 renderOverlay={renderOverlayList}
-                footer={completedFooter}
+                footer={
+                  <>
+                    {completedFooter}
+                    {trashFooter}
+                  </>
+                }
                 onReorder={handleListReorder}
                 onDragStart={markDragStart}
                 onDragEnd={markDragEnd}
@@ -3280,7 +3801,209 @@ function App() {
 
             {/* ---------------------------------------------- 主区：当前清单 */}
             <section className="main-pane">
-              {isCompletedView ? (
+              {isTrashView ? (
+                <>
+                  <div className="pane-head pane-head--trash">
+                    <div className="pane-head-title">
+                      <h2>已删除</h2>
+                      <p className="pane-note">24 小时后自动永久删除</p>
+                    </div>
+                    <span className="pane-count">{trashCount} 项</span>
+                  </div>
+                  <div className="task-scroll">
+                    {trashError ? (
+                      <p className="error">回收站读取失败：{trashError}</p>
+                    ) : trashCount === 0 ? (
+                      <p className="hint">回收站为空。</p>
+                    ) : (
+                      <div className="trash-groups">
+                        {trashListsVisible.length > 0 && (
+                          <section className="trash-section">
+                            <h3 className="trash-section-title">已删除的清单</h3>
+                            <ul className="trash-list">
+                              {trashListsVisible.map((item) => {
+                                const restoring = restoringIds.has(
+                                  item.trash_id,
+                                );
+                                return (
+                                  <li className="trash-row" key={item.trash_id}>
+                                    <div className="trash-row-main">
+                                      <span className="trash-row-title">
+                                        {item.name}
+                                      </span>
+                                      <span className="trash-row-meta">
+                                        {item.task_count} 个任务
+                                      </span>
+                                    </div>
+                                    <div className="trash-row-side">
+                                      <span className="trash-remaining">
+                                        {formatTrashRemaining(
+                                          item.deleted,
+                                          trashNow,
+                                        )}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        className="trash-restore"
+                                        onClick={() =>
+                                          void restoreTrashList(item)
+                                        }
+                                        disabled={restoring}
+                                        aria-busy={restoring}
+                                        aria-label={`恢复清单「${item.name}」`}
+                                      >
+                                        {restoring ? "恢复中…" : "恢复"}
+                                      </button>
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </section>
+                        )}
+                        {trashTaskGroups.length > 0 && (
+                          <section className="trash-section">
+                            <h3 className="trash-section-title">
+                              已删除的任务
+                            </h3>
+                            <div className="trash-task-groups">
+                              {trashTaskGroups.map((group) => {
+                                const collapsed = collapsedTrashSet.has(
+                                  group.listFile,
+                                );
+                                return (
+                                  <section
+                                    className="trash-group"
+                                    key={group.listFile}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="trash-group-head"
+                                      aria-expanded={!collapsed}
+                                      onClick={() =>
+                                        toggleTrashGroup(group.listFile)
+                                      }
+                                      title={
+                                        collapsed
+                                          ? `展开「${group.listName}」`
+                                          : `折叠「${group.listName}」`
+                                      }
+                                    >
+                                      <span
+                                        className="completed-group-chevron"
+                                        aria-hidden="true"
+                                      >
+                                        <svg
+                                          viewBox="0 0 24 24"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          strokeWidth="2"
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                        >
+                                          <path d="M6 9l6 6 6-6" />
+                                        </svg>
+                                      </span>
+                                      <span className="trash-group-name">
+                                        {group.listName}
+                                      </span>
+                                      <span className="trash-group-count">
+                                        {group.tasks.length}
+                                      </span>
+                                    </button>
+                                    {!collapsed && (
+                                      <div className="trash-group-body">
+                                        <ul className="trash-list">
+                                          {group.tasks.map((item) => {
+                                            const restoring = restoringIds.has(
+                                              item.trash_id,
+                                            );
+                                            const purging = purgingIds.has(
+                                              item.trash_id,
+                                            );
+                                            const isDone =
+                                              item.task.status === "done";
+                                            const label =
+                                              item.task.title || "(无标题)";
+                                            return (
+                                              <li
+                                                className={`trash-row${
+                                                  isDone ? " is-done" : ""
+                                                }${
+                                                  selectedTaskId ===
+                                                  item.trash_id
+                                                    ? " is-selected"
+                                                    : ""
+                                                }`}
+                                                key={item.trash_id}
+                                                onContextMenu={(e) =>
+                                                  openTrashTaskMenu(e, item)
+                                                }
+                                              >
+                                                <button
+                                                  type="button"
+                                                  className="trash-row-open"
+                                                  onClick={(e) =>
+                                                    openTask(
+                                                      item.trash_id,
+                                                      e.detail === 0,
+                                                    )
+                                                  }
+                                                  title="查看详情"
+                                                >
+                                                  <span className="trash-row-main">
+                                                    <span className="trash-row-title">
+                                                      {label}
+                                                    </span>
+                                                    {isDone && (
+                                                      <span className="trash-done-badge">
+                                                        已完成
+                                                      </span>
+                                                    )}
+                                                  </span>
+                                                </button>
+                                                <div className="trash-row-side">
+                                                  <span className="trash-remaining">
+                                                    {formatTrashRemaining(
+                                                      item.deleted,
+                                                      trashNow,
+                                                    )}
+                                                  </span>
+                                                  <button
+                                                    type="button"
+                                                    className="trash-restore"
+                                                    onClick={(e) => {
+                                                      e.stopPropagation();
+                                                      requestRestoreTask(item);
+                                                    }}
+                                                    disabled={
+                                                      restoring || purging
+                                                    }
+                                                    aria-busy={restoring}
+                                                    aria-label={`恢复任务「${label}」`}
+                                                  >
+                                                    {restoring
+                                                      ? "恢复中…"
+                                                      : "恢复"}
+                                                  </button>
+                                                </div>
+                                              </li>
+                                            );
+                                          })}
+                                        </ul>
+                                      </div>
+                                    )}
+                                  </section>
+                                );
+                              })}
+                            </div>
+                          </section>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : isCompletedView ? (
                 <>
                   <div className="pane-head">
                     <h2>已完成</h2>
@@ -3432,8 +4155,8 @@ function App() {
                 </>
               )}
 
-              {/* 左栏底部：新增 todo（「已完成」视图隐藏） */}
-              {!isCompletedView && (
+              {/* 左栏底部：新增 todo（「已完成」/「已删除」视图隐藏） */}
+              {!isCompletedView && !isTrashView && (
                 <div className="add-row">
                   <input
                     value={
@@ -3533,6 +4256,27 @@ function App() {
         />
       )}
 
+      {trashTaskMenu && (
+        <ContextMenu
+          x={trashTaskMenu.x}
+          y={trashTaskMenu.y}
+          items={[
+            {
+              key: "purge",
+              label: "彻底删除",
+              danger: true,
+              disabled: purgingIds.has(trashTaskMenu.trashId),
+              onSelect: () =>
+                setPurgeTarget({
+                  trashId: trashTaskMenu.trashId,
+                  title: trashTaskMenu.title,
+                }),
+            },
+          ]}
+          onClose={() => setTrashTaskMenu(null)}
+        />
+      )}
+
       {settingsOpen && (
         <SettingsModal
           theme={theme}
@@ -3562,10 +4306,32 @@ function App() {
       {pendingDeleteList && (
         <ConfirmModal
           title="删除清单"
-          message={`「${pendingDeleteList.name}」及其中的任务将一并删除，且无法撤销。对应文件也会一并删除。`}
+          message={`「${pendingDeleteList.name}」及其中的任务将移入「已删除」，24 小时内可恢复；到期后永久删除。`}
           confirmLabel="删除"
           onConfirm={confirmRemoveList}
           onCancel={() => setPendingDeleteList(null)}
+        />
+      )}
+
+      {restoreTarget && (
+        <RestoreTaskModal
+          title={restoreTarget.title}
+          lists={lists}
+          value={restoreTargetFile}
+          busy={restoringIds.has(restoreTarget.trashId)}
+          onChange={setRestoreTargetFile}
+          onConfirm={confirmRestoreTarget}
+          onCancel={() => setRestoreTarget(null)}
+        />
+      )}
+
+      {purgeTarget && (
+        <ConfirmModal
+          title="彻底删除"
+          message={`「${purgeTarget.title}」将被永久删除，无法恢复。`}
+          confirmLabel="彻底删除"
+          onConfirm={confirmPurgeTrashEntry}
+          onCancel={() => setPurgeTarget(null)}
         />
       )}
 
@@ -3577,6 +4343,30 @@ function App() {
           onConfirm={() => void invoke("exit_app")}
           onCancel={() => setExitNoteCount(null)}
         />
+      )}
+
+      {deleteToast && (
+        <div
+          className={`toast toast--delete${
+            archiveToast ? " toast--stacked" : ""
+          }`}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="toast-text">
+            已移入「已删除」，24 小时内可恢复
+          </span>
+          <button
+            type="button"
+            className="toast-action"
+            onClick={() => {
+              dismissDeleteToast();
+              selectList(TRASH_ID);
+            }}
+          >
+            查看
+          </button>
+        </div>
       )}
 
       {archiveToast && (
@@ -3594,6 +4384,134 @@ function App() {
         </div>
       )}
     </main>
+  );
+}
+
+const MODAL_FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * 「选择恢复到的清单」模态（FR-APP-37）：
+ * 仅当被恢复任务的原清单已不存在时打开；无清单时禁用确认。
+ */
+function RestoreTaskModal({
+  title,
+  lists,
+  value,
+  busy,
+  onChange,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  lists: TaskList[];
+  value: string;
+  busy: boolean;
+  onChange: (file: string) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef(onCancel);
+  cancelRef.current = onCancel;
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    const select = panel?.querySelector<HTMLElement>("select");
+    (select ?? panel)?.focus();
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        cancelRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE),
+      );
+      if (focusables.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !panel.contains(active)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, []);
+
+  const canConfirm = lists.length > 0 && !busy;
+
+  return (
+    <div className="modal-backdrop" onPointerDown={onCancel}>
+      <div
+        ref={panelRef}
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="选择恢复到的清单"
+        tabIndex={-1}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <div className="modal-head">
+          <h2>选择恢复到的清单</h2>
+        </div>
+        <div className="confirm-body">
+          <p className="confirm-message">
+            原清单已不存在，请选择「{title}」恢复到的清单。
+          </p>
+          {lists.length === 0 ? (
+            <p className="hint">没有可恢复到的清单</p>
+          ) : (
+            <label className="restore-target-field">
+              <span className="field-label">恢复到</span>
+              <select
+                className="restore-target-select"
+                value={value}
+                disabled={busy}
+                onChange={(e) => onChange(e.currentTarget.value)}
+              >
+                {lists.map((list) => (
+                  <option key={list.file} value={list.file}>
+                    {list.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="confirm-actions">
+            <button type="button" onClick={onCancel}>
+              取消
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!canConfirm}
+              onClick={onConfirm}
+            >
+              {busy ? "恢复中…" : "恢复"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

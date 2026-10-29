@@ -144,6 +144,34 @@ fn delete_list(list_file: String) -> Result<(), String> {
     storage::delete_list_in(&base, &list_file)
 }
 
+/// 读取回收站（读取前先清理过期条目）。
+#[tauri::command]
+fn load_trash() -> Result<storage::TrashView, String> {
+    let base = storage::data_dir()?;
+    storage::load_trash_from(&base)
+}
+
+/// 恢复回收站中的任务（`target_list_file` 缺省 → 恢复到原清单）。
+#[tauri::command]
+fn restore_task(trash_id: String, target_list_file: Option<String>) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::restore_task_in(&base, &trash_id, target_list_file.as_deref())
+}
+
+/// 恢复回收站中的清单，返回实际写入的文件名。
+#[tauri::command]
+fn restore_list(trash_id: String) -> Result<String, String> {
+    let base = storage::data_dir()?;
+    storage::restore_list_in(&base, &trash_id)
+}
+
+/// 彻底删除回收站中的单条条目（立即真删除，不等待 24 小时）。
+#[tauri::command]
+fn purge_trash_entry(trash_id: String) -> Result<(), String> {
+    let base = storage::data_dir()?;
+    storage::purge_trash_entry_in(&base, &trash_id)
+}
+
 /// 上 / 下移清单（direction: "up" | "down"）。
 #[tauri::command]
 fn move_list(list_file: String, direction: String) -> Result<(), String> {
@@ -202,6 +230,13 @@ fn save_app_bar_order(order: Option<Vec<String>>) -> Result<(), String> {
 fn save_completed_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String> {
     let base = storage::settings_dir()?;
     storage::save_completed_collapsed_in(&base, collapsed.as_deref())
+}
+
+/// 保存「已删除」视图折叠的来源清单文件名集合（`None` / 空数组 → 恢复默认，删除 `collapsed`）。
+#[tauri::command]
+fn save_trash_collapsed(collapsed: Option<Vec<String>>) -> Result<(), String> {
+    let base = storage::settings_dir()?;
+    storage::save_trash_collapsed_in(&base, collapsed.as_deref())
 }
 
 /// 保存「已完成」视图是否显示归档任务（`false` → 删除 `completed.show_archived`，恢复默认关闭）。
@@ -466,6 +501,19 @@ pub fn run() {
             if minimize_to_tray_enabled() {
                 ensure_tray(app.handle());
             }
+            // 回收站后台清理：启动即清理一次，之后每 10 分钟一次；失败只记日志，绝不 panic。
+            // 不调用 `ensure_data_dir`：避免后台线程在用户删光清单后偷偷重建示例清单。
+            std::thread::spawn(|| loop {
+                match storage::data_dir() {
+                    Ok(base) => {
+                        if let Err(error) = storage::purge_trash_in(&base) {
+                            eprintln!("回收站清理失败：{error}");
+                        }
+                    }
+                    Err(error) => eprintln!("回收站清理无法定位数据目录：{error}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            });
             Ok(())
         })
         // 关闭拦截：托盘设置开启且托盘可用时点「关闭」隐藏到托盘、进程保活；
@@ -541,6 +589,10 @@ pub fn run() {
             update_task,
             update_task_metadata,
             delete_task,
+            load_trash,
+            restore_task,
+            restore_list,
+            purge_trash_entry,
             add_subtask,
             remove_subtask,
             set_subtask_status,
@@ -555,6 +607,7 @@ pub fn run() {
             save_settings,
             save_app_bar_order,
             save_completed_collapsed,
+            save_trash_collapsed,
             save_completed_show_archived,
             save_detail_collapsed,
             save_minimize_to_tray,

@@ -10,10 +10,12 @@
 TodoList/
 └── lists/
     ├── 收集箱.yaml
-    └── 工作.yaml
+    ├── 工作.yaml
+    └── .trash.yaml          # 删除回收站（仅存在已删除条目时）
 ```
 
 - 文件名 = 清单名（规整化）；清单显示名以文件内 `name` 为准。
+- `lists/.trash.yaml` 是保留文件，**不是清单**：清单加载 / 排序 / 示例清单检测均跳过它；schema 见 §2.1。
 - 非任务数据（设置等）放**应用配置目录**，不进数据目录；当前包括 `settings.yaml` 与提醒账本 `reminder-ledger.json`（Windows：`%APPDATA%\com.lftan.todolist\`；设置文件名、字段与回退语义见 ADR-0006）。
 
 ## 2. 清单文件（schema v1）
@@ -65,11 +67,51 @@ tasks:
 | `notes` | string（多行） |  | 备注 |
 | `subtasks` | array（一层，**元素不可嵌套**） |  | 子任务；元素为 `{ id, title, status }`（`status ∈ open / done`，缺省 `open`）；数组顺序 = 显示顺序；增 / 删 / 勾选 / 改名经**按 id 的命令**原子写入（不做整数组覆盖）；可扩展 |
 
+## 2.1 删除回收站文件（`lists/.trash.yaml`，schema 1）
+
+```yaml
+schema: 1
+tasks:
+  - trash_id: 01JAVX8ZQK3M2N4P5R6S7T8V9W   # 每次删除生成，唯一
+    deleted: 2026-10-29T12:34:56           # 本地时间（秒）
+    list_file: 工作.yaml                    # 原清单文件名（快照）
+    list_name: 工作                         # 原清单显示名（快照）
+    task:                                   # 原任务 mapping 原样保留（含未知字段）
+      id: 01JAVX...
+      title: 写周报
+      status: open
+lists:
+  - trash_id: 01JAVXA1B2C3D4E5F6G7H8J9K
+    deleted: 2026-10-29T12:40:00
+    file: 旧清单.yaml                       # 原文件名
+    name: 旧清单                            # 原显示名
+    list:                                   # 原清单文件完整 Value（含 schema / order / tasks / 未知字段）
+      schema: 1
+      name: 旧清单
+      tasks: []
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `schema` | int | ✓ | 当前 `1` |
+| `tasks` | array |  | 已删除任务条目；缺失按空数组 |
+| `lists` | array |  | 已删除清单条目；缺失按空数组 |
+| `trash_id` | string（ULID） | ✓ | 条目唯一 id；每次删除新生成，恢复 / 清理按它定位 |
+| `deleted` | 本地时间 `YYYY-MM-DDTHH:MM:SS` | ✓ | 删除时间；24 小时清理的基准 |
+| `list_file` / `file` | string | ✓ | 原清单 / 原清单文件名 |
+| `list_name` / `name` | string |  | 原显示名；缺失时回退文件名去扩展名 |
+| `task` | mapping | ✓（tasks 条目） | 原任务完整内容 |
+| `list` | mapping | ✓（lists 条目） | 原清单完整内容 |
+
+- 文件仅在存在条目时出现；清理或恢复后为空时删除该文件。
+- 文件缺失 → 回收站为空；文件损坏 → `load_trash` 返回错误（不影响普通清单加载）。
+- 未知字段宽容保留；外部新增的条目按同一 schema 读取。`deleted` 无法解析的条目**不自动清理**。
+
 ## 3. 语义与写入约定
 
 - **id 稳定**：重排 / 编辑不改 id；删除后不复用。
 - **顺序语义**：显示顺序 = `tasks` 数组顺序；拖拽排序即重排数组；自动排序视图不落盘。**新建任务插入到清单首位**（`tasks[0]`）；跨清单移动仍追加到目标清单末尾。
-- **清单文件**：文件名 = 清单名规整化（含 Windows 保留名 / 结尾点空格处理）；重命名清单同步改名文件（冲突自动后缀）；删除清单即删除对应文件。
+- **清单文件**：文件名 = 清单名规整化（含 Windows 保留名 / 结尾点空格处理）；重命名清单同步改名文件（冲突自动后缀）；删除清单＝整份移入 `lists/.trash.yaml`（可 24 小时内恢复），原文件消失。
 - **完成留档**：完成任务保留在原文件（带 `completed`），不迁出文件。
 - **归档（FR-APP-36）**：归档＝在任务上写 `archived`（本地时间），**不移动、不删除、不改 `status`、不改数组顺序**；仅已完成视图按视图偏好决定是否渲染。取消归档＝删除 `archived` 键。归档不影响子任务数据。
 - **未知字段一律保留**：app 不认识的字段原样写回（agent 可自定义扩展字段）。
@@ -93,6 +135,18 @@ tasks:
 - `archive_tasks({ listFile, taskIds }) -> void`：对同一清单内一批 task 写入 `archived = 本地时间`（`now_local()` 同款格式）。一次重读 + **一次原子写**（Value 级补丁，未知字段与其它任务保留）；跳过不存在的 id 与 `status !== done` 的任务（不报错、不写该键）；已有 `archived` 的任务**不覆盖**原归档时间。
 - `unarchive_tasks({ listFile, taskIds }) -> void`：删除同批 task 的 `archived` 键；缺失该键的 id 静默跳过。
 - 两条命令均以 `listFile` 为作用域（跨清单批量由前端按清单拆分调用）；写入失败返回中文错误且不落盘。
+
+### 删除与回收站命令（FR-APP-37）
+
+- `delete_task({ listFile, taskId }) -> void`：**签名不变**。从原清单 `tasks` 移除目标任务，并把该任务完整 mapping + 原清单文件名 / 显示名 + `deleted` 写入 `lists/.trash.yaml` 的 `tasks`（新条目置顶）。先写回收站、再写原清单；原清单写失败时用删除前的回收站内容回滚；回收站写失败则原清单不动。
+- `delete_list({ listFile }) -> void`：**签名不变**。读取整份清单 Value，写入 `lists/.trash.yaml` 的 `lists`（含 `file` / `name` / `list` / `deleted`），再删除原文件；原文件删除失败时回滚回收站。清单无法解析时报错且不删除（避免丢失不可解析内容）。
+- `load_trash() -> { tasks: TrashTaskView[], lists: TrashListView[] }`：读取前先清理过期条目（`deleted + 24h ≤ now`；无法解析时间的条目保留）；清理后为空则删除保留文件。文件缺失 → 两个空数组；文件损坏 → 中文错误。
+  - `TrashTaskView`：`{ trash_id, deleted, list_file, list_name, task: TaskView }`（`task` 复用 §2 / `load_lists` 的 TaskView 形状）。
+  - `TrashListView`：`{ trash_id, deleted, file, name, task_count }`。
+- `restore_task({ trashId, targetListFile? }) -> void`：把条目中的任务追加到目标清单 `tasks` 末尾并移除回收站条目。`targetListFile` 缺省时用条目 `list_file`；原清单不存在 → 报错「原清单不存在，请选择目标清单」。目标清单不存在、或目标已存在同 id 任务 → 报错且不写盘。先写目标清单、后写回收站；回收站写失败时回滚目标清单为写入前内容。
+- `restore_list({ trashId }) -> string`：把条目中的清单 Value 重建为文件，返回新文件名。原文件名未被占用 → 沿用；被占用 → 按清单显示名生成不冲突文件名（`-2` / `-3`…）。先写文件、后写回收站；回收站写失败时删除刚创建的文件。`list` 非合法 mapping / 缺少 `tasks` 数组 → 报错。
+- `purge_trash_entry({ trashId }) -> void`：立即永久删除单条回收站条目（`tasks` 或 `lists` 中按 `trash_id` 定位一条）；不存在 → 中文错误且不写盘；删除后为空则删除保留文件。用于「彻底删除」右键菜单。
+- 所有删除 / 恢复操作持既有进程级写锁；对回收站与目标文件的写均使用 Value 级补丁 + 原子写，保留未知字段。
 
 ## 4. 版本与演进
 
@@ -238,6 +292,31 @@ completed:
 - 开启：归档项留在其 `completed` 所属时间组内、排在该组未归档项之后，弱化样式 + 「已归档」角标；计数包含它们。
 - 该字段与 `completed.collapsed` 互不覆盖（各自 Value 级补丁）；失效 / 未知字段照旧保留。
 - **不新增文件监听**；本字段与清单文件、`load_lists` / 刷新语义无关。
+
+### 5.5 「已删除」视图分组折叠偏好（trash.collapsed）
+
+> **状态（2026-10-29）：随 FR-APP-37 实现**——经既有 settings 读写通道（ADR-0006：字段可选、**未知字段保留**、原子写、缺失 / 解析失败回退默认）落地，**不新增数据目录内容**。
+> 分组与折叠交互见 [01-spec.md](01-spec.md) §1（FR-APP-37）；与 §5.1 的差异：回收站没有时间标签，语义其余一致。
+
+```yaml
+theme: system
+trash:
+  collapsed: [工作.yaml]   # 键 = 来源清单文件名
+```
+
+- 缺失 `trash.collapsed` = **全部展开**（默认）。
+
+**接口（Tauri 命令）**：
+
+- `load_settings()` 增 `trash_collapsed: string[] | null`，取自 `trash.collapsed`；缺失 / 空 / 非法 → `null`（= 全部展开）。
+- `save_trash_collapsed({ collapsed: string[] | null })`：Value 级补丁**仅改 `trash.collapsed`**（保留 `theme`、`app_bar`、`completed`、`detail` 与全部未知字段）；`collapsed` 为 `null` 或空数组 → **删除该字段**（恢复默认 = 全部展开）；空白文件名、或已有 `trash` 非对象 → 中文错误、不写盘。
+
+**折叠语义**：
+
+- 键 = 来源清单文件名；空集合 / 字段缺失 = 全部展开；不在集合中的组默认展开。
+- 原清单已不存在但仍显示在回收站中的分组同样可折叠（折叠集合直接按回收站分组键判定，不要求清单仍存在）。
+- 失效键由 UI 静默忽略，不报错、不主动清理。
+- **不新增文件监听**；该字段与清单文件、`load_lists` / 刷新语义无关。
 
 ## 6. Agent 协助（多 Provider，**已实现；隔离集成复验通过（假 provider、零真实网络）；用户验收通过（2026-10-14）；真实联网未实测**）
 
@@ -385,3 +464,5 @@ agent:
 - 2026-10-22 新增 Agent 只读网页抓取工具 `url_read`（§6.6）：参数 `{ url, offset? }`；仅能抓取任务 `agent.links` 中 trim 后完全相等的链接（未授权不请求），`file://` 转本地路径并复用 `agent.paths` 白名单；单页 ≤256KiB 并计入 `stats.bytes_read`，超时 20s（且不超过运行剩余时限），重定向手动跟随 ≤3 跳；每跳重新校验 scheme 与解析 IP（SSRF 拒绝回环 / 内网 / 链路本地 / 组播 / 文档保留段，IPv4-mapped 按映射后处理）；仅接受文本类响应，HTML→纯文本（去 script/style/标签、实体解码、压缩空白）。运行启动时再次校验已存 links（非法 → `failed(UnsafePath)`）。`RunRecord.snapshot.links` 与 `RunRecord.web_reads`（去重保序，旧记录缺省为空数组）落盘；初始 prompt 增加「可用材料」本地路径 / 链接清单。**`agent.paths` 沙箱与 `native_search` 行为不变。**
 - 2026-10-28 规划 FR-APP-36「已完成归档与时间分层」：任务字段新增可选 `archived`（本地时间，删除即取消归档；不移动 / 不改 `status` / 不改数组顺序）；新增命令 `archive_tasks` / `unarchive_tasks`（按 `listFile` + `taskIds` 一次重读一次原子写，跳过不存在与非 done 项，不覆盖已有 `archived`）；新增 §5.4 `completed.show_archived`（`load_settings.completed_show_archived: bool`、`save_completed_show_archived({ show })`，`show: false` 删键恢复默认关闭）。**向后兼容、旧数据无需迁移；未改 schema 版本、不新增文件。**
 - 2026-10-28 `agent.paths` 放宽为**接受 UNC**（§6.1）：`\\server\share\...`、`\\wsl.localhost\<发行版>\...`、`\\wsl$\<发行版>\...` 均可作为材料路径、**原样存储**；仍拒绝设备命名空间（`\\?\` / `\\.\`）、`//` 写法、**共享根 / 盘符根**、相对路径（含 `/home`、`/mnt/c` 这类 WSL 内部路径）、ADS、结尾点空格、保留设备名与敏感组件。写前校验与读时 `resolve_allowed`、运行前复查共用同一 `guard_path_string`，避免「存得进去、读时 UnsafePath」。批量添加保持**全有或全无**，错误改为 `路径「{p}」不可用：{原因}` **点名路径**；前端就地显示在材料板。**未改 schema、未改字段名。**
+- 2026-10-29 新增 §2.1「删除回收站文件」与 §3「删除与回收站命令」（FR-APP-37，ADR-0010）：删除任务 / 清单改为移入 `lists/.trash.yaml`（保留文件，非清单，加载 / 排序 / 示例检测跳过）；新增 `load_trash` / `restore_task` / `restore_list`，`delete_task` / `delete_list` 签名不变、语义改为软删除；条目 24 小时后自动真删除。**向后兼容、旧数据无需迁移；保留文件仅在存在条目时出现。**
+- 2026-10-29 FR-APP-37 追加：新增 `purge_trash_entry({ trashId })` 单条彻底删除；新增 §5.5 `trash.collapsed`（`load_settings.trash_collapsed`、`save_trash_collapsed`，语义同 `completed.collapsed`，回收站无时间标签）。**未改保留文件 schema。**

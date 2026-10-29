@@ -582,6 +582,358 @@ button:focus-visible {
   }
 }
 
+/* ---------------------------------------------- 已删除（回收站，FR-APP-37） ---- */
+
+/* 页头：标题 + 保留期说明同处一列，计数仍在右侧 */
+.pane-head--trash {
+  align-items: center;
+}
+
+.pane-head-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  min-width: 0;
+}
+
+/* 说明性小字：明显弱于标题，不与计数抢读 */
+.pane-note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+}
+
+.trash-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.trash-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 区块标签（已删除的清单 / 已删除的任务）：与「已完成」的时间档同层级 */
+.trash-section-title {
+  margin: 0;
+  padding-left: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.trash-task-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* 来源清单组头：可点折叠按钮，视觉层级与「已完成」组头一致 */
+.trash-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trash-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: var(--text);
+  text-align: left;
+  font-size: 1.06rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.trash-group-head:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-muted);
+  border-color: transparent;
+}
+
+/* chevron 复用 .completed-group-chevron，这里补上回收站组头的折叠旋转 */
+.trash-group-head[aria-expanded="false"] .completed-group-chevron {
+  transform: rotate(-90deg);
+}
+
+.trash-group-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 组体：不缩进（任务行必须与普通任务卡同宽），只保留组头下的发丝线与上间距 */
+.trash-group-body {
+  display: flex;
+  flex-direction: column;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  animation: group-open 150ms ease backwards;
+}
+
+.trash-group-count {
+  flex: none;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.trash-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 回收站行：外宽 / 内边距与 .task-card 完全一致；只把底色压沉，弱化但仍可读 */
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: 10px 12px;
+  padding: 12px 14px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sm);
+  transition: background-color var(--ease), border-color var(--ease),
+    box-shadow var(--ease);
+}
+
+.trash-row:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-hover);
+}
+
+/* 选中态：强调色描边 + 淡强调底（与 .task-card.is-selected 同语言） */
+.trash-row.is-selected,
+.trash-row.is-selected:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 标题区整块可点：按钮只承载交互，视觉仍是一行文字 */
+.trash-row-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.trash-row-open:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+}
+
+/* 选中行已有 accent 描边，焦点环冗余；未选中行保留全局焦点环 */
+.trash-row.is-selected .trash-row-open:focus-visible {
+  outline: none;
+}
+
+.trash-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+
+.trash-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-row.is-done .trash-row-title {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--text-faint);
+}
+
+.trash-row-meta {
+  flex: none;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+}
+
+.trash-done-badge {
+  flex: none;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: nowrap;
+}
+
+.trash-row-side {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+}
+
+.trash-remaining {
+  font-size: 0.76rem;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.trash-restore {
+  flex: none;
+  min-width: 76px;
+  padding: 4px 10px;
+  text-align: center;
+  border-color: var(--border-strong);
+  border-radius: 6px;
+  color: var(--accent-strong);
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.trash-restore:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+/* ---- 回收站详情（只读）---- */
+
+/* 标题：沿用详情的正文体量，但只是文本，不做输入框外观 */
+.trash-detail-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+/* 「已删除任务；恢复后可编辑」：弱化说明，不和标题抢注意力 */
+.trash-detail-note {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.trash-detail-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 只读备注：保留原始换行，长串在窄面板内断行 */
+.trash-detail-notes {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 空态文案 / 空备注占位：弱化，不占额外高度 */
+.trash-detail-empty {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+/* 只读子任务状态符号：与可点子任务标记同尺寸、同基线，但不可交互 */
+.trash-subtask-mark {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.subtask.done .trash-subtask-mark {
+  color: var(--accent);
+}
+
+/* 只读详情里的子任务不暗示「双击改名」：去掉文字光标与悬停下划线 */
+.detail--trash .subtask-title {
+  cursor: default;
+}
+
+.detail--trash .subtask:not(.done) .subtask-title:hover {
+  text-decoration: none;
+}
+
+/* 「选择恢复到的清单」：原生下拉，样式与输入框同源 */
+.restore-target-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.restore-target-select {
+  width: 100%;
+  padding: 8px 11px;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  transition: border-color var(--ease), box-shadow var(--ease);
+}
+
+.restore-target-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.restore-target-select:disabled {
+  color: var(--text-faint);
+  background: var(--surface-muted);
+  cursor: not-allowed;
+}
+
 /* 任务列表内部滚动区 */
 .task-scroll {
   flex: 1;
@@ -1054,6 +1406,14 @@ button:focus-visible {
 .list-nav-mark {
   margin-right: 6px;
   color: var(--accent);
+}
+
+/* 「已删除」固定项的内联图标（24 viewBox / stroke 1.8） */
+.list-nav-mark svg {
+  width: 13px;
+  height: 13px;
+  display: inline-block;
+  vertical-align: -2px;
 }
 
 .list-nav-count {
@@ -2671,6 +3031,30 @@ body.is-dragging * {
     margin-left: 12px;
   }
 
+  /* 回收站：窄屏下也保持单行——标题优先截断，剩余时间与恢复按钮始终同排 */
+  .trash-group-head {
+    font-size: 1rem;
+  }
+
+  .trash-row {
+    gap: 8px 10px;
+    padding: 10px 12px;
+  }
+
+  .trash-row-side {
+    gap: 8px;
+  }
+
+  .trash-remaining {
+    font-size: 0.72rem;
+  }
+
+  .trash-restore {
+    min-width: 60px;
+    padding: 4px 9px;
+    font-size: 0.78rem;
+  }
+
   /* 单列：清单条 → 任务列表（填满剩余）；清单条样式与宽屏一致 */
   .layout {
     grid-template-columns: minmax(0, 1fr);
@@ -2802,6 +3186,11 @@ body.is-dragging * {
 .toast-action:hover:not(:disabled) {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* 删除任务提示与归档撤销条同时出现时上移一档，避免重叠 */
+.toast--stacked {
+  bottom: 74px;
 }
 
 /* -------------------------------------------------------------- 无障碍 ---- */
