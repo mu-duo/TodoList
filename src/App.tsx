@@ -270,10 +270,12 @@ function App() {
   // 彻底删除中的条目 id（与恢复互斥判断共用一份「在途」语义，但单独记录便于禁用）
   const [purgingIds, setPurgingIds] = useState<Set<string>>(new Set());
   const purgingIdsRef = useRef<Set<string>>(new Set());
-  // 回收站任务行右键菜单（与普通任务菜单相互独立）
-  const [trashTaskMenu, setTrashTaskMenu] = useState<{
+  // 回收站右键菜单（任务行 / 清单行共用同一份状态；与普通任务菜单相互独立）
+  const [trashMenu, setTrashMenu] = useState<{
     trashId: string;
     title: string;
+    kind: "task" | "list";
+    taskCount?: number;
     x: number;
     y: number;
   } | null>(null);
@@ -281,6 +283,8 @@ function App() {
   const [purgeTarget, setPurgeTarget] = useState<{
     trashId: string;
     title: string;
+    kind: "task" | "list";
+    taskCount?: number;
   } | null>(null);
   // 「已删除」视图折叠的来源清单文件名集合（键 = 清单文件；空 = 全展开）
   const [trashCollapsed, setTrashCollapsed] = useState<string[]>([]);
@@ -2606,9 +2610,24 @@ function App() {
   function openTrashTaskMenu(event: MouseEvent, item: TrashTaskRef) {
     event.preventDefault();
     event.stopPropagation();
-    setTrashTaskMenu({
+    setTrashMenu({
       trashId: item.trash_id,
       title: item.task.title || "(无标题)",
+      kind: "task",
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }
+
+  // 已删除清单行右键：与任务行同一个菜单状态，只是确认文案带上清单内任务数
+  function openTrashListMenu(event: MouseEvent, item: TrashListRef) {
+    event.preventDefault();
+    event.stopPropagation();
+    setTrashMenu({
+      trashId: item.trash_id,
+      title: item.name || "(未命名清单)",
+      kind: "list",
+      taskCount: item.task_count,
       x: event.clientX,
       y: event.clientY,
     });
@@ -3826,7 +3845,13 @@ function App() {
                                   item.trash_id,
                                 );
                                 return (
-                                  <li className="trash-row" key={item.trash_id}>
+                                  <li
+                                    className="trash-row"
+                                    key={item.trash_id}
+                                    onContextMenu={(e) =>
+                                      openTrashListMenu(e, item)
+                                    }
+                                  >
                                     <div className="trash-row-main">
                                       <span className="trash-row-title">
                                         {item.name}
@@ -4256,24 +4281,26 @@ function App() {
         />
       )}
 
-      {trashTaskMenu && (
+      {trashMenu && (
         <ContextMenu
-          x={trashTaskMenu.x}
-          y={trashTaskMenu.y}
+          x={trashMenu.x}
+          y={trashMenu.y}
           items={[
             {
               key: "purge",
               label: "彻底删除",
               danger: true,
-              disabled: purgingIds.has(trashTaskMenu.trashId),
+              disabled: purgingIds.has(trashMenu.trashId),
               onSelect: () =>
                 setPurgeTarget({
-                  trashId: trashTaskMenu.trashId,
-                  title: trashTaskMenu.title,
+                  trashId: trashMenu.trashId,
+                  title: trashMenu.title,
+                  kind: trashMenu.kind,
+                  taskCount: trashMenu.taskCount,
                 }),
             },
           ]}
-          onClose={() => setTrashTaskMenu(null)}
+          onClose={() => setTrashMenu(null)}
         />
       )}
 
@@ -4328,7 +4355,13 @@ function App() {
       {purgeTarget && (
         <ConfirmModal
           title="彻底删除"
-          message={`「${purgeTarget.title}」将被永久删除，无法恢复。`}
+          message={
+            purgeTarget.kind === "list"
+              ? `「${purgeTarget.title}」及其中的 ${
+                  purgeTarget.taskCount ?? 0
+                } 个任务将被永久删除，无法恢复。`
+              : `「${purgeTarget.title}」将被永久删除，无法恢复。`
+          }
           confirmLabel="彻底删除"
           onConfirm={confirmPurgeTrashEntry}
           onCancel={() => setPurgeTarget(null)}
