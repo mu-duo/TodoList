@@ -838,17 +838,17 @@ pub fn unarchive_tasks_in(base: &Path, list_file: &str, task_ids: &[String]) -> 
     patch_task_archive(base, list_file, task_ids, false)
 }
 
-/// 若 `value` 的 `tasks` 为数组则在其末尾追加 `task`，否则报错。
-fn push_task(value: &mut Value, list_file: &str, task: Mapping) -> Result<(), String> {
+/// 若 `value` 的 `tasks` 为数组则把 `task` 插到**首位**，否则报错。
+fn prepend_task(value: &mut Value, list_file: &str, task: Mapping) -> Result<(), String> {
     let tasks = value
         .get_mut("tasks")
         .and_then(Value::as_sequence_mut)
         .ok_or_else(|| format!("清单「{list_file}」缺少 tasks 数组"))?;
-    tasks.push(Value::Mapping(task));
+    tasks.insert(0, Value::Mapping(task));
     Ok(())
 }
 
-/// 向清单末尾追加新任务（自动 ULID `id` 与 `created`），Value 级补丁后原子写回。
+/// 向清单**顶部**插入新任务（自动 ULID `id` 与 `created`），Value 级补丁后原子写回。
 pub fn create_task_in(base: &Path, list_file: &str, title: &str) -> Result<(), String> {
     let _guard = task_file_write_guard();
     let title = title.trim();
@@ -858,7 +858,7 @@ pub fn create_task_in(base: &Path, list_file: &str, title: &str) -> Result<(), S
 
     let path = list_path(base, list_file)?;
     let mut value = read_list_value(&path, list_file)?;
-    push_task(&mut value, list_file, new_task_mapping(title))?;
+    prepend_task(&mut value, list_file, new_task_mapping(title))?;
     write_list(&path, &value)
 }
 
@@ -2276,7 +2276,7 @@ tasks:
     }
 
     #[test]
-    fn create_task_appends_and_preserves_unknown_fields() {
+    fn create_task_prepends_and_preserves_unknown_fields() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let original = r#"schema: 1
@@ -2298,11 +2298,8 @@ tasks:
         assert_eq!(value.get("x-top").and_then(Value::as_str), Some("keep"));
         let tasks = value.get("tasks").and_then(Value::as_sequence).unwrap();
         assert_eq!(tasks.len(), 2);
-        // 原有任务不变
-        assert_eq!(tasks[0].get("id").and_then(Value::as_str), Some("T1"));
-        assert_eq!(tasks[0].get("x-task").and_then(Value::as_str), Some("keep2"));
-        // 新任务追加在末尾，title 已 trim
-        let task = &tasks[1];
+        // 新任务在首位，title 已 trim
+        let task = &tasks[0];
         assert_eq!(task.get("title").and_then(Value::as_str), Some("新任务"));
         assert_eq!(task.get("status").and_then(Value::as_str), Some("open"));
         assert!(task.get("created").and_then(Value::as_str).is_some());
@@ -2311,12 +2308,16 @@ tasks:
             26,
             "新任务 id 应为 ULID"
         );
+        // 原有任务顺序后移且内容不变
+        assert_eq!(tasks[1].get("id").and_then(Value::as_str), Some("T1"));
+        assert_eq!(tasks[1].get("x-task").and_then(Value::as_str), Some("keep2"));
 
         // 能被 load 读到
         let result = load_lists_from(base).unwrap();
         assert_eq!(result.lists[0].tasks.len(), 2);
-        assert_eq!(result.lists[0].tasks[1].title, "新任务");
-        assert_eq!(result.lists[0].tasks[1].status, "open");
+        assert_eq!(result.lists[0].tasks[0].title, "新任务");
+        assert_eq!(result.lists[0].tasks[0].status, "open");
+        assert_eq!(result.lists[0].tasks[1].id, "T1");
 
         // 空标题拒绝，且不改动文件
         assert!(create_task_in(base, "清单.yaml", "   ").is_err());

@@ -1927,12 +1927,27 @@ function App() {
     });
   }
 
+  // 新建任务落在清单首位；把任务列表滚回顶部，让刚加的那条在视野内
+  function scrollTaskListToTop() {
+    const el = taskScrollRef.current;
+    if (!el) return;
+    const reduceMotion =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
+  }
+
   function submitNewTask(listFile: string) {
     const title = (newTaskTitles[listFile] ?? "").trim();
     if (!title) return;
+    let created = false;
     void run(async () => {
       await invoke("create_task", { listFile, title });
       setNewTaskTitles((prev) => ({ ...prev, [listFile]: "" }));
+      created = true;
+    }).then(() => {
+      // refresh 完成后再滚，否则内容还是旧的
+      if (created) scrollTaskListToTop();
     });
   }
 
