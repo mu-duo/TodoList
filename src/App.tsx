@@ -2936,15 +2936,10 @@ function App() {
                 <span className="task-archived-badge">已归档</span>
               )}
             </span>
-            {(task.priority || task.due || showSource) && (
+            {(task.due || showSource) && (
               <span className="task-meta-row">
                 {showSource && (
                   <span className="meta">来自 {entry.listName}</span>
-                )}
-                {task.priority && (
-                  <span className="meta">
-                    优先级 {PRIORITY_LABEL[task.priority] ?? task.priority}
-                  </span>
                 )}
                 {task.due && <span className="meta">截止 {task.due}</span>}
               </span>
@@ -2952,6 +2947,12 @@ function App() {
           </button>
         )}
         <div className="task-actions">
+          {/* 优先级仅作辅助提示：纯展示、不可聚焦、不拦截点击与拖拽 */}
+          {task.priority && (
+            <span className="task-priority">
+              优先级 {PRIORITY_LABEL[task.priority] ?? task.priority}
+            </span>
+          )}
           {badgeState && (
             <button
               type="button"
@@ -3021,9 +3022,15 @@ function App() {
   function taskRowClass(entry: ViewTask) {
     const { task } = entry;
     const isDone = leaving.get(task.id) ?? task.status === "done";
+    const priorityClass =
+      task.priority === "high"
+        ? " is-priority-high"
+        : task.priority === "medium"
+          ? " is-priority-medium"
+          : "";
     return `task-card${isDone ? " is-done" : ""}${
       typeof task.archived === "string" ? " is-archived" : ""
-    }${task.id === selectedTaskId ? " is-selected" : ""}${
+    }${priorityClass}${task.id === selectedTaskId ? " is-selected" : ""}${
       leaving.has(task.id) ? " is-leaving" : ""
     }`;
   }

@@ -37,6 +37,10 @@
   --success: #16a34a;
   --success-soft: #e9f7ef;
 
+  /* 优先级描边（任务卡片）：高 / 中两档，只用于描边色 */
+  --priority-high: #dc2626;
+  --priority-medium: #e0a400;
+
   --radius-card: 12px;
   --radius-control: 8px;
 
@@ -960,6 +964,8 @@ button:focus-visible {
   padding: 12px 14px;
   box-shadow: var(--shadow-sm);
   cursor: pointer;
+  /* 供行尾「优先级」文字按卡片实际宽度做隐藏判断（见 .task-priority） */
+  container-type: inline-size;
   transition: border-color var(--ease), box-shadow var(--ease),
     transform var(--ease), background-color var(--ease);
   animation: card-in 200ms ease backwards;
@@ -982,6 +988,26 @@ button:focus-visible {
   background: var(--surface-hover);
   box-shadow: var(--shadow-md);
   transform: translateY(-1px);
+}
+
+/* 优先级描边：高 / 中两档只换描边色，宽度沿用基础 1px，不动底色、阴影与左侧色条。
+   :not() 显式排除完成 / 归档 / 选中三态，让状态语义始终压过优先级：
+   完成 / 归档回到 --border，选中保持强调色。 */
+.task-card.is-priority-high:not(.is-done):not(.is-archived):not(.is-selected) {
+  border-color: var(--priority-high);
+}
+
+.task-card.is-priority-medium:not(.is-done):not(.is-archived):not(.is-selected) {
+  border-color: var(--priority-medium);
+}
+
+/* 悬浮只换底色与阴影，优先级描边保持住（否则会被上面的 .task-card:hover 冲淡成 --border-hover） */
+.task-card.is-priority-high:not(.is-done):not(.is-archived):not(.is-selected):hover {
+  border-color: var(--priority-high);
+}
+
+.task-card.is-priority-medium:not(.is-done):not(.is-archived):not(.is-selected):hover {
+  border-color: var(--priority-medium);
 }
 
 /* 完成态：降饱和 + 弱化，不抢注意力 */
@@ -1204,6 +1230,28 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   transition: opacity var(--ease);
+}
+
+/* 行尾优先级提示：辅助信息，单行、中性灰、不可点击；
+   与右侧操作区同列但不参与热区交互（pointer-events: none 让点击穿透到卡片）。 */
+.task-priority {
+  flex: none;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* 归档卡片标题已弱化到 --text-faint，行尾优先级文字同步压一级，避免比标题更亮 */
+.task-card.is-archived .task-priority {
+  color: var(--text-faint);
+}
+
+/* 卡片过窄时整体隐去这行文字（不做省略号截断），把宽度让给标题与操作按钮 */
+@container (max-width: 360px) {
+  .task-priority {
+    display: none;
+  }
 }
 
 /* 隐藏态：保留占位（不引起布局跳动），但不响应指针 */
@@ -3241,6 +3289,10 @@ body.is-dragging * {
 
     --success: #5fd39a;
     --success-soft: #17301f;
+
+    /* 优先级描边（任务卡片）：高 / 中两档，只用于描边色 */
+    --priority-high: #f26a6a;
+    --priority-medium: #f2c66d;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.5);

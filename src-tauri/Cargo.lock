@@ -4375,7 +4375,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "todolist"
-version = "1.11.1"
+version = "1.11.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
