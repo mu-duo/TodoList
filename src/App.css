@@ -1320,14 +1320,16 @@ button:focus-visible {
   min-width: 0;
 }
 
-/* 「+」新增按钮：方形强调色 */
+/* 「+」新增按钮：40×40 正方形强调色（清单条与「新增 todo」行共用，两处外观一致） */
 .add-btn {
   flex: none;
   width: 40px;
+  height: 40px;
   padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  border-radius: var(--radius-control);
   font-size: 1.25rem;
   line-height: 1;
 }
@@ -1337,7 +1339,7 @@ button:focus-visible {
   margin-top: 12px;
 }
 
-/* 清单条底部「新增清单」行（同款） */
+/* 清单条底部「新增清单」输入行（仅点「+」展开时出现，同款外观） */
 .lists-block > .add-row {
   margin-top: 0;
 }
@@ -1386,6 +1388,33 @@ button:focus-visible {
   flex-direction: column;
   gap: 8px;
   padding: 8px;
+}
+
+/* 清单条：横向列表 + 分隔线 + 「+」，按钮固定在滚动区之外 */
+
+.list-strip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 列表自己拥有横向滚动，宽度不超过剩余空间 */
+.list-strip > .list-nav {
+  flex: 1;
+  min-width: 0;
+}
+
+.list-strip-divider {
+  flex: none;
+  width: 1px;
+  height: 24px;
+  background: var(--border);
+}
+
+.list-strip-add {
+  flex: none;
 }
 
 .list-nav {

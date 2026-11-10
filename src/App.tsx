@@ -345,6 +345,8 @@ function App() {
   const agentRunsRefetchRef = useRef<number | null>(null);
 
   const [newListName, setNewListName] = useState("");
+  // 新建清单输入行是否展开（点「+」切换；收起时保留草稿）
+  const [showNewListInput, setShowNewListInput] = useState(false);
   const [newTaskTitles, setNewTaskTitles] = useState<Record<string, string>>({});
 
   // 当前选中的清单（可为真实清单文件或「已完成」哨兵）/ 任务
@@ -436,6 +438,8 @@ function App() {
   // 源任务滚动区 / 「已完成」固定项（拖拽命中测试）
   const taskScrollRef = useRef<HTMLDivElement | null>(null);
   const completedFooterRef = useRef<HTMLLIElement | null>(null);
+  // 清单条末尾的「+」按钮：Esc 收起输入行后把焦点还给它
+  const newListButtonRef = useRef<HTMLButtonElement | null>(null);
   // 本次任务拖拽的抓取点 / 源行实际宽高（收缩动画的 transform-origin 与非等比比例）
   const [dragMetrics, setDragMetrics] = useState<DragMetrics | null>(null);
   // 本次拖拽是否已按「跨清单转移 / 勾选完成」处理（用于压掉随后的同清单排序回调）
@@ -2104,11 +2108,23 @@ function App() {
 
   function submitNewList() {
     const name = newListName.trim();
-    if (!name) return;
+    // 空输入：只收起输入行，保留草稿，不发请求
+    if (!name) {
+      setShowNewListInput(false);
+      return;
+    }
     void run(async () => {
-      await invoke("create_list", { name });
+      const file = await invoke<string>("create_list", { name });
       setNewListName("");
+      setShowNewListInput(false);
+      // 新建后直接选中该清单（同名重复时 file 已存在则 selectList 自行忽略）
+      selectList(file);
     });
+  }
+
+  // 「+」按钮：展开 / 收起输入行（收起时保留草稿）
+  function toggleNewListInput() {
+    setShowNewListInput((open) => !open);
   }
 
   // 新建任务落在清单首位；把任务列表滚回顶部，让刚加的那条在视野内
@@ -3772,57 +3788,80 @@ function App() {
           <div className="main-col">
             {/* ------------------------------------- 清单条（宽窄一致，位于任务列表上方） */}
             <section className="side-block lists-block">
-              <SortableList
-                className="list-nav"
-                ids={listIds}
-                axis="horizontal"
-                rowClassName={(id) =>
-                  `list-nav-item${id === selectedListFile ? " is-active" : ""}${
-                    editingListFile === id ? " is-editing" : ""
-                  }${dragDropTarget === id ? " is-drop-target" : ""}`
-                }
-                itemDisabled={(id) => editingListFile === id}
-                rowDataAttributes={(id) => ({ "data-list-file": id })}
-                renderItem={(id) => {
-                  const list = listById.get(id);
-                  return list ? renderListRow(list) : null;
-                }}
-                renderOverlay={renderOverlayList}
-                footer={
-                  <>
-                    {completedFooter}
-                    {trashFooter}
-                  </>
-                }
-                onReorder={handleListReorder}
-                onDragStart={markDragStart}
-                onDragEnd={markDragEnd}
-                onItemContextMenu={(id, event) => {
-                  const list = listById.get(id);
-                  if (list) openListMenu(event, list);
-                }}
-              />
-
-              <div className="add-row">
-                <input
-                  value={newListName}
-                  placeholder="新建清单…"
-                  onChange={(e) => setNewListName(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") submitNewList();
+              <div className="list-strip">
+                <SortableList
+                  className="list-nav"
+                  ids={listIds}
+                  axis="horizontal"
+                  rowClassName={(id) =>
+                    `list-nav-item${id === selectedListFile ? " is-active" : ""}${
+                      editingListFile === id ? " is-editing" : ""
+                    }${dragDropTarget === id ? " is-drop-target" : ""}`
+                  }
+                  itemDisabled={(id) => editingListFile === id}
+                  rowDataAttributes={(id) => ({ "data-list-file": id })}
+                  renderItem={(id) => {
+                    const list = listById.get(id);
+                    return list ? renderListRow(list) : null;
+                  }}
+                  renderOverlay={renderOverlayList}
+                  footer={
+                    <>
+                      {completedFooter}
+                      {trashFooter}
+                    </>
+                  }
+                  onReorder={handleListReorder}
+                  onDragStart={markDragStart}
+                  onDragEnd={markDragEnd}
+                  onItemContextMenu={(id, event) => {
+                    const list = listById.get(id);
+                    if (list) openListMenu(event, list);
                   }}
                 />
+                <span className="list-strip-divider" aria-hidden="true" />
                 <button
                   type="button"
-                  className="btn-primary add-btn"
-                  onClick={submitNewList}
+                  ref={newListButtonRef}
+                  className="btn-primary add-btn list-strip-add"
+                  onClick={toggleNewListInput}
                   disabled={busy}
                   aria-label="新建清单"
                   title="新建清单"
+                  aria-expanded={showNewListInput}
+                  aria-controls="new-list-input"
                 >
                   +
                 </button>
               </div>
+
+              {showNewListInput && (
+                <div className="add-row">
+                  <input
+                    id="new-list-input"
+                    value={newListName}
+                    placeholder="新建清单…"
+                    autoFocus
+                    onChange={(e) => setNewListName(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        submitNewList();
+                      } else if (e.key === "Escape") {
+                        // 取消：收起并清空草稿，焦点回到「+」
+                        setShowNewListInput(false);
+                        setNewListName("");
+                        newListButtonRef.current?.focus();
+                      }
+                    }}
+                    onBlur={(e) => {
+                      // 点击「+」收起时先触发 blur：交给按钮的 click 处理，
+                      // 否则「先收起、再被 click 展开」会看着像没反应
+                      if (e.relatedTarget === newListButtonRef.current) return;
+                      setShowNewListInput(false);
+                    }}
+                  />
+                </div>
+              )}
             </section>
 
             {/* ---------------------------------------------- 主区：当前清单 */}
