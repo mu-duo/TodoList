@@ -40,6 +40,11 @@ docs/issues/
 - [ ] 异常（失败路径、边界与稳定性）
 - [ ] 回顾（收尾回顾：文档同步）
 
+## 测试
+- 执行：<命令> → 通过 ｜ 跳过 N（原因）
+- 临时：<场景> → 通过，已清理 ｜ 无
+- 落盘：<用例> ↔ <SPEC ID / 完成判据>（无）
+
 ## 结果（完成后填写，可选）
 - …
 
@@ -50,6 +55,7 @@ docs/issues/
 （若本机安装了 project-docs-workflow：条目骨架 ~/.agents/skills/project-docs-workflow/assets/templates/entries/issue-entry.md；未安装则按本文格式创建。）
 
 - `Status` 就地更新；`## Log` 追加式记录，不改历史行，仅记关键事件（范围变化 / 阻塞 / 交接 / 放弃），不需要逐步机械追加。
+- `## 测试` 按 `testing.md` 填写（执行 / 临时 / 落盘），收尾必填；`suggestion` 不是工作条目，不设此节。
 - 涉及 ADR / PRD 的改动，须同步更新对应文档。
 - issue 可引用 FR / 文档；收尾更新 Current 事实时，不插入指向本 issue 的自链接或任务历史。
 - 推进流程见 `workflow.md`（推荐五步：规划 / 骨架 / 细节 / 异常 / 回顾）；步骤状态就地更新，关键事件记 Log。
